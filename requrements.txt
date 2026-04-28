@@ -20,5 +20,10 @@ git+https://github.com/openai/CLIP.git
 transformers>=4.45.0
 accelerate
 
+# AI providers
+ollama
+openai
+python-dotenv
+
 # UI & Web
 python-fasthtml

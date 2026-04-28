@@ -1,0 +1,24 @@
+# Core Logic & Simulation
+exifread==3.0.0
+numpy
+pandas
+pydantic-settings
+
+# Database & Storage
+lancedb
+pyarrow
+
+# AI & Computer Vision
+opencv-python
+pillow
+torch
+torchvision
+ftfy
+regex
+tqdm
+git+https://github.com/openai/CLIP.git
+transformers>=4.45.0
+accelerate
+
+# UI & Web
+python-fasthtml

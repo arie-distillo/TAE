@@ -1,7 +1,7 @@
 import logging
-import sys
-import os
 import cv2
+import os
+import sys
 from pathlib import Path
 from config import settings
 from core.sim_provider import SimD3Environment
@@ -10,130 +10,106 @@ from core.database import TacticalDatabase
 from ai.search import SearchLibrarian
 from ai.analyst import TacticalAnalyst
 
-# --- LOGGING CONFIGURATION ---
+# Restoration of detailed logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("tae_operation.log")
-    ]
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("TAE-Core")
 
 def main():
-    logger.info("=== TAE TACTICAL ENGINE: MISSION START ===")
+    logger.info("=== MISSION START: Grounded Tactical Reasoning ===")
 
-    # 1. SETUP COMPONENTS
+    # Component Init
+    sim = SimD3Environment(settings.SIM_METADATA_FILE)
+    spatial = SpatialEngine(settings.SENSOR_WIDTH_MM, settings.FOCAL_LENGTH_MM)
+    search_lib = SearchLibrarian(settings.CLIP_MODEL)
+    db = TacticalDatabase()
+    db.initialize_table(vector_dim=512)
+    analyst = TacticalAnalyst(settings.AI_PROVIDER, settings.VLM_MODEL, settings.OPENROUTER_API_KEY)
+
+    # 1. THEATER INGESTION
     try:
-        sim = SimD3Environment(settings.SIM_METADATA_FILE)
-        spatial = SpatialEngine(sensor_width=settings.SENSOR_WIDTH_MM, focal_length=settings.FOCAL_LENGTH_MM)
-        search_lib = SearchLibrarian(settings.CLIP_MODEL)
-        
-        db = TacticalDatabase()
-        # Initialize table with fixed 512-dim schema
-        db.initialize_table(vector_dim=512)
-
-        analyst = TacticalAnalyst(
-            provider=settings.AI_PROVIDER,
-            model_name=settings.VLM_MODEL,
-            api_key=settings.OPENROUTER_API_KEY
-        )
-        logger.info("All components initialized successfully.")
-    except Exception as e:
-        logger.critical(f"Initialization failed: {e}")
-        return
-
-    # 2. THEATER PERSISTENCE CHECK (SKIP INGESTION IF INDEXED)
-    # We check if the table exists and has rows to avoid redundant CLIP encoding
-    try:
-        table = db.db.open_table("theater_index")
-        row_count = table.count_rows()
+        table_names = db.db.table_names()
+        if "theater_index" in table_names:
+            table = db.db.open_table("theater_index")
+            if table.count_rows() > 0:
+                logger.info(f"Persistent index found ({table.count_rows()} frames). Skipping ingestion.")
+                ingest_needed = False
+            else:
+                ingest_needed = True
+        else:
+            ingest_needed = True
     except:
-        row_count = 0
+        ingest_needed = True
 
-    if row_count > 0:
-        logger.info(f"Existing theater index found with {row_count} frames. Skipping ingestion.")
-    else:
+    if ingest_needed:
         logger.info("Starting Fresh Ingestion Phase...")
-        frame_count = 0
-        for img_cv2, telemetry in sim:
-            try:
-                frame_count += 1
-                # A. Semantic Encoding
-                vector = search_lib.encode_image(img_cv2)
+        for i, (img_cv2, telemetry) in enumerate(sim):
+            vector = search_lib.encode_image(img_cv2)
+            db.add_observation(vector, telemetry['full_path'], telemetry, 0)
+            if (i+1) % 10 == 0: logger.info(f"Indexed {i+1} frames...")
 
-                # B. Spatial Projection
-                projection = spatial.get_projection_data(telemetry, img_cv2.shape[1])
-                
-                # C. Indexing
-                db.add_observation(
-                    vector=vector,
-                    image_path=telemetry['full_path'],
-                    telemetry=telemetry,
-                    footprint=projection['ground_width_m']
-                )
-                if frame_count % 10 == 0:
-                    logger.info(f"Indexed {frame_count} frames...")
-            except Exception as e:
-                logger.error(f"Error indexing frame {frame_count}: {e}")
-        logger.info(f"Ingestion Complete. {frame_count} frames indexed.")
-
-    # 3. TACTICAL QUERY & SEARCH
+    # 2. Search & Analyze
     user_request = "Find a helipad marked with H"
-    logger.info(f"Executing Semantic Search: '{user_request}'")
+    logger.info(f"Querying Vector DB: {user_request}")
     
     query_vec = search_lib.encode_text(user_request)
     top_candidates = db.semantic_search(query_vec, limit=3)
+    
+    paths = [c['image_path'] for c in top_candidates]
+    intel = analyst.analyze_multiple_views(paths, user_request)
 
-    if not top_candidates:
-        logger.warning("No targets found for the current query.")
-        return
-
-    # 4. VISUAL VALIDATION & DECK PREPARATION
-    logger.info("Generating visual validation frames for candidates...")
+    # 3. Grounding & Multi-Target Bounding Box Overlay
     os.makedirs("tactical_results", exist_ok=True)
-    candidate_paths = []
-
-    print("\n" + "="*60)
-    print("TARGET DECK RETRIEVED")
-    print("="*60)
+    all_vlm_targets = intel.get('targets', [])
 
     for i, cand in enumerate(top_candidates):
         img_path = cand['image_path']
-        candidate_paths.append(img_path)
-        
-        # Load image for overlaying coordinates
+        fname = Path(img_path).name
         img = cv2.imread(img_path)
-        if img is not None:
-            h, w, _ = img.shape
-            # Draw Target Crosshair
-            cv2.drawMarker(img, (w//2, h//2), (0, 255, 0), cv2.MARKER_CROSS, 100, 5)
+        if img is None: continue
+        h, w, _ = img.shape
+
+        # Filter all targets for this specific filename
+        frame_targets = [t for t in all_vlm_targets if t['filename'].lower() == fname.lower()]
+        
+        if frame_targets:
+            for target_data in frame_targets:
+                # FIX: VLM is outputting [xmin, ymin, xmax, ymax] 
+                # (Verified because values > 3040 height are appearing in indices 0 and 2)
+                v_xmin, v_ymin, v_xmax, v_ymax = target_data['bbox']
+                
+                is_pixels = max(v_xmin, v_ymin, v_xmax, v_ymax) > 1001
+                
+                if is_pixels:
+                    p1 = (int(v_xmin), int(v_ymin))
+                    p2 = (int(v_xmax), int(v_ymax))
+                else:
+                    p1 = (int(v_xmin * w / 1000), int(v_ymin * h / 1000))
+                    p2 = (int(v_xmax * w / 1000), int(v_ymax * h / 1000))
+
+                # Draw the Bounding Box
+                cv2.rectangle(img, p1, p2, (0, 255, 0), 5)
+                cv2.putText(img, "TARGET", (p1[0], p1[1]-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
-            # Burn Coordinates into image
-            overlay_text = f"LAT: {cand['lat']:.6f} LON: {cand['lon']:.6f}"
-            cv2.rectangle(img, (10, h-60), (w-10, h-10), (0,0,0), -1)
-            cv2.putText(img, overlay_text, (30, h-25), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            val_path = f"tactical_results/cand_{i+1}_{Path(img_path).name}"
-            cv2.imwrite(val_path, img)
+            color, label = (0, 255, 0), "VLM GROUNDED"
+        else:
+            # Fallback marker only if NO targets found for this image
+            color, label = (0, 165, 255), "CENTER FALLBACK"
+            cv2.drawMarker(img, (w//2, h//2), color, cv2.MARKER_CROSS, 100, 5)
 
-        print(f"[{i+1}] Frame: {Path(img_path).name}")
-        print(f"    Location: {cand['lat']:.6f}, {cand['lon']:.6f}")
-        print(f"    Confidence: {1 - cand.get('_distance', 0):.4f}")
-        print(f"    Validation Image: {val_path}")
+        # Tactical Status Bar
+        status_text = f"{label} | LAT: {cand['lat']:.6f} LON: {cand['lon']:.6f}"
+        cv2.rectangle(img, (0, h-80), (w, h), (0,0,0), -1)
+        cv2.putText(img, status_text, (40, h-30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
+        
+        cv2.imwrite(f"tactical_results/grounded_{fname}", img)
 
-    # 5. MULTI-ANGLE PERSISTENCE (MAP) ANALYSIS
-    logger.info("Requesting Synthesized Tactical Report...")
-    report = analyst.analyze_multiple_views(candidate_paths, user_request)
-    
-    print("\n" + "="*60)
-    print("SYNTHESIZED TACTICAL INTELLIGENCE")
-    print("="*60)
-    print(report)
-    print("="*60 + "\n")
-
-    logger.info("=== TAE MISSION COMPLETE ===")
+    print(f"\nTACTICAL REPORT:\n{intel.get('report', 'No data')}\n")
+    logger.info("=== MISSION COMPLETE ===")
 
 if __name__ == "__main__":
     main()

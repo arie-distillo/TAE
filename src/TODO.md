@@ -3,7 +3,7 @@
 - [] skip ingestion when it's already done
 
 ### Misc
- - [] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini chat)
+ - [] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini)
 
 ### non-generative Visual models
 - [] learn CLIP

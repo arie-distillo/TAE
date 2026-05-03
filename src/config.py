@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     # Define the keys here. If they exist in .env, they get populated.
     AI_PROVIDER: str = "openrouter"
     OPENROUTER_API_KEY: str | None = None  # Loaded from .env
-    VLM_MODEL: str = "qwen/qwen-2.5-vl-72b-instruct"
+    VLM_MODEL: str = "qwen/qwen-vl-plus"
 
     # Path to the generated JSON file
     SIM_METADATA_FILE: str = "./data/raw/sim_env_1/pose_metadata.json"
@@ -19,8 +19,11 @@ class Settings(BaseSettings):
     # Model Configs
     CLIP_MODEL: str = "ViT-B/32"
 
-    # DJI Mini 2 / Mavic Air defaults
+    # DJI Mini / Mavic Air defaults
     SENSOR_WIDTH_MM: float = 6.3
     FOCAL_LENGTH_MM: float = 4.5
+    SENSOR_HEIGHT_MM: float = 4.7 # DJI Mini 2, Mavic Air, etc. Adjust if using a different drone.
+    SENSOR_WIDTH_MM: float = 6.3
+
 
 settings = Settings()

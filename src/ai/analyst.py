@@ -5,11 +5,31 @@ import logging
 from pathlib import Path
 
 import cv2
+import numpy as np
 import ollama
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
 logger = logging.getLogger("TacticalAnalyst")
+
+
+# ---------------------------------------------------------------------------
+# Tile reconstruction
+# ---------------------------------------------------------------------------
+
+def _load_tile_cv2(candidate: dict) -> np.ndarray | None:
+    """
+    Reconstructs a tile by cropping its parent frame.
+    Tiles are never stored on disk — this is the single reconstruction point
+    used by the analyst whenever it needs the actual pixel data.
+    """
+    img = cv2.imread(candidate['parent_path'])
+    if img is None:
+        logger.warning(f"Cannot read parent frame: {candidate['parent_path']}")
+        return None
+    x, y = candidate['tile_x'], candidate['tile_y']
+    w, h = candidate['tile_w'], candidate['tile_h']
+    return img[y:y + h, x:x + w]
 
 
 # ---------------------------------------------------------------------------
@@ -22,6 +42,7 @@ QUERY_INTENT_KEYWORDS = {
     "change":           ["unusual", "anomaly", "anomalies", "out of place", "changed", "different"],
     "object_search":    [],  # default fallback
 }
+
 
 def classify_query(user_query: str) -> str:
     q = user_query.lower()
@@ -45,13 +66,14 @@ _BBOX_RULES = (
     "- confidence: 0.0 (uncertain) to 1.0 (certain)\n"
 )
 
+
 def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tuple[str, bool]:
     """
     Returns (prompt, expects_bboxes).
-    filename and image dimensions are passed so the VLM knows the coordinate space.
+    Image dimensions are passed explicitly so the VLM knows the pixel space.
     """
     intent = classify_query(user_query)
-    img_info = f"Image: {filename} ({img_w}×{img_h} pixels)"
+    img_info = f"Image: {filename} ({img_w}x{img_h} pixels)"
 
     if intent == "object_search":
         prompt = (
@@ -66,8 +88,8 @@ def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tup
             '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0}\n'
             '  ]\n'
             "}\n\n"
-            + _BBOX_RULES +
-            "No markdown, no text outside the JSON object."
+            + _BBOX_RULES
+            + "No markdown, no text outside the JSON object."
         )
         return prompt, True
 
@@ -84,8 +106,8 @@ def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tup
             '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0}\n'
             '  ]\n'
             "}\n\n"
-            + _BBOX_RULES +
-            "No markdown, no text outside the JSON object."
+            + _BBOX_RULES
+            + "No markdown, no text outside the JSON object."
         )
         return prompt, True
 
@@ -117,8 +139,8 @@ def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tup
             '"confidence": 0.0, "reason": "why flagged"}\n'
             '  ]\n'
             "}\n\n"
-            + _BBOX_RULES +
-            "No markdown, no text outside the JSON object."
+            + _BBOX_RULES
+            + "No markdown, no text outside the JSON object."
         )
         return prompt, True
 
@@ -152,45 +174,68 @@ class TacticalAnalyst:
     # Public interface
     # ------------------------------------------------------------------
 
-    def analyze_multiple_views(self, image_paths: list[str], user_query: str) -> dict:
+    def analyze_multiple_views(self, candidates: list[dict], user_query: str) -> dict:
         """
-        Analyzes each tile independently and merges results.
-        Each image is sent in a separate VLM call — no batching.
+        Analyzes each candidate tile independently and merges results.
+
+        Accepts candidate dicts (from LanceDB) rather than file paths because
+        tiles are not stored on disk — each tile is reconstructed on demand
+        from its parent frame using the stored pixel offsets.
+
+        Only tiles with confirmed detections appear in the final report.
+        Tiles where the VLM found nothing are counted but not reported.
         """
         intent = classify_query(user_query)
         logger.info(
             f"Intent: {intent} | Query: {user_query} | "
-            f"Tiles: {[Path(p).name for p in image_paths]}"
+            f"Tiles: {[Path(c['image_path']).name for c in candidates]}"
         )
 
         merged_targets = []
-        merged_reports = []
+        hit_reports    = []
+        miss_count     = 0
 
-        for path in image_paths:
-            filename = Path(path).name
+        for cand in candidates:
+            filename = Path(cand['image_path']).name
 
-            # Read actual pixel dimensions for prompt and normalization
-            img = cv2.imread(path)
-            if img is None:
-                logger.warning(f"Cannot read tile for analysis: {path}")
+            # Reconstruct tile from parent frame — no file I/O for tiles
+            tile_img = _load_tile_cv2(cand)
+            if tile_img is None:
+                logger.warning(f"Skipping {filename} — could not load parent frame")
                 continue
-            img_h, img_w = img.shape[:2]
 
+            img_h, img_w = tile_img.shape[:2]
             prompt, expects_bboxes = _build_prompt(user_query, filename, img_w, img_h)
 
             try:
                 result = self._call_vlm_with_validation(
-                    path, prompt, expects_bboxes, img_w, img_h
+                    tile_img, filename, prompt, expects_bboxes, img_w, img_h
                 )
-                merged_reports.append(f"{filename}: {result.get('report', '')}")
-                merged_targets.extend(result.get('targets', []))
+                targets = result.get('targets', [])
+                if targets:
+                    hit_reports.append(f"{filename}: {result.get('report', '')}")
+                    merged_targets.extend(targets)
+                else:
+                    miss_count += 1
+                    logger.info(f"No detection in {filename} (VLM confirmed absent)")
+
             except Exception as e:
                 logger.error(f"VLM failed for {filename} after retries: {e}")
-                merged_reports.append(f"{filename}: ERROR - {e}")
+
+        summary = (
+            f"{len(hit_reports)} tiles with detections, "
+            f"{miss_count} tiles confirmed empty"
+        )
+        report = (
+            " | ".join(hit_reports)
+            if hit_reports
+            else f"No detections found. {summary}"
+        )
 
         return {
-            "report":  " | ".join(merged_reports),
+            "report":  report,
             "targets": merged_targets,
+            "summary": summary,
         }
 
     # ------------------------------------------------------------------
@@ -199,11 +244,8 @@ class TacticalAnalyst:
 
     def _normalize_targets(self, targets: list, img_w: int, img_h: int) -> list:
         """
-        Detects whether the VLM returned normalized (0-1000) or pixel coordinates
-        and converts everything to tile pixel coordinates.
-
-        Since we now pass actual image dimensions in the prompt, the VLM should
-        return pixel coords — but this guards against models that ignore the prompt.
+        Safety net: converts 0-1000 normalized coords to pixels if the VLM
+        ignored the explicit pixel dimensions in the prompt.
         """
         normalized = []
         for t in targets:
@@ -212,14 +254,13 @@ class TacticalAnalyst:
                 continue
             xmin, ymin, xmax, ymax = [float(v) for v in bbox]
 
-            # Heuristic: if all values <= 1000 but image is larger, treat as 0-1000 normalized
             if max(xmin, ymin, xmax, ymax) <= 1000 and max(img_w, img_h) > 1000:
                 xmin = round(xmin * img_w / 1000)
                 ymin = round(ymin * img_h / 1000)
                 xmax = round(xmax * img_w / 1000)
                 ymax = round(ymax * img_h / 1000)
                 logger.info(
-                    f"Converted 0-1000 → pixel bbox: "
+                    f"Converted 0-1000 to pixel bbox: "
                     f"[{int(xmin)},{int(ymin)},{int(xmax)},{int(ymax)}]"
                 )
 
@@ -228,9 +269,8 @@ class TacticalAnalyst:
 
     def _validate_targets(self, targets: list, img_w: int, img_h: int) -> bool:
         """
-        Validates bboxes in pixel coordinate space.
-        Returns True if all targets are geometrically plausible.
-        An empty list is valid (object not present in tile).
+        Validates bboxes in pixel space.
+        Empty list is valid — means object not present in this tile.
         """
         for t in targets:
             bbox = t.get('bbox', [])
@@ -242,9 +282,8 @@ class TacticalAnalyst:
                 logger.warning(f"Inverted bbox: {bbox}")
                 return False
             if xmin < 0 or ymin < 0 or xmax > img_w or ymax > img_h:
-                logger.warning(f"Bbox out of image bounds {img_w}×{img_h}: {bbox}")
+                logger.warning(f"Bbox out of bounds {img_w}x{img_h}: {bbox}")
                 return False
-            # Reject full-tile bbox — almost certainly a hallucination
             if (xmax - xmin) > 0.95 * img_w and (ymax - ymin) > 0.95 * img_h:
                 logger.warning(f"Full-tile bbox (likely hallucination): {bbox}")
                 return False
@@ -254,8 +293,8 @@ class TacticalAnalyst:
         self, targets: list, threshold: float = 0.4
     ) -> list:
         """
-        Drops targets where the VLM expressed low confidence.
-        Models that ignore the confidence field default to 1.0 (kept).
+        Drops targets below the confidence threshold.
+        Models that omit the confidence field default to 1.0 (always kept).
         """
         filtered = []
         for t in targets:
@@ -280,16 +319,17 @@ class TacticalAnalyst:
     )
     def _call_vlm_with_validation(
         self,
-        image_path: str,
-        prompt: str,
+        tile_img:       np.ndarray,
+        filename:       str,
+        prompt:         str,
         expects_bboxes: bool,
-        img_w: int,
-        img_h: int,
+        img_w:          int,
+        img_h:          int,
     ) -> dict:
         if self.provider == "openrouter":
-            res_text = self._analyze_openrouter(image_path, prompt)
+            res_text = self._analyze_openrouter(tile_img, filename, prompt)
         else:
-            res_text = self._analyze_ollama(image_path, prompt)
+            res_text = self._analyze_ollama(tile_img, filename, prompt)
 
         logger.debug(f"Raw VLM response: {res_text}")
         clean = re.sub(r'^```json\s*|\s*```$', '', res_text.strip(), flags=re.MULTILINE)
@@ -305,13 +345,21 @@ class TacticalAnalyst:
         return result
 
     # ------------------------------------------------------------------
-    # Provider backends — single image per call
+    # Provider backends — encode numpy tile directly, no disk I/O
     # ------------------------------------------------------------------
 
-    def _analyze_openrouter(self, image_path: str, prompt: str) -> str:
-        img_b64 = base64.b64encode(open(image_path, "rb").read()).decode('utf-8')
-        size_kb = len(img_b64) * 3 / 4 / 1024  # approximate decoded size
-        logger.info(f"Sending tile to VLM: {Path(image_path).name} (~{size_kb:.0f} KB)")
+    def _encode_tile(self, tile_img: np.ndarray, filename: str) -> str:
+        """Encodes a numpy array as a base64 JPEG string."""
+        _, buf = cv2.imencode('.jpg', tile_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        encoded = base64.b64encode(buf.tobytes()).decode('utf-8')
+        size_kb = len(buf) / 1024
+        logger.info(f"Encoding tile for VLM: {filename} (~{size_kb:.0f} KB)")
+        return encoded
+
+    def _analyze_openrouter(
+        self, tile_img: np.ndarray, filename: str, prompt: str
+    ) -> str:
+        img_b64 = self._encode_tile(tile_img, filename)
 
         response = self.client.chat.completions.create(
             model=self.model_name,
@@ -327,14 +375,18 @@ class TacticalAnalyst:
         )
         return response.choices[0].message.content
 
-    def _analyze_ollama(self, image_path: str, prompt: str) -> str:
+    def _analyze_ollama(
+        self, tile_img: np.ndarray, filename: str, prompt: str
+    ) -> str:
+        img_b64 = self._encode_tile(tile_img, filename)
+
         response = ollama.chat(
             model=self.model_name,
             format='json',
             messages=[{
-                'role': 'user',
+                'role':    'user',
                 'content': prompt,
-                'images': [image_path]
+                'images':  [img_b64]
             }]
         )
         return response['message']['content']

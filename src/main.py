@@ -4,7 +4,9 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+import numpy as np
 
+from ai import analyst
 from config import settings
 from core.sim_provider import SimD3Environment
 from core.spatial import SpatialEngine
@@ -25,77 +27,65 @@ logger = logging.getLogger("TAE-Core")
 # ---------------------------------------------------------------------------
 
 def run_ingestion(sim, spatial, search_lib, db):
-    """
-    Tiles each frame, computes per-tile CLIP embeddings and ground footprints,
-    and writes all tiles to LanceDB.
-
-    Tiles are written as temporary JPEG files so the VLM can read them by path
-    at query time. Tile files are stored under settings.TILE_CACHE_DIR and
-    persist between runs (they are not re-generated if ingestion is skipped).
-    """
-    tile_cache = Path(settings.TILE_CACHE_DIR)
-    tile_cache.mkdir(parents=True, exist_ok=True)
-
-    total_tiles = 0
     logger.info("Starting Fresh Ingestion Phase...")
+    total_tiles = 0
 
     for frame_idx, (img_cv2, telemetry) in enumerate(sim):
         img_h, img_w = img_cv2.shape[:2]
-        frame_name = Path(telemetry['full_path']).stem
 
-        # Compute full-frame footprint — used as basis for tile footprints
         frame_footprint = spatial.compute_footprint(
-            lat=telemetry['lat'],
-            lon=telemetry['lon'],
-            alt_m=telemetry['z'],
-            gimbal_yaw_deg=telemetry['gimbal_yaw'],
-            img_w_px=img_w,
-            img_h_px=img_h,
+            lat=telemetry['lat'], lon=telemetry['lon'],
+            alt_m=telemetry['z'], gimbal_yaw_deg=telemetry['gimbal_yaw'],
+            img_w_px=img_w, img_h_px=img_h,
         )
 
-        frame_tiles = 0
-        for tile_img, x_off, y_off, tile_w, tile_h in spatial.tile_image(img_cv2, tile_size=settings.TILE_SIZE):
-            # Stable tile filename — same tile always gets same path across runs
-            tile_filename = f"{frame_name}_tx{x_off}_ty{y_off}.jpg"
-            tile_path = tile_cache / tile_filename
+        # Collect all tiles for this frame first
+        tiles = list(spatial.tile_image(img_cv2))  # [(tile_img, x, y, w, h), ...]
 
-            # Write tile to disk (skip if already cached)
-            if not tile_path.exists():
-                cv2.imwrite(str(tile_path), tile_img,
-                            [cv2.IMWRITE_JPEG_QUALITY, 90])
+        # FIX 1: Single batched CLIP forward pass for all tiles in the frame
+        tile_imgs = [t[0] for t in tiles]
+        vectors = search_lib.encode_image_batch(tile_imgs)  # shape (N, 512)
 
-            # Tile footprint via bilinear interpolation of frame corners
+        # FIX 3: Accumulate all rows, write once per frame
+        rows = []
+        for (tile_img, x_off, y_off, tile_w, tile_h), vector in zip(tiles, vectors):
             tile_footprint = spatial.compute_tile_footprint(
                 x_off=x_off, y_off=y_off,
                 tile_w=tile_w, tile_h=tile_h,
                 img_w=img_w, img_h=img_h,
                 frame_footprint=frame_footprint,
             )
+            # FIX 2: No disk write — store parent path + offsets only
+            rows.append({
+                "vector":      vector.tolist(),
+                "image_path":  str(telemetry['full_path']),  # parent path, not tile
+                "parent_path": str(telemetry['full_path']),
+                "tile_x":      int(x_off),
+                "tile_y":      int(y_off),
+                "tile_w":      int(tile_w),
+                "tile_h":      int(tile_h),
+                "lat":         float(telemetry['lat']),
+                "lon":         float(telemetry['lon']),
+                "alt_m":       float(telemetry['z']),
+                "gimbal_yaw":  float(telemetry.get('gimbal_yaw', 0.0)),
+                "gsd_cm_px":   float(tile_footprint['gsd_cm_px']),
+                "fp_nw_lat":   float(tile_footprint['nw'][0]),
+                "fp_nw_lon":   float(tile_footprint['nw'][1]),
+                "fp_ne_lat":   float(tile_footprint['ne'][0]),
+                "fp_ne_lon":   float(tile_footprint['ne'][1]),
+                "fp_se_lat":   float(tile_footprint['se'][0]),
+                "fp_se_lon":   float(tile_footprint['se'][1]),
+                "fp_sw_lat":   float(tile_footprint['sw'][0]),
+                "fp_sw_lon":   float(tile_footprint['sw'][1]),
+            })
 
-            # CLIP embedding of the tile
-            vector = search_lib.encode_image(tile_img)
-
-            db.add_observation(
-                vector=vector,
-                tile_path=str(tile_path),
-                telemetry=telemetry,
-                tile_footprint=tile_footprint,
-                tile_x=x_off,
-                tile_y=y_off,
-                tile_w=tile_w,
-                tile_h=tile_h,
-            )
-            frame_tiles += 1
-
-        total_tiles += frame_tiles
+        db.add_observations_batch(rows)
+        total_tiles += len(rows)
 
         if (frame_idx + 1) % 10 == 0:
             logger.info(
-                f"Ingested {frame_idx + 1} frames | "
-                f"{total_tiles} tiles so far | "
-                f"GSD: {frame_footprint['gsd_cm_px']} cm/px | "
-                f"Frame coverage: {frame_footprint['ground_w_m']}m × "
-                f"{frame_footprint['ground_h_m']}m"
+                f"Ingested {frame_idx + 1} frames | {total_tiles} tiles | "
+                f"GSD: {frame_footprint['gsd_cm_px']} cm/px"
             )
 
     logger.info(f"Ingestion complete — {total_tiles} tiles indexed.")
@@ -127,9 +117,7 @@ def run_vlm_analysis(candidates, user_request, analyst) -> dict:
     Sends each candidate tile independently to the VLM for grounding.
     Returns merged { report, targets } across all tiles.
     """
-    paths = [c['image_path'] for c in candidates]
-    logger.info(f"Sending {len(paths)} tiles to VLM for grounding...")
-    intel = analyst.analyze_multiple_views(paths, user_request)
+    intel = analyst.analyze_multiple_views(candidates, user_request)
     logger.info(f"VLM report: {intel.get('report', 'No report returned')}")
     return intel
 
@@ -137,6 +125,21 @@ def run_vlm_analysis(candidates, user_request, analyst) -> dict:
 # ---------------------------------------------------------------------------
 # Phase 4: Render
 # ---------------------------------------------------------------------------
+
+def _load_tile(candidate: dict) -> np.ndarray | None:
+    """
+    Reconstructs a tile by cropping its parent frame.
+    Called at query time — tiles are never stored on disk.
+    """
+    img = cv2.imread(candidate['parent_path'])
+    if img is None:
+        logger.warning(f"Cannot read parent frame: {candidate['parent_path']}")
+        return None
+    x = candidate['tile_x']
+    y = candidate['tile_y']
+    w = candidate['tile_w']
+    h = candidate['tile_h']
+    return img[y:y+h, x:x+w]
 
 def render_results(candidates, intel):
     """
@@ -148,12 +151,11 @@ def render_results(candidates, intel):
     all_targets = intel.get('targets', [])
 
     for cand in candidates:
-        tile_path = cand['image_path']
-        fname = Path(tile_path).name
-        img = cv2.imread(tile_path)
+        fname = Path(cand['image_path']).name   # tile filename for target matching
+        img = _load_tile(cand)                  # ← reconstruct from parent frame
 
         if img is None:
-            logger.warning(f"Could not read tile: {tile_path}")
+            logger.warning(f"Could not read tile: {cand['image_path']}")
             continue
 
         h, w = img.shape[:2]

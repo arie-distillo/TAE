@@ -17,7 +17,6 @@ class Settings(BaseSettings):
     MAP_IMAGE: str = "./data/maps/baseline_satellite.png"
     
     # Tile configuration
-    TILE_CACHE_DIR:   str   = "./data/processed/tiles"
     TILE_SIZE:       int   = 640  # Tile size in pixels (e.g., 512x512)
     TILE_OVERLAP:    float = 0.2   # 20% overlap
     

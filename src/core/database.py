@@ -101,6 +101,11 @@ class TacticalDatabase:
             "fp_sw_lon":   float(tile_footprint['sw'][1]),
         }])
 
+    def add_observations_batch(self, rows: list[dict]):
+        """Write all tile rows for one frame in a single LanceDB call."""
+        if rows:
+            self.table.add(rows)
+
     def semantic_search(self, query_vector, limit=5) -> list:
         return self.table.search(query_vector).limit(limit).to_list()
 

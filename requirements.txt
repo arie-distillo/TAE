@@ -1,6 +1,7 @@
 # Core Logic & Simulation
 exifread==3.0.0
 numpy
+torch
 pandas
 pydantic-settings
 
@@ -24,6 +25,7 @@ accelerate
 ollama
 openai
 python-dotenv
+tenacity
 
 # UI & Web
 python-fasthtml

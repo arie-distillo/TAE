@@ -3,9 +3,9 @@
 - [x] skip ingestion when it's already done
 
 ### Misc
- - [] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini)
- - [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot
- - [] Merge detections → NMS to remove duplicates from overlapping tiles
+- [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot
+- [x] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini)
+- [x] Merge detections → NMS to remove duplicates from overlapping tiles
 
 ### non-generative Visual models
 - [x] learn CLIP
@@ -23,3 +23,6 @@
 
 ### Jetson
 - [] what one to purchase - dev kit?
+
+### UI
+- [] TBD

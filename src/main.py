@@ -5,6 +5,7 @@ import sys
 import tempfile
 from pathlib import Path
 import numpy as np
+import time
 
 from ai import analyst
 from config import settings
@@ -13,6 +14,7 @@ from core.spatial import SpatialEngine
 from core.database import TacticalDatabase
 from ai.search import SearchLibrarian
 from ai.analyst import TacticalAnalyst
+from core.object_detection import merge_detections, ObjectInstance, Detection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,11 +42,14 @@ def run_ingestion(sim, spatial, search_lib, db):
         )
 
         # Collect all tiles for this frame first
+        t0 = time.perf_counter()
         tiles = list(spatial.tile_image(img_cv2))  # [(tile_img, x, y, w, h), ...]
+        t1 = time.perf_counter()
 
         # FIX 1: Single batched CLIP forward pass for all tiles in the frame
         tile_imgs = [t[0] for t in tiles]
         vectors = search_lib.encode_image_batch(tile_imgs)  # shape (N, 512)
+        t2 = time.perf_counter()
 
         # FIX 3: Accumulate all rows, write once per frame
         rows = []
@@ -78,9 +83,17 @@ def run_ingestion(sim, spatial, search_lib, db):
                 "fp_sw_lat":   float(tile_footprint['sw'][0]),
                 "fp_sw_lon":   float(tile_footprint['sw'][1]),
             })
-
+        t3 = time.perf_counter()
+        
         db.add_observations_batch(rows)
+        t4 = time.perf_counter()
         total_tiles += len(rows)
+
+        if frame_idx == 0:
+            logger.info(
+                f"Frame 0 timing: tiling={t1-t0:.2f}s | "
+                f"CLIP={t2-t1:.2f}s | rows={t3-t2:.2f}s | DB={t4-t3:.2f}s"
+            )
 
         if (frame_idx + 1) % 10 == 0:
             logger.info(
@@ -141,71 +154,56 @@ def _load_tile(candidate: dict) -> np.ndarray | None:
     h = candidate['tile_h']
     return img[y:y+h, x:x+w]
 
-def render_results(candidates, intel):
-    """
-    Draws VLM bounding boxes on candidate tiles and saves annotated images.
-    Bboxes are in tile pixel coordinates — no frame-level translation needed.
-    Also logs the geo-coordinates of each detected target.
-    """
+def render_results(instances: list[ObjectInstance]):
     os.makedirs("tactical_results", exist_ok=True)
-    all_targets = intel.get('targets', [])
 
-    for cand in candidates:
-        fname = Path(cand['image_path']).name   # tile filename for target matching
-        img = _load_tile(cand)                  # ← reconstruct from parent frame
+    for inst in instances:
+        best = inst.best   # highest-confidence detection
 
-        if img is None:
-            logger.warning(f"Could not read tile: {cand['image_path']}")
+        # Render the best view
+        tile_img = _load_tile(best.candidate)
+        if tile_img is None:
             continue
 
-        h, w = img.shape[:2]
-        frame_targets = [t for t in all_targets
-                         if t['filename'].lower() == fname.lower()]
+        h, w = tile_img.shape[:2]
+        xmin, ymin, xmax, ymax = [int(v) for v in best.bbox]
+        cv2.rectangle(tile_img, (xmin, ymin), (xmax, ymax), (0, 255, 0), 3)
 
-        if frame_targets:
-            for target in frame_targets:
-                # Bboxes are in tile pixel coords — render directly
-                xmin, ymin, xmax, ymax = [int(v) for v in target['bbox']]
-                p1, p2 = (xmin, ymin), (xmax, ymax)
-                cv2.rectangle(img, p1, p2, (0, 255, 0), 3)
-                label = f"TARGET ({target.get('confidence', '?')})"
-                cv2.putText(img, label, (p1[0], max(p1[1] - 10, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        tag = f"OBJ#{inst.instance_id} ({best.confidence:.2f})"
+        if inst.is_multiangle:
+            tag += f" [{len(inst.detections)} angles]"
+        cv2.putText(tile_img, tag, (xmin, max(ymin-10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                # Log geo-coordinates of bbox center
-                cx_frac = ((xmin + xmax) / 2) / w
-                cy_frac = ((ymin + ymax) / 2) / h
-                nw = (cand['fp_nw_lat'], cand['fp_nw_lon'])
-                ne = (cand['fp_ne_lat'], cand['fp_ne_lon'])
-                se = (cand['fp_se_lat'], cand['fp_se_lon'])
-                sw = (cand['fp_sw_lat'], cand['fp_sw_lon'])
-                target_lat = ((1 - cy_frac) * ((1 - cx_frac) * nw[0] + cx_frac * ne[0]) +
-                                   cy_frac  * ((1 - cx_frac) * sw[0] + cx_frac * se[0]))
-                target_lon = ((1 - cy_frac) * ((1 - cx_frac) * nw[1] + cx_frac * ne[1]) +
-                                   cy_frac  * ((1 - cx_frac) * sw[1] + cx_frac * se[1]))
-                logger.info(
-                    f"Target geo: {target_lat:.6f}, {target_lon:.6f} | "
-                    f"tile: {fname} | confidence: {target.get('confidence', '?')}"
-                )
+        # Also mark secondary angles with a different colour
+        for secondary in inst.detections[1:]:
+            sec_img = _load_tile(secondary.candidate)
+            if sec_img is None:
+                continue
+            sx1, sy1, sx2, sy2 = [int(v) for v in secondary.bbox]
+            cv2.rectangle(sec_img, (sx1, sy1), (sx2, sy2), (255, 165, 0), 3)
+            cv2.putText(sec_img, f"OBJ#{inst.instance_id} angle#{inst.detections.index(secondary)+1}",
+                        (sx1, max(sy1-10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+            fname = Path(secondary.filename).stem
+            cv2.imwrite(f"tactical_results/obj{inst.instance_id}_angle{inst.detections.index(secondary)+1}_{fname}.jpg", sec_img)
 
-            color, label = (0, 255, 0), "VLM GROUNDED"
-        else:
-            cv2.drawMarker(img, (w // 2, h // 2), (0, 165, 255),
-                           cv2.MARKER_CROSS, 60, 3)
-            color, label = (0, 165, 255), "NO DETECTION"
+        status = (f"OBJ#{inst.instance_id} | "
+                  f"LAT:{best.lat:.6f} LON:{best.lon:.6f} | "
+                  f"conf:{best.confidence:.2f} | "
+                  f"{'MULTI-ANGLE x'+str(len(inst.detections)) if inst.is_multiangle else 'SINGLE VIEW'}")
+        cv2.rectangle(tile_img, (0, h-50), (w, h), (0, 0, 0), -1)
+        cv2.putText(tile_img, status, (10, h-15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        # Status bar
-        fp_info = (f"NW({cand['fp_nw_lat']:.5f},{cand['fp_nw_lon']:.5f}) "
-                   f"SE({cand['fp_se_lat']:.5f},{cand['fp_se_lon']:.5f})")
-        status = f"{label} | {fp_info} | GSD:{cand['gsd_cm_px']:.1f}cm/px"
-        cv2.rectangle(img, (0, h - 60), (w, h), (0, 0, 0), -1)
-        cv2.putText(img, status, (10, h - 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
-
-        out_path = f"tactical_results/grounded_{fname}"
-        cv2.imwrite(out_path, img)
-        logger.info(f"Saved: {out_path}")
-
+        fname = Path(best.filename).stem
+        cv2.imwrite(f"tactical_results/obj{inst.instance_id}_best_{fname}.jpg", tile_img)
+        logger.info(
+            f"Object #{inst.instance_id} | "
+            f"{best.lat:.6f},{best.lon:.6f} | "
+            f"conf:{best.confidence:.2f} | "
+            f"{'multi-angle: '+str(len(inst.detections))+' views' if inst.is_multiangle else 'single view'}"
+        )
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -237,7 +235,7 @@ def main():
                                  settings.VLM_MODEL,
                                  settings.OPENROUTER_API_KEY)
 
-    db.initialize_table(vector_dim=512)
+    db.initialize_table(vector_dim=settings.CLIP_DIM)
 
     if check_ingestion_needed(db):
         run_ingestion(sim, spatial, search_lib, db)
@@ -248,7 +246,15 @@ def main():
     candidates   = run_search(user_request, search_lib, db, limit=5)
     intel        = run_vlm_analysis(candidates, user_request, analyst)
 
-    render_results(candidates, intel)
+    # Geo-NMS + Multi-Angle Persistence
+    instances = merge_detections(intel.get('targets', []), candidates)
+    logger.info(
+        f"Detections: {sum(len(i.detections) for i in instances)} raw → "
+        f"{len(instances)} unique objects | "
+        f"{sum(1 for i in instances if i.is_multiangle)} multi-angle"
+    )
+
+    render_results(instances)
 
     print(f"\n{'=' * 60}")
     print("TACTICAL REPORT")

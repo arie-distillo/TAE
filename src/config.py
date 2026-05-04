@@ -21,7 +21,9 @@ class Settings(BaseSettings):
     TILE_OVERLAP:    float = 0.2   # 20% overlap
     
     # Model Configs
-    CLIP_MODEL: str = "ViT-B/32"
+    #CLIP_MODEL: str = "ViT-B/32"
+    CLIP_MODEL: str = "RN50"
+    CLIP_DIM:   int = 1024   # RN50=1024, ViT-B/32=512, ViT-L/14=768
 
     # DJI Mini / Mavic Air defaults
     SENSOR_WIDTH_MM: float = 6.3

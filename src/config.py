@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     DB_PATH: str = "./data/processed/tae_vectors.lancedb"
     MAP_IMAGE: str = "./data/maps/baseline_satellite.png"
     
+    # Tile configuration
+    TILE_CACHE_DIR:   str   = "./data/processed/tiles"
+    TILE_SIZE:       int   = 640  # Tile size in pixels (e.g., 512x512)
+    TILE_OVERLAP:    float = 0.2   # 20% overlap
+    
     # Model Configs
     CLIP_MODEL: str = "ViT-B/32"
 

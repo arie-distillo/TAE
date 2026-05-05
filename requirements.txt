@@ -1,36 +1,43 @@
-# Core Logic & Simulation
-exifread==3.0.0
-numpy
-torch
-pandas
-pydantic-settings
-
-# Database & Storage
-lancedb
-pyarrow
-
-# AI & Computer Vision
-opencv-python
-pillow
+# ── Indexing ──────────────────────────────────────────────────────────────────
+# CPU-only torch — Railway has no GPU on standard plans
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
+
+# CLIP (OpenAI) — requires git
+git+https://github.com/openai/CLIP.git
 ftfy
 regex
 tqdm
-git+https://github.com/openai/CLIP.git
-transformers>=4.45.0
-accelerate
 
-# AI providers
-ollama
+# ── Computer Vision ───────────────────────────────────────────────────────────
+opencv-python-headless   # headless: no display needed on server
+pillow
+numpy
+
+# ── Database & Geospatial ─────────────────────────────────────────────────────
+lancedb
+pyarrow
+pandas
+folium==0.14.0
+
+# ── AI providers ──────────────────────────────────────────────────────────────
 openai
-python-dotenv
-tenacity
+ollama
+tenacity                 # retry logic in analyst.py
 
-# UI & Web
+# ── Web ───────────────────────────────────────────────────────────────────────
 fastapi==0.127.0
 fastcore==1.9.6
 starlette==0.50.0
 python-fasthtml==0.12.36
 monsterui==1.0.36
-folium==0.14.0
+
+# ── Config & Telemetry ────────────────────────────────────────────────────────
+pydantic-settings
+python-dotenv
+exifread==3.0.0
+
+# ── Transformers (VLM support) ────────────────────────────────────────────────
+transformers>=4.45.0
+accelerate

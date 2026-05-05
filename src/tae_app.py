@@ -48,11 +48,14 @@ logger = logging.getLogger("TAE-UI")
 # ─────────────────────────────────────────────────────────────────────────────
 # Directories
 # ─────────────────────────────────────────────────────────────────────────────
-STATIC_DIR = Path("static")
-DET_DIR    = STATIC_DIR / "detections"
-UPLOAD_DIR = Path("data") / "uploads"
+# All persistent paths come from settings (backed by Railway volume via DATA_DIR).
+UPLOAD_PATH  = Path(settings.UPLOAD_PATH)      # original frames — permanent
+DETECTIONS_PATH     = Path(settings.DETECTIONS_PATH)  # annotated detection images
+MAP_PATH     = Path(settings.MAP_PATH)         # generated map.html
 
-for _d in [STATIC_DIR, DET_DIR, UPLOAD_DIR]:
+
+
+for _d in [UPLOAD_PATH, DETECTIONS_PATH, MAP_PATH]:
     _d.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +73,10 @@ _MARKER_COLORS = [
     "#e879f9",  # fuchsia
 ]
 
+# Cache for annotated full-frame images served by /frame_img/{det_id}
+_frame_img_cache: dict[str, bytes] = {}
+_tile_img_cache:  dict[str, bytes] = {}  # hex key → annotated tile JPEG
+
 _state: dict = {
     "map_center":      [32.08, 34.78],
     "map_zoom":        14,
@@ -77,7 +84,6 @@ _state: dict = {
     "ingested":        False,
     "frame_count":     0,
     "tile_count":      0,
-    "session_dir":     None,
     "query_color_idx": 0,     # increments each query
     "show_coverage": False,   # Ctrl+P toggle
 }
@@ -170,7 +176,7 @@ def _recenter_on_detections(det_ids: list[str]) -> None:
 
 
 def _build_map() -> None:
-    """Regenerate static/map.html from current state."""
+    """Regenerate MAP_PATH/map.html from current state."""
     lat, lon = _state["map_center"]
     m = folium.Map(
         location=[lat, lon],
@@ -277,7 +283,8 @@ def _build_map() -> None:
             import traceback as _tb
             logger.error(f"Coverage polygon error: {e}\n{_tb.format_exc()}")
 
-    m.save(str(STATIC_DIR / "map.html"))
+    map_file = MAP_PATH / "map.html"
+    m.save(str(map_file))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,9 +296,14 @@ def _load_tile(candidate: dict):
     Reconstructs a tile by cropping its parent frame.
     Tiles are never stored on disk — this mirrors main.py's _load_tile().
     """
-    img = cv2.imread(candidate["parent_path"])
+    parent = candidate.get("parent_path", "")
+    logger.info(f"_load_tile: reading parent frame: {parent}")
+    if not parent or not Path(parent).exists():
+        logger.error(f"_load_tile: parent frame not found on disk: {parent}")
+        return None
+    img = cv2.imread(parent)
     if img is None:
-        logger.warning(f"Cannot read parent frame: {candidate['parent_path']}")
+        logger.error(f"_load_tile: cv2.imread returned None for: {parent}")
         return None
     x, y = candidate["tile_x"], candidate["tile_y"]
     w, h = candidate["tile_w"], candidate["tile_h"]
@@ -299,7 +311,7 @@ def _load_tile(candidate: dict):
 
 
 def _annotate_and_save(candidate: dict, bbox_px: list | None, label: str) -> str | None:
-    """Crop tile from parent frame, draw bbox (pixel coords), save to static/detections/."""
+    """Crop tile, draw bbox, cache bytes in memory, return /tile_img/<key> URL."""
     img = _load_tile(candidate)
     if img is None:
         return None
@@ -312,15 +324,16 @@ def _annotate_and_save(candidate: dict, bbox_px: list | None, label: str) -> str
             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (74, 222, 128), 2,
         )
 
-    stem     = Path(candidate["parent_path"]).stem
-    fname    = f"{stem}_t{candidate['tile_x']}_{candidate['tile_y']}_{uuid.uuid4().hex[:6]}_det.jpg"
-    out_path = DET_DIR / fname
-    cv2.imwrite(str(out_path), img)
-    return f"/static/detections/{fname}"
-
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok:
+        logger.error("cv2.imencode failed for tile")
+        return None
+    key = uuid.uuid4().hex[:16]
+    _tile_img_cache[key] = buf.tobytes()
+    return f"/tile_img/{key}"
 
 def _tile_to_static_url(candidate: dict) -> str | None:
-    """Crop tile from parent frame and save as a static URL (no bbox)."""
+    """Crop tile (no bbox), cache, return URL."""
     return _annotate_and_save(candidate, None, "")
 
 
@@ -728,7 +741,7 @@ _JS = Script("""
 
     function refreshMap() {
         const f = document.getElementById('tae-map-frame');
-        if (f) f.src = '/static/map.html?' + Date.now();
+        if (f) f.src = '/map?' + Date.now();
     }
 """)
 
@@ -747,7 +760,8 @@ app, rt = fast_app(
 )
 
 # Mount static directories
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Also serve detections and map directly from their persistent paths
+# Images and map served via FileResponse routes — see /detections/<fname> and /map below
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -890,7 +904,7 @@ def index():
         Div(
             # Map iframe
             Div(
-                Iframe(src="/static/map.html", id="tae-map-frame"),
+                Iframe(src="/map", id="tae-map-frame"),
                 cls="map-wrap",
             ),
             # Image panel (right side)
@@ -922,11 +936,6 @@ async def upload(request: Request):
     if not files or all(not f.filename for f in files):
         return _msg("⚠️  No files received.", "sys")
 
-    # Fresh session directory
-    sess = uuid.uuid4().hex
-    sess_dir = UPLOAD_DIR / sess
-    sess_dir.mkdir()
-    _state["session_dir"] = sess_dir
 
     saved_images: list[str] = []
     video_count = 0
@@ -936,11 +945,11 @@ async def upload(request: Request):
             continue
         fname  = Path(f.filename).name
         suffix = Path(fname).suffix.lower()
-        dest   = sess_dir / fname
+        dest   = UPLOAD_PATH / fname
         dest.write_bytes(await f.read())
 
         if suffix in {".mp4", ".mov", ".avi", ".mkv"}:
-            frames = _extract_video_frames(str(dest), sess_dir, fps=1.0)
+            frames = _extract_video_frames(str(dest), UPLOAD_PATH, fps=1.0)
             saved_images.extend(frames)
             video_count += 1
         elif suffix in {".jpg", ".jpeg", ".png"}:
@@ -951,9 +960,9 @@ async def upload(request: Request):
 
     # ── Metadata extraction ──────────────────────────────────────────────────
     logger.info(f"Extracting XMP/EXIF metadata from {len(saved_images)} image(s)…")
-    gen = TAESimGenerator(str(sess_dir), str(sess_dir))
+    gen = TAESimGenerator(str(UPLOAD_PATH), str(UPLOAD_PATH))
     gen.generate()
-    meta_file = sess_dir / "pose_metadata.json"
+    meta_file = UPLOAD_PATH / "pose_metadata.json"
 
     if not meta_file.exists():
         return _msg("⚠️  Metadata extraction failed.", "sys")
@@ -1247,18 +1256,25 @@ def frame_view(det_id: str, mode: str = "tile"):
                 by2 = ty + int(bbox[3])
                 cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 0, 0), 10)  # shadow
                 cv2.rectangle(img, (bx1, by1), (bx2, by2), (74, 222, 128), 6)
-            fname    = Path(parent_path).stem + f"_{det_id}_frame.jpg"
-            out_path = DET_DIR / fname
-            cv2.imwrite(str(out_path), img)
-            img_url  = f"/static/detections/{fname}"
+            # Frame is already in UPLOAD_PATH — annotate in memory, stream via /frame_img/
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                return P("Failed to encode frame.", style="color:var(--danger);padding:12px")
+            _frame_img_cache[det_id] = buf.tobytes()
+            img_url = f"/frame_img/{det_id}"
             other_mode, other_label = "tile", "Tile view"
         else:
             return P("Could not load parent frame.", style="color:var(--danger);padding:12px")
     else:
-        # Tile view — use existing first img_url (already annotated with bbox)
-        img_url = det["img_urls"][0] if det.get("img_urls") else None
+        # Tile view — check static/detections/ file still exists, else regenerate
+        stored = det["img_urls"][0] if det.get("img_urls") else None
+        if stored and stored.startswith("/tile_img/"):
+            key = stored.split("/")[-1]
+            img_url = stored if key in _tile_img_cache else None
+        else:
+            img_url = None
         if not img_url:
-            # Regenerate on demand
+            logger.info(f"Tile cache miss — regenerating for {det_id}")
             img_url = _tile_to_static_url(det) or ""
         other_mode, other_label = "frame", "Full frame"
 
@@ -1281,6 +1297,38 @@ def frame_view(det_id: str, mode: str = "tile"):
     )
 
 
+@rt("/map")
+def serve_map():
+    """Serve map.html from MAP_PATH."""
+    map_file = MAP_PATH / "map.html"
+    if not map_file.exists():
+        _build_map()
+    return FileResponse(str(map_file), media_type="text/html")
+
+
+@rt("/tile_img/{key}")
+def serve_tile_img(key: str):
+    """Stream annotated tile from in-memory cache."""
+    from starlette.responses import Response
+    data = _tile_img_cache.get(key)
+    if data is None:
+        return Response("Tile not in cache — re-query to regenerate.", status_code=404)
+    return Response(content=data, media_type="image/jpeg")
+
+
+@rt("/frame_img/{det_id}")
+def serve_frame_img(det_id: str):
+    """Stream annotated full-frame image directly — no disk write needed.
+    The frame is read from UPLOAD_PATH (parent_path), annotated in frame_view,
+    cached in _frame_img_cache, and streamed here.
+    """
+    from starlette.responses import Response
+    data = _frame_img_cache.get(det_id)
+    if data is None:
+        return Response("Frame not rendered yet — click 'Full frame' first.", status_code=404)
+    return Response(content=data, media_type="image/jpeg")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Restore state from persistent DB on startup
 def _restore_state():
@@ -1298,4 +1346,6 @@ def _restore_state():
         logger.warning(f"Could not restore DB state: {e}")
 
 _restore_state()
-serve()
+_PORT = int(os.environ.get('PORT', 8000))
+logger.info(f'Starting TAE on port {_PORT}')
+serve(host='0.0.0.0', port=_PORT)

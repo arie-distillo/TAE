@@ -15,7 +15,7 @@ class TacticalDatabase:
     """
 
     def __init__(self):
-        self.db = lancedb.connect(settings.DB_PATH)
+        self.db = lancedb.connect(settings.VECTOR_DB_PATH)
         self.table_name = "theater_index"
         self.table = None
 

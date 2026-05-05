@@ -28,4 +28,9 @@ python-dotenv
 tenacity
 
 # UI & Web
-python-fasthtml
+fastapi==0.127.0
+fastcore==1.9.6
+starlette==0.50.0
+python-fasthtml==0.12.36
+monsterui==1.0.36
+folium==0.14.0

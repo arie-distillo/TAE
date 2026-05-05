@@ -5,6 +5,7 @@ tests/*.JPEG
 tests/*.jpg
 tests/*.JPG
 tests/*.png
+static/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -17,12 +17,16 @@
 - [x] handle cases of a different intents, beyond finding a specific object
 - [] add context
   
-
 ### Python libraries to manipulate / seacrh geo object
-- [] see Gemini chat
+- [`on hold`] see Gemini chat
 
 ### Jetson
 - [] what one to purchase - dev kit?
 
 ### UI
-- [] TBD
+- [] images / video upload
+- [] chat widget
+- [] map with markers
+
+### Deployment
+- [] Runpod

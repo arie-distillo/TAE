@@ -1,4 +1,10 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python.analysis.extraPaths": ["${workspaceFolder}/src"],
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": false,
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.python",
+        "editor.formatOnSave": false
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

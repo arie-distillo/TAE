@@ -15,6 +15,7 @@ from core.database import TacticalDatabase
 from ai.search import SearchLibrarian
 from ai.analyst import TacticalAnalyst
 from core.object_detection import merge_detections, ObjectInstance, Detection
+from core.ingestion import run_ingestion 
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,87 +26,7 @@ logger = logging.getLogger("TAE-Core")
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Ingestion
-# ---------------------------------------------------------------------------
-
-def run_ingestion(sim, spatial, search_lib, db):
-    logger.info("Starting Fresh Ingestion Phase...")
-    total_tiles = 0
-
-    for frame_idx, (img_cv2, telemetry) in enumerate(sim):
-        img_h, img_w = img_cv2.shape[:2]
-
-        frame_footprint = spatial.compute_footprint(
-            lat=telemetry['lat'], lon=telemetry['lon'],
-            alt_m=telemetry['z'], gimbal_yaw_deg=telemetry['gimbal_yaw'],
-            img_w_px=img_w, img_h_px=img_h,
-        )
-
-        # Collect all tiles for this frame first
-        t0 = time.perf_counter()
-        tiles = list(spatial.tile_image(img_cv2))  # [(tile_img, x, y, w, h), ...]
-        t1 = time.perf_counter()
-
-        # FIX 1: Single batched CLIP forward pass for all tiles in the frame
-        tile_imgs = [t[0] for t in tiles]
-        vectors = search_lib.encode_image_batch(tile_imgs)  # shape (N, 512)
-        t2 = time.perf_counter()
-
-        # FIX 3: Accumulate all rows, write once per frame
-        rows = []
-        for (tile_img, x_off, y_off, tile_w, tile_h), vector in zip(tiles, vectors):
-            tile_footprint = spatial.compute_tile_footprint(
-                x_off=x_off, y_off=y_off,
-                tile_w=tile_w, tile_h=tile_h,
-                img_w=img_w, img_h=img_h,
-                frame_footprint=frame_footprint,
-            )
-            # FIX 2: No disk write — store parent path + offsets only
-            rows.append({
-                "vector":      vector.tolist(),
-                "image_path":  str(telemetry['full_path']),  # parent path, not tile
-                "parent_path": str(telemetry['full_path']),
-                "tile_x":      int(x_off),
-                "tile_y":      int(y_off),
-                "tile_w":      int(tile_w),
-                "tile_h":      int(tile_h),
-                "lat":         float(telemetry['lat']),
-                "lon":         float(telemetry['lon']),
-                "alt_m":       float(telemetry['z']),
-                "gimbal_yaw":  float(telemetry.get('gimbal_yaw', 0.0)),
-                "gsd_cm_px":   float(tile_footprint['gsd_cm_px']),
-                "fp_nw_lat":   float(tile_footprint['nw'][0]),
-                "fp_nw_lon":   float(tile_footprint['nw'][1]),
-                "fp_ne_lat":   float(tile_footprint['ne'][0]),
-                "fp_ne_lon":   float(tile_footprint['ne'][1]),
-                "fp_se_lat":   float(tile_footprint['se'][0]),
-                "fp_se_lon":   float(tile_footprint['se'][1]),
-                "fp_sw_lat":   float(tile_footprint['sw'][0]),
-                "fp_sw_lon":   float(tile_footprint['sw'][1]),
-            })
-        t3 = time.perf_counter()
-        
-        db.add_observations_batch(rows)
-        t4 = time.perf_counter()
-        total_tiles += len(rows)
-
-        if frame_idx == 0:
-            logger.info(
-                f"Frame 0 timing: tiling={t1-t0:.2f}s | "
-                f"CLIP={t2-t1:.2f}s | rows={t3-t2:.2f}s | DB={t4-t3:.2f}s"
-            )
-
-        if (frame_idx + 1) % 10 == 0:
-            logger.info(
-                f"Ingested {frame_idx + 1} frames | {total_tiles} tiles | "
-                f"GSD: {frame_footprint['gsd_cm_px']} cm/px"
-            )
-
-    logger.info(f"Ingestion complete — {total_tiles} tiles indexed.")
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: Search
+# Search
 # ---------------------------------------------------------------------------
 
 def run_search(user_request, search_lib, db, limit=5) -> list:
@@ -122,7 +43,7 @@ def run_search(user_request, search_lib, db, limit=5) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: VLM Grounding
+# VLM Grounding
 # ---------------------------------------------------------------------------
 
 def run_vlm_analysis(candidates, user_request, analyst) -> dict:
@@ -136,7 +57,7 @@ def run_vlm_analysis(candidates, user_request, analyst) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Render
+# Render
 # ---------------------------------------------------------------------------
 
 def _load_tile(candidate: dict) -> np.ndarray | None:

@@ -1,6 +1,6 @@
 ### Operations
 - [] add detailed logging at each step
-- [x] skip ingestion when it's already done
+- [x] c
 
 ### Misc
 - [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot

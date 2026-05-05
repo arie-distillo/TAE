@@ -32,10 +32,17 @@ from tools.ingest_telemetry import TAESimGenerator
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
+# force=True ensures this wins over uvicorn's own logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
+# Re-set uvicorn loggers to INFO so they don't suppress ours
+for _uv in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    logging.getLogger(_uv).setLevel(logging.INFO)
+
 logger = logging.getLogger("TAE-UI")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,13 +58,28 @@ for _d in [STATIC_DIR, DET_DIR, UPLOAD_DIR]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Global app state
 # ─────────────────────────────────────────────────────────────────────────────
+# Colors cycle per query — chat icon and map marker always match
+_MARKER_COLORS = [
+    "#4ade80",  # green
+    "#60a5fa",  # blue
+    "#f59e0b",  # amber
+    "#f472b6",  # pink
+    "#a78bfa",  # purple
+    "#34d399",  # emerald
+    "#fb923c",  # orange
+    "#e879f9",  # fuchsia
+]
+
 _state: dict = {
-    "map_center":   [32.08, 34.78],   # Tel Aviv default
-    "map_zoom":     14,
-    "detections":   {},               # det_id → DetectionRecord dict
-    "ingested":     False,
-    "frame_count":  0,
-    "session_dir":  None,             # Path of current upload folder
+    "map_center":      [32.08, 34.78],
+    "map_zoom":        14,
+    "detections":      {},    # det_id → DetectionRecord dict
+    "ingested":        False,
+    "frame_count":     0,
+    "tile_count":      0,
+    "session_dir":     None,
+    "query_color_idx": 0,     # increments each query
+    "show_coverage": False,   # Ctrl+P toggle
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +120,55 @@ _DARK_TILES = (
 )
 
 
+def _optimal_zoom(lat_span: float, lon_span: float) -> int:
+    """
+    Estimate a Leaflet zoom level that fits a lat/lon bounding box.
+    Uses the larger of the two spans mapped against rough degree-per-tile widths.
+    """
+    import math
+    span = max(lat_span, lon_span)
+    if span <= 0:
+        return 17
+    # degrees visible at each zoom at ~800px wide viewport
+    # zoom: degrees
+    thresholds = [
+        (0.002,  18), (0.005,  17), (0.01,   16), (0.02,   15),
+        (0.05,   14), (0.1,    13), (0.2,    12), (0.5,    11),
+        (1.0,    10), (2.0,     9), (5.0,     8),
+    ]
+    for deg, z in thresholds:
+        if span <= deg:
+            return z
+    return 7
+
+
+def _recenter_on_detections(det_ids: list[str]) -> None:
+    """
+    Recompute map center and zoom from a specific set of detection ids.
+    Uses weighted centroid (equal weight per marker).
+    """
+    lats = [_state["detections"][d]["lat"] for d in det_ids if d in _state["detections"]]
+    lons = [_state["detections"][d]["lon"] for d in det_ids if d in _state["detections"]]
+    if not lats:
+        return
+
+    center_lat = sum(lats) / len(lats)
+    center_lon = sum(lons) / len(lons)
+
+    lat_span = max(lats) - min(lats)
+    lon_span = max(lons) - min(lons)
+
+    # Add 30% padding around the extent
+    zoom = _optimal_zoom(lat_span * 1.3, lon_span * 1.3)
+
+    _state["map_center"] = [center_lat, center_lon]
+    _state["map_zoom"]   = zoom
+    logger.info(
+        f"Map recentered | center ({center_lat:.6f}, {center_lon:.6f}) | "
+        f"zoom {zoom} | span ({lat_span:.5f}° lat, {lon_span:.5f}° lon)"
+    )
+
+
 def _build_map() -> None:
     """Regenerate static/map.html from current state."""
     lat, lon = _state["map_center"]
@@ -111,20 +182,30 @@ def _build_map() -> None:
     )
 
     for det_id, det in _state["detections"].items():
+        color     = det.get("color", "#4ade80")
+        confirmed = det.get("confirmed", True)
+        if confirmed:
+            dot_html = (
+                f'<div style="width:18px;height:18px;background:{color};'
+                f'border-radius:50%;border:2.5px solid #fff;'
+                f'box-shadow:0 0 8px {color};cursor:pointer"></div>'
+            )
+        else:
+            dot_html = (
+                f'<div style="width:18px;height:18px;background:transparent;'
+                f'border-radius:50%;border:2.5px solid {color};'
+                f'box-shadow:0 0 6px {color};cursor:pointer"></div>'
+            )
         icon = folium.DivIcon(
-            html=(
-                '<div style="width:18px;height:18px;background:#4ade80;'
-                'border-radius:50%;border:2.5px solid #fff;'
-                'box-shadow:0 0 10px #4ade80;cursor:pointer"></div>'
-            ),
+            html=dot_html,
             icon_size=(18, 18),
             icon_anchor=(9, 9),
         )
         popup_html = (
             f'<div style="font-family:\'JetBrains Mono\',monospace;color:#1a1b26;'
             f'min-width:210px;padding:6px 2px">'
-            f'<div style="color:#22c55e;font-weight:700;font-size:13px;margin-bottom:5px">'
-            f'🎯 {det["label"][:40]}</div>'
+            f'<div style="color:{color};font-weight:700;font-size:13px;margin-bottom:5px">'
+            f'● {det["label"][:40]}</div>'
             f'<div style="font-size:11px;line-height:1.7;color:#334155">'
             f'LAT &nbsp;{det["lat"]:.6f}<br>'
             f'LON &nbsp;{det["lon"]:.6f}<br>'
@@ -132,7 +213,7 @@ def _build_map() -> None:
             f'<button onclick="window.parent.postMessage('
             f'{{type:\'show_images\',id:\'{det_id}\'}},'
             f'\'*\')" '
-            f'style="margin-top:9px;padding:5px 14px;background:#22c55e;color:#1a1b26;'
+            f'style="margin-top:9px;padding:5px 14px;background:{color};color:#1a1b26;'
             f'border:none;border-radius:5px;cursor:pointer;font-weight:700;font-size:12px">'
             f'📸 View Images</button></div>'
         )
@@ -141,6 +222,60 @@ def _build_map() -> None:
             popup=folium.Popup(popup_html, max_width=240),
             icon=icon,
         ).add_to(m)
+
+    # ── Coverage polygon (Ctrl+P toggle) ─────────────────────────────────────
+    if _state.get("show_coverage") and db.table is not None:
+        try:
+            df = db.table.to_pandas()[
+                ["parent_path",
+                 "fp_nw_lat","fp_nw_lon","fp_ne_lat","fp_ne_lon",
+                 "fp_se_lat","fp_se_lon","fp_sw_lat","fp_sw_lon"]
+            ].drop_duplicates(subset=["parent_path"])  # one footprint per frame
+
+            logger.info(f"Coverage: {len(df)} unique frames to draw")
+
+            # Collect all corner points for the convex hull
+            pts = []
+            for _, r in df.iterrows():
+                pts += [
+                    (r.fp_nw_lat, r.fp_nw_lon), (r.fp_ne_lat, r.fp_ne_lon),
+                    (r.fp_se_lat, r.fp_se_lon), (r.fp_sw_lat, r.fp_sw_lon),
+                ]
+
+            # Pure-numpy convex hull (Andrew's monotone chain — no scipy needed)
+            def _convex_hull(points):
+                pts_s = sorted(set(map(tuple, points)))
+                if len(pts_s) < 3:
+                    return pts_s
+                def _cross(O, A, B):
+                    return (A[0]-O[0])*(B[1]-O[1]) - (A[1]-O[1])*(B[0]-O[0])
+                lower = []
+                for p in pts_s:
+                    while len(lower) >= 2 and _cross(lower[-2], lower[-1], p) <= 0:
+                        lower.pop()
+                    lower.append(p)
+                upper = []
+                for p in reversed(pts_s):
+                    while len(upper) >= 2 and _cross(upper[-2], upper[-1], p) <= 0:
+                        upper.pop()
+                    upper.append(p)
+                return lower[:-1] + upper[:-1]
+
+            hull_pts = _convex_hull(pts)
+            logger.info(f"Coverage hull: {len(hull_pts)} vertices from {len(pts)} corner points")
+
+            folium.Polygon(
+                locations=hull_pts,   # (lat, lon) tuples
+                color="#7aa2f7",
+                weight=2,
+                fill=True,
+                fill_color="#7aa2f7",
+                fill_opacity=0.15,
+            ).add_to(m)
+
+        except Exception as e:
+            import traceback as _tb
+            logger.error(f"Coverage polygon error: {e}\n{_tb.format_exc()}")
 
     m.save(str(STATIC_DIR / "map.html"))
 
@@ -226,6 +361,15 @@ def _msg(content: str, role: str = "sys") -> FT:
     return Div(
         Span(ts, cls="msg-time"),
         Div(content, cls="msg-bubble"),
+        cls=f"msg {role}",
+    )
+
+def _msg_html(html_content: str, role: str = "sys") -> FT:
+    """Like _msg but renders raw HTML inside the bubble (for colored icons etc)."""
+    ts = datetime.now().strftime("%H:%M")
+    return Div(
+        Span(ts, cls="msg-time"),
+        Div(NotStr(html_content), cls="msg-bubble"),
         cls=f"msg {role}",
     )
 
@@ -558,6 +702,18 @@ _JS = Script("""
     }
 
     // Marker click → open image panel
+    // Ctrl+P → toggle coverage polygon
+    document.addEventListener('keydown', function(e) {
+        if (e.ctrlKey && e.key === 'p') {
+            e.preventDefault();
+            htmx.ajax('GET', '/toggle_coverage', {
+                target: '#tae-msgs', swap: 'beforeend'
+            });
+            // htmx.ajax is not a Promise in v1.x — use setTimeout to refresh after route completes
+            setTimeout(() => { scrollChat(); refreshMap(); }, 400);
+        }
+    });
+
     window.addEventListener('message', function(e) {
         if (!e.data || e.data.type !== 'show_images') return;
         htmx.ajax('GET', '/images/' + e.data.id, {
@@ -794,6 +950,7 @@ async def upload(request: Request):
         return _msg("⚠️  No processable images found in upload.", "sys")
 
     # ── Metadata extraction ──────────────────────────────────────────────────
+    logger.info(f"Extracting XMP/EXIF metadata from {len(saved_images)} image(s)…")
     gen = TAESimGenerator(str(sess_dir), str(sess_dir))
     gen.generate()
     meta_file = sess_dir / "pose_metadata.json"
@@ -816,12 +973,21 @@ async def upload(request: Request):
     from core.sim_provider import SimD3Environment
     from core.ingestion import run_ingestion
 
-    sim = SimD3Environment(str(meta_file))
+    logger.info(f"Metadata extracted for {len(meta)} frame(s).")
     db.initialize_table(vector_dim=getattr(settings, 'CLIP_DIM', 512))
-    lib = get_search_lib()
 
-    tiles_ok, frames_failed = run_ingestion(sim, spatial, lib, db)
-    ok, fail = tiles_ok, frames_failed
+    if db.row_count() > 0:
+        existing = db.row_count()
+        logger.info(f"Index already contains {existing} tiles — skipping ingestion.")
+        ok, fail = existing, 0
+    else:
+        sim = SimD3Environment(str(meta_file))
+        lib = get_search_lib()
+        logger.info("Starting CLIP ingestion…")
+        tiles_ok, frames_failed = run_ingestion(sim, spatial, lib, db)
+        logger.info(f"Ingestion done — {tiles_ok} tiles, {frames_failed} frame(s) failed.")
+        ok, fail = tiles_ok, frames_failed
+
     first_error = None  # run_ingestion logs errors internally
 
     _state["ingested"]    = True
@@ -860,17 +1026,20 @@ async def query(message: str):
 
     user_bubble = _msg(message, "user")
 
-    if not _state["ingested"]:
+    if not _state["ingested"] and db.row_count() == 0:
         return (
             user_bubble,
             _msg("⚠️  No imagery indexed yet. Upload images first.", "sys"),
         )
+    _state["ingested"] = True  # sync flag if restored from DB
 
     lib = get_search_lib()
 
     # ── Vector search ────────────────────────────────────────────────────────
+    logger.info(f"Encoding query: '{message}'")
     q_vec      = lib.encode_text(message)
     candidates = db.semantic_search(q_vec, limit=3)
+    logger.info(f"Vector search returned {len(candidates)} candidate tile(s).")
 
     if not candidates:
         return (
@@ -878,18 +1047,21 @@ async def query(message: str):
             _msg("No matching frames found in the index.", "sys"),
         )
 
+    # ── Pick query color (cycles through palette per query) ──────────────────
+    color = _MARKER_COLORS[_state["query_color_idx"] % len(_MARKER_COLORS)]
+    _state["query_color_idx"] += 1
+    new_det_ids: list[str] = []  # track det_ids added by this query
+    logger.info(f"Query color: {color} | Sending {len(candidates)} tiles to VLM…")
+
     # ── VLM grounding ────────────────────────────────────────────────────────
-    # analyst.analyze_multiple_views takes the raw candidate dicts (matching
-    # the current analyst.py signature used in main.py)
     intel   = analyst.analyze_multiple_views(candidates, message)
     targets: list[dict] = intel.get("targets", [])
+    logger.info(f"VLM returned {len(targets)} target(s). Summary: {intel.get('summary', '')}")
 
-    # ── Build detections ──────────────────────────────────────────────────────
-    # Tiles are matched by parent filename since tile temp paths are gone.
-    new_det = 0
+    # ── Build detections ─────────────────────────────────────────────────────
     for cand in candidates:
-        tile_name     = Path(cand["image_path"]).name  # e.g. DJI_..._t0_0.jpg
-        parent_name   = Path(cand["parent_path"]).name
+        tile_name   = Path(cand["image_path"]).name
+        parent_name = Path(cand["parent_path"]).name
         frame_targets = [
             t for t in targets
             if Path(t["filename"]).name.lower() == tile_name.lower()
@@ -901,41 +1073,91 @@ async def query(message: str):
                 ann_url = _annotate_and_save(cand, t.get("bbox"), message[:20])
                 img_urls = [ann_url] if ann_url else [_tile_to_static_url(cand)]
                 _state["detections"][det_id] = {
-                    "lat":      cand["lat"],
-                    "lon":      cand["lon"],
-                    "label":    message,
-                    "img_urls": img_urls,
-                    "gsd":      f"{cand.get('gsd_cm_px', 0):.1f}",
-                    "bbox":     t.get("bbox"),
-                    "source":   parent_name,
+                    "lat":         cand["lat"],
+                    "lon":         cand["lon"],
+                    "label":       message,
+                    "color":       color,
+                    "confirmed":   True,
+                    "img_urls":    img_urls,
+                    "gsd":         f"{cand.get('gsd_cm_px', 0):.1f}",
+                    "bbox":        t.get("bbox"),
+                    "source":      parent_name,
+                    "parent_path": cand["parent_path"],
+                    "tile_x":      cand["tile_x"],
+                    "tile_y":      cand["tile_y"],
+                    "tile_w":      cand["tile_w"],
+                    "tile_h":      cand["tile_h"],
                 }
-                new_det += 1
+                new_det_ids.append(det_id)
+                logger.info(
+                    f"Detection | {parent_name} | "
+                    f"LAT {cand['lat']:.6f} LON {cand['lon']:.6f} | "
+                    f"conf {t.get('confidence', '—')}"
+                )
         else:
+            # CLIP found this tile relevant but VLM couldn't confirm with a bbox.
+            # Still show as a candidate marker (hollow) so the operator can inspect.
             det_id  = uuid.uuid4().hex[:10]
             img_url = _tile_to_static_url(cand)
             _state["detections"][det_id] = {
-                "lat":      cand["lat"],
-                "lon":      cand["lon"],
-                "label":    f"Candidate – {message[:28]}",
-                "img_urls": [img_url] if img_url else [],
-                "gsd":      f"{cand.get('gsd_cm_px', 0):.1f}",
-                "bbox":     None,
-                "source":   parent_name,
+                "lat":         cand["lat"],
+                "lon":         cand["lon"],
+                "label":       f"Candidate: {message[:40]}",
+                "color":       color,
+                "confirmed":   False,
+                "img_urls":    [img_url] if img_url else [],
+                "gsd":         f"{cand.get('gsd_cm_px', 0):.1f}",
+                "bbox":        None,
+                "source":      parent_name,
+                "parent_path": cand["parent_path"],
+                "tile_x":      cand["tile_x"],
+                "tile_y":      cand["tile_y"],
+                "tile_w":      cand["tile_w"],
+                "tile_h":      cand["tile_h"],
             }
+            new_det_ids.append(det_id)
+            logger.info(
+                f"Candidate (no VLM bbox) | {parent_name} | "
+                f"LAT {cand['lat']:.6f} LON {cand['lon']:.6f}"
+            )
 
+    # Recenter map on the new markers from this query
+    _recenter_on_detections(list(new_det_ids))
     _build_map()
 
-    report  = intel.get("report", "Analysis complete.")
-    summary = (
-        f"{'🎯' if new_det else '🔍'}  "
-        f"{new_det} object(s) grounded | "
-        f"{len(candidates)} candidate frame(s) retrieved. "
-        f"{report[:180]}{'…' if len(report) > 180 else ''}"
-    )
+    # ── Format chat response ─────────────────────────────────────────────────
+    n_confirmed  = sum(1 for d in _state["detections"].values()
+                       if d.get("confirmed") and d.get("color") == color)
+    n_candidates = sum(1 for d in _state["detections"].values()
+                       if not d.get("confirmed") and d.get("color") == color)
+
+    raw_report = intel.get("report", "")
+    dot_solid  = f'<span style="color:{color};font-size:13px">&#9679;</span>'
+    dot_hollow = f'<span style="color:{color};font-size:13px">&#9675;</span>'
+
+    lines = []
+    if raw_report and targets:
+        parts = [p.strip() for p in raw_report.split(" | ") if p.strip()]
+        for p in parts:
+            if ": " in p:
+                p = p.split(": ", 1)[1]
+            if p:
+                lines.append(f"{dot_solid} {p}")
+
+    if n_candidates:
+        lines.append(
+            f"{dot_hollow} {n_candidates} additional frame(s) matched by semantic search "
+            f"but not confirmed by VLM — click hollow markers to inspect."
+        )
+
+    if not lines:
+        lines = [raw_report or "No objects matching the query were found."]
+
+    reply_html = "<br>".join(lines)
 
     return (
         user_bubble,
-        _msg(summary, "sys"),
+        _msg_html(reply_html),
     )
 
 
@@ -953,25 +1175,17 @@ def images(det_id: str):
                 cls="empty-state"),
         )
 
-    cards = []
-    for url in det.get("img_urls", []):
-        cards.append(
-            Div(
-                Img(src=url, cls="det-img", loading="lazy"),
-                Div(
-                    Div(det["label"][:50], cls="label"),
-                    f"LAT {det['lat']:.6f}  ·  LON {det['lon']:.6f}",
-                    Br(),
-                    f"GSD {det['gsd']} cm/px  ·  Source: {det['source']}",
-                    cls="det-meta",
-                ),
-                cls="det-card",
-            )
-        )
-
-    if not cards:
-        cards = [Div(P("No images available.", style="color:var(--muted);padding:20px"),
-                     cls="empty-state")]
+    # Use frame_view widget (tile/frame toggle) instead of raw img
+    fv_widget = frame_view(det_id, mode="tile")
+    meta_div  = Div(
+        Div(det["label"][:60], cls="label"),
+        f"LAT {det['lat']:.6f}  ·  LON {det['lon']:.6f}",
+        Br(),
+        f"GSD {det['gsd']} cm/px  ·  Source: {det['source']}",
+        cls="det-meta",
+        style="margin:0 12px 12px",
+    )
+    cards = [Div(fv_widget, meta_div, cls="det-card")]
 
     return (
         Div(
@@ -983,5 +1197,105 @@ def images(det_id: str):
     )
 
 
+@rt("/toggle_coverage")
+def toggle_coverage():
+    _state["show_coverage"] = not _state["show_coverage"]
+    state_txt = "ON" if _state["show_coverage"] else "OFF"
+    logger.info(
+        f"Coverage polygon: {state_txt} | "
+        f"db.table={'set' if db.table is not None else 'None'} | "
+        f"rows={db.row_count()}"
+    )
+    _build_map()
+    return _msg(f"Coverage polygon {'shown' if _state['show_coverage'] else 'hidden'} (Ctrl+P to toggle).", "sys")
+
+
+@rt("/frame_view/{det_id}")
+def frame_view(det_id: str, mode: str = "tile"):
+    """Return annotated tile or full-frame card for the image panel."""
+    det = _state["detections"].get(det_id)
+    if not det:
+        return P("Detection not found.", style="color:var(--danger);padding:20px")
+
+    parent_path = det.get("parent_path")
+    tx, ty = det.get("tile_x", 0), det.get("tile_y", 0)
+    tw, th = det.get("tile_w", 0), det.get("tile_h", 0)
+    bbox   = det.get("bbox")
+
+    if mode == "frame" and parent_path:
+        img = cv2.imread(parent_path)
+        if img is not None:
+            # Tile boundary — vivid magenta, very thick, with semi-transparent fill
+            TILE_CLR = (180, 0, 255)   # BGR: vivid magenta
+            # Semi-transparent fill overlay
+            overlay = img.copy()
+            cv2.rectangle(overlay, (tx, ty), (tx+tw, ty+th), TILE_CLR, -1)
+            cv2.addWeighted(overlay, 0.15, img, 0.85, 0, img)
+            # Black shadow border then colored border
+            cv2.rectangle(img, (tx, ty), (tx+tw, ty+th), (0, 0, 0), 20)
+            cv2.rectangle(img, (tx, ty), (tx+tw, ty+th), TILE_CLR, 12)
+            # Label
+            cv2.putText(img, "TILE", (tx + 8, ty + 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), 8)
+            cv2.putText(img, "TILE", (tx + 8, ty + 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.4, TILE_CLR, 3)
+            # Detection bbox inside tile
+            if bbox and len(bbox) == 4:
+                bx1 = tx + int(bbox[0])
+                by1 = ty + int(bbox[1])
+                bx2 = tx + int(bbox[2])
+                by2 = ty + int(bbox[3])
+                cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 0, 0), 10)  # shadow
+                cv2.rectangle(img, (bx1, by1), (bx2, by2), (74, 222, 128), 6)
+            fname    = Path(parent_path).stem + f"_{det_id}_frame.jpg"
+            out_path = DET_DIR / fname
+            cv2.imwrite(str(out_path), img)
+            img_url  = f"/static/detections/{fname}"
+            other_mode, other_label = "tile", "Tile view"
+        else:
+            return P("Could not load parent frame.", style="color:var(--danger);padding:12px")
+    else:
+        # Tile view — use existing first img_url (already annotated with bbox)
+        img_url = det["img_urls"][0] if det.get("img_urls") else None
+        if not img_url:
+            # Regenerate on demand
+            img_url = _tile_to_static_url(det) or ""
+        other_mode, other_label = "frame", "Full frame"
+
+    toggle_btn = Button(
+        other_label,
+        hx_get=f"/frame_view/{det_id}?mode={other_mode}",
+        hx_target=f"#fv-{det_id}",
+        hx_swap="outerHTML",
+        style=(
+            "margin:8px 12px;padding:5px 14px;"
+            "background:var(--bg4);border:1px solid var(--border);"
+            "border-radius:5px;cursor:pointer;font-size:11px;"
+            "font-family:var(--font-mono);color:var(--text);"
+        ),
+    )
+    return Div(
+        toggle_btn,
+        Img(src=img_url, style="width:100%;display:block", loading="lazy") if img_url else "",
+        id=f"fv-{det_id}",
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
+# Restore state from persistent DB on startup
+def _restore_state():
+    try:
+        db.initialize_table(vector_dim=getattr(settings, 'CLIP_DIM', 512))
+        count = db.row_count()
+        if count > 0:
+            _state["ingested"]    = True
+            _state["tile_count"]  = count
+            logger.info(f"Restored index from DB — {count} tiles already indexed.")
+            _build_map()
+        else:
+            logger.info("DB is empty — waiting for upload.")
+    except Exception as e:
+        logger.warning(f"Could not restore DB state: {e}")
+
+_restore_state()
 serve()

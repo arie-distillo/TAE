@@ -27,9 +27,12 @@
 - [] what one to purchase - dev kit?
 
 ### UI
-- [] images / video upload
-- [] chat widget
-- [] map with markers
+- [x] images upload
+- [] video upload
+- [x] chat widget
+- [x] map with markers
+- [] remove Span("Intelligence", cls="brand-sub")
+
 
 ### Deployment
 - [] Runpod

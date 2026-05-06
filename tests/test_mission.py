@@ -76,7 +76,8 @@ def _load_tile(candidate: dict) -> np.ndarray | None:
     return img[y:y+h, x:x+w]
 
 def render_results(instances: list[ObjectInstance]):
-    os.makedirs("tactical_results", exist_ok=True)
+    results_dir = Path(settings.DATA_DIR) / "tactical_results"
+    results_dir.mkdir(parents=True, exist_ok=True)
 
     for inst in instances:
         best = inst.best   # highest-confidence detection
@@ -107,7 +108,7 @@ def render_results(instances: list[ObjectInstance]):
                         (sx1, max(sy1-10, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
             fname = Path(secondary.filename).stem
-            cv2.imwrite(f"tactical_results/obj{inst.instance_id}_angle{inst.detections.index(secondary)+1}_{fname}.jpg", sec_img)
+            cv2.imwrite(str(results_dir / f"obj{inst.instance_id}_angle{inst.detections.index(secondary)+1}_{fname}.jpg"), sec_img)
 
         status = (f"OBJ#{inst.instance_id} | "
                   f"LAT:{best.lat:.6f} LON:{best.lon:.6f} | "
@@ -118,7 +119,7 @@ def render_results(instances: list[ObjectInstance]):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         fname = Path(best.filename).stem
-        cv2.imwrite(f"tactical_results/obj{inst.instance_id}_best_{fname}.jpg", tile_img)
+        cv2.imwrite(str(results_dir / f"obj{inst.instance_id}_best_{fname}.jpg"), tile_img)
         logger.info(
             f"Object #{inst.instance_id} | "
             f"{best.lat:.6f},{best.lon:.6f} | "

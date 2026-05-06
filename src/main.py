@@ -745,7 +745,10 @@ _JS = Script("""
     }
 """)
 
+_MAX_UPLOAD_MB = 500
+
 app, rt = fast_app(
+    max_upload_size=_MAX_UPLOAD_MB * 1024 * 1024,
     hdrs=(
         Theme.slate.headers(),
         Link(
@@ -930,8 +933,18 @@ def toggle_chat():
 
 @rt("/upload", methods=["POST"])
 async def upload(request: Request):
-    form  = await request.form()
-    files = form.getlist("files")
+    from starlette.requests import ClientDisconnect
+    try:
+        form  = await request.form()
+        files = form.getlist("files")
+    except ClientDisconnect:
+        logger.warning("Client disconnected during upload — connection dropped or request too large.")
+        return _msg(
+            "⚠️  Upload failed: connection dropped mid-transfer. "
+            "Try uploading fewer images at once (10 max recommended), "
+            "or check your Railway HTTP timeout setting.",
+            "sys"
+        )
 
     if not files or all(not f.filename for f in files):
         return _msg("⚠️  No files received.", "sys")

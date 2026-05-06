@@ -61,7 +61,8 @@ def _iter_tiles(img: np.ndarray, tile_size: int, overlap: int):
 def run_ingestion(sim, spatial, search_lib, db,
                   tile_dir: Path | None = None,
                   tile_size: int = TILE_SIZE,
-                  tile_overlap: int = TILE_OVERLAP) -> tuple:
+                  tile_overlap: int = TILE_OVERLAP,
+                  on_frame=None) -> tuple:
     """
     Iterate over all frames in *sim*, slice into tiles, encode with CLIP,
     compute footprints, write to *db*.
@@ -104,6 +105,9 @@ def run_ingestion(sim, spatial, search_lib, db,
             frames_skipped += 1
             continue
 
+        if on_frame:
+            on_frame(frame_idx + 1, frame_name)
+            
         # Tile output dir: alongside the parent frame if not specified
         out_dir = tile_dir if tile_dir else parent_path.parent
 

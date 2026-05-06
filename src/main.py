@@ -80,12 +80,13 @@ _tile_img_cache:  dict[str, bytes] = {}  # hex key → annotated tile JPEG
 _state: dict = {
     "map_center":      [32.08, 34.78],
     "map_zoom":        14,
-    "detections":      {},    # det_id → DetectionRecord dict
+    "detections":      {},
     "ingested":        False,
     "frame_count":     0,
     "tile_count":      0,
-    "query_color_idx": 0,     # increments each query
-    "show_coverage": False,   # Ctrl+P toggle
+    "query_color_idx": 0,
+    "show_coverage":   False,
+    "ingest_progress": "",    # e.g. "frame 3 of 50"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -931,6 +932,50 @@ def toggle_chat():
     return _chat_panel(collapsed=False)
 
 
+def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
+    from core.sim_provider import SimD3Environment
+    from core.ingestion import run_ingestion
+    try:
+        db.initialize_table(vector_dim=getattr(settings, "CLIP_DIM", 512))
+        sim      = SimD3Environment(str(meta_file))
+        lib      = get_search_lib()
+        total    = len(sim.frame_names)
+        logger.info("Starting CLIP ingestion…")
+
+        def _on_frame(idx: int, name: str):
+            _state["ingest_progress"] = f"frame {idx} of {total} — {name}"
+
+        tiles_ok, frames_failed = run_ingestion(sim, spatial, lib, db,
+                                                on_frame=_on_frame)
+        logger.info(f"Ingestion done — {tiles_ok} tiles, {frames_failed} frame(s) failed.")
+# Count unique frames from DB — correct even with incremental uploads
+        try:
+            df = db.table.to_pandas()
+            total_frames = df["parent_path"].nunique()
+            # Re-center map from all known frame GPS positions
+            lats = df.groupby("parent_path")["lat"].first().tolist()
+            lons = df.groupby("parent_path")["lon"].first().tolist()
+            if lats and lons:
+                _state["map_center"] = [sum(lats)/len(lats), sum(lons)/len(lons)]
+                _state["map_zoom"]   = 16
+        except Exception:
+            total_frames = _state["frame_count"]
+        _state["frame_count"] = total_frames
+        _state["ingested"]    = True
+        _state["tile_count"]  = tiles_ok
+        _state["detections"]  = {}
+        _state["ingesting"]   = False
+        _state["ingest_msg"]  = (
+            f"Indexed {tiles_ok} tiles across {total_frames} frame(s). "
+            f"Theater is ready — query below."
+        )
+        _build_map()
+    except Exception as e:
+        logger.error(f"Background ingestion failed: {e}")
+        _state["ingesting"]  = False
+        _state["ingest_msg"] = f"Ingestion failed: {e}"
+
+
 @rt("/upload", methods=["POST"])
 async def upload(request: Request):
     from starlette.requests import ClientDisconnect
@@ -973,16 +1018,19 @@ async def upload(request: Request):
 
     # ── Metadata extraction ──────────────────────────────────────────────────
     logger.info(f"Extracting XMP/EXIF metadata from {len(saved_images)} image(s)…")
-    gen = TAESimGenerator(str(UPLOAD_PATH), str(UPLOAD_PATH))
-    gen.generate()
-    meta_file = UPLOAD_PATH / "pose_metadata.json"
+    gen  = TAESimGenerator(str(UPLOAD_PATH), str(UPLOAD_PATH))
+    meta = {}
+    for img_path in saved_images:
+        try:
+            meta[Path(img_path).name] = gen._extract_dji_data(Path(img_path))
+        except Exception as e:
+            logger.warning(f"Metadata extraction failed for {img_path}: {e}")
 
-    if not meta_file.exists():
-        return _msg("⚠️  Metadata extraction failed.", "sys")
-
-    meta: dict = json.loads(meta_file.read_text())
     if not meta:
         return _msg("⚠️  No parseable metadata in uploaded images.", "sys")
+
+    meta_file = UPLOAD_PATH / "pose_metadata.json"
+    meta_file.write_text(json.dumps(meta))
 
     # ── Update map center ────────────────────────────────────────────────────
     lats = [v["lat"] for v in meta.values() if v.get("lat") not in (None, 0.0)]
@@ -991,55 +1039,43 @@ async def upload(request: Request):
         _state["map_center"] = [sum(lats) / len(lats), sum(lons) / len(lons)]
         _state["map_zoom"]   = 16
 
-    # ── CLIP ingestion ───────────────────────────────────────────────────────
-    from core.sim_provider import SimD3Environment
-    from core.ingestion import run_ingestion
-
-    logger.info(f"Metadata extracted for {len(meta)} frame(s).")
-    db.initialize_table(vector_dim=getattr(settings, 'CLIP_DIM', 512))
-
-    if db.row_count() > 0:
-        existing = db.row_count()
-        logger.info(f"Index already contains {existing} tiles — skipping ingestion.")
-        ok, fail = existing, 0
-    else:
-        sim = SimD3Environment(str(meta_file))
-        lib = get_search_lib()
-        logger.info("Starting CLIP ingestion…")
-        tiles_ok, frames_failed = run_ingestion(sim, spatial, lib, db)
-        logger.info(f"Ingestion done — {tiles_ok} tiles, {frames_failed} frame(s) failed.")
-        ok, fail = tiles_ok, frames_failed
-
-    first_error = None  # run_ingestion logs errors internally
-
-    _state["ingested"]    = True
+    # ── CLIP ingestion in background ─────────────────────────────────────────
+    from starlette.background import BackgroundTasks
+    _state["ingesting"]   = True
+    _state["ingest_msg"]  = None
     _state["frame_count"] = len(meta)
-    _state["tile_count"]   = ok
-    _state["detections"]  = {}   # Clear old detections on re-upload
-    _build_map()
-
-    video_note = (
-        f" (from {video_count} video{'s' if video_count > 1 else ''})"
-        if video_count else ""
-    )
-    center_txt = (
-        f"{_state['map_center'][0]:.5f}, {_state['map_center'][1]:.5f}"
-        if lats else "unknown (no GPS)"
-    )
-
+    tasks = BackgroundTasks()
+    tasks.add_task(_ingest_background, saved_images, meta_file, meta)
     return (
         _msg(
-            f"✅  Indexed {ok} tiles across {_state['frame_count']} frame{'s' if _state['frame_count'] != 1 else ''}{video_note}. "
-            f"{f'({fail} frames failed). ' if fail else ''}"
-            f"Map centered at {center_txt}. "
-            f"Theater is ready — query below."
-            + (f" First error: {first_error}" if first_error else ""),
-            "sys",
+            f"{len(saved_images)} image(s) received. Indexing in background…",
+            "sys"
         ),
-        # OOB-swap the status badge in the navbar
+        Div(
+            Span("Indexing... ", cls="pulse-txt"),
+            hx_get="/upload_progress",
+            hx_trigger="every 2s",
+            hx_target="this",
+            hx_swap="outerHTML",
+        ),
         _status_badge(),
-    )
+    ), tasks
 
+@rt("/upload_progress")
+def upload_progress():
+    if _state.get("ingesting"):
+            progress = _state.get("ingest_progress", "")
+            label = f"Indexing {progress}..." if progress else "Indexing..."
+            return Div(
+                Span(label, cls="pulse-txt"),
+                hx_get="/upload_progress",
+                hx_trigger="every 2s",
+                hx_swap="outerHTML",
+            )
+    msg = _state.pop("ingest_msg", None)
+    if msg:
+        return _msg(msg, "sys"), _status_badge(), Script("refreshMap();")
+    return ""
 
 @rt("/query", methods=["POST"])
 async def query(message: str):
@@ -1221,16 +1257,19 @@ def images(det_id: str):
 
 @rt("/toggle_coverage")
 def toggle_coverage():
-    _state["show_coverage"] = not _state["show_coverage"]
-    state_txt = "ON" if _state["show_coverage"] else "OFF"
-    logger.info(
-        f"Coverage polygon: {state_txt} | "
-        f"db.table={'set' if db.table is not None else 'None'} | "
-        f"rows={db.row_count()}"
-    )
-    _build_map()
-    return _msg(f"Coverage polygon {'shown' if _state['show_coverage'] else 'hidden'} (Ctrl+P to toggle).", "sys")
-
+    try:
+        _state["show_coverage"] = not _state["show_coverage"]
+        state_txt = "ON" if _state["show_coverage"] else "OFF"
+        logger.info(
+            f"Coverage polygon: {state_txt} | "
+            f"db.table={'set' if db.table is not None else 'None'} | "
+            f"rows={db.row_count()}"
+        )
+        _build_map()
+        return _msg(f"Coverage polygon {'shown' if _state['show_coverage'] else 'hidden'} (Ctrl+P to toggle).", "sys"), _status_badge()
+    except Exception as e:
+        logger.warning(f"toggle_coverage error (non-fatal): {e}")
+        return ""
 
 @rt("/frame_view/{det_id}")
 def frame_view(det_id: str, mode: str = "tile"):

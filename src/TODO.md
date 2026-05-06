@@ -6,6 +6,9 @@
 - [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot
 - [x] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini)
 - [x] Merge detections → NMS to remove duplicates from overlapping tiles
+- [] Improve startup message if something already uploaded `_msg("TAE ready. Upload imagery to build the theater index, ""then query in natural language.", "sys"),`
+- [] Investigate bad detections
+- [] Split into two services - on-edge server and cloud server
 
 ### non-generative Visual models
 - [x] learn CLIP

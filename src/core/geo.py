@@ -10,7 +10,6 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-
 def bbox_center_to_geo(
     bbox: list,
     tile_w: int, tile_h: int,
@@ -29,4 +28,12 @@ def bbox_center_to_geo(
                v  * ((1-u)*fp_sw[0] + u*fp_se[0]))
     lon = ((1-v) * ((1-u)*fp_nw[1] + u*fp_ne[1]) +
                v  * ((1-u)*fp_sw[1] + u*fp_se[1]))
+    return lat, lon
+
+def tile_center_geo(cand: dict) -> tuple[float, float]:
+    """Returns the geographic center of a tile from its stored footprint corners."""
+    lat = (cand["fp_nw_lat"] + cand["fp_ne_lat"] +
+           cand["fp_se_lat"] + cand["fp_sw_lat"]) / 4
+    lon = (cand["fp_nw_lon"] + cand["fp_ne_lon"] +
+           cand["fp_se_lon"] + cand["fp_sw_lon"]) / 4
     return lat, lon

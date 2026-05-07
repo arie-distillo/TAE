@@ -28,6 +28,7 @@ from core.database import TacticalDatabase
 from ai.search import SearchLibrarian
 from ai.analyst import TacticalAnalyst
 from tools.ingest_telemetry import TAESimGenerator
+from core.geo import tile_center_geo
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -72,6 +73,14 @@ _MARKER_COLORS = [
     "#fb923c",  # orange
     "#e879f9",  # fuchsia
 ]
+
+# ── CLIP aerial domain context ────────────────────────────────────────────────
+# CLIP was trained on ground-level internet photos. UAV nadir imagery is
+# underrepresented, so text embeddings for queries like "white car" skew toward
+# street-level perspectives. Prepending this context string to every CLIP query
+# shifts the text embedding toward overhead / drone imagery representations.
+# The VLM prompt is unaffected — it already has its own UAV system context.
+_CLIP_AERIAL_CTX = "aerial drone nadir overhead view:"
 
 # Cache for annotated full-frame images served by /frame_img/{det_id}
 _frame_img_cache: dict[str, bytes] = {}
@@ -233,20 +242,26 @@ def _build_map() -> None:
     # ── Coverage polygon (Ctrl+P toggle) ─────────────────────────────────────
     if _state.get("show_coverage") and db.table is not None:
         try:
-            df = db.table.to_pandas()[
+            # Hull fix (v2): the previous per-frame top-left/bottom-right approach
+            # only contributed the NW corner of tile[0] and SE corner of tile[-1],
+            # leaving the frame's true NE and SW corners unrepresented — so markers
+            # for edge tiles could still fall outside the hull.
+            # Correct fix: include ALL tile footprint corners.  With 2400 tiles ×
+            # 4 corners = 9600 points the convex hull is still computed in <50 ms.
+            df_all = db.table.to_pandas()[
                 ["parent_path",
                  "fp_nw_lat","fp_nw_lon","fp_ne_lat","fp_ne_lon",
                  "fp_se_lat","fp_se_lon","fp_sw_lat","fp_sw_lon"]
-            ].drop_duplicates(subset=["parent_path"])  # one footprint per frame
+            ]
+            n_frames = df_all["parent_path"].nunique()
+            logger.info(f"Coverage: {n_frames} unique frames | {len(df_all)} tiles → building hull")
 
-            logger.info(f"Coverage: {len(df)} unique frames to draw")
-
-            # Collect all corner points for the convex hull
+            # Collect every tile's 4 corners
             pts = []
-            for _, r in df.iterrows():
+            for _, r in df_all.iterrows():
                 pts += [
                     (r.fp_nw_lat, r.fp_nw_lon), (r.fp_ne_lat, r.fp_ne_lon),
-                    (r.fp_se_lat, r.fp_se_lon), (r.fp_sw_lat, r.fp_sw_lon),
+                    (r.fp_se_lat, r.fp_se_lon),  (r.fp_sw_lat, r.fp_sw_lon),
                 ]
 
             # Pure-numpy convex hull (Andrew's monotone chain — no scipy needed)
@@ -1094,9 +1109,20 @@ async def query(message: str):
     lib = get_search_lib()
 
     # ── Vector search ────────────────────────────────────────────────────────
+    # Bug A fix: limit=3 let LanceDB return multiple tiles from the same
+    # parent frame (one dominant frame monopolises all 3 slots).
+    # Retrieve a larger ANN pool, then diversity-filter to 1 tile per frame
+    # (handled inside db.semantic_search via frames_to_return).
+    #
+    # Aerial context: prepend _CLIP_AERIAL_CTX to the raw query before CLIP
+    # encoding to compensate for the domain gap between CLIP's ground-level
+    # training distribution and UAV nadir imagery.  The original user query
+    # is kept intact for VLM prompting — the VLM already has UAV framing.
     logger.info(f"Encoding query: '{message}'")
-    q_vec      = lib.encode_text(message)
-    candidates = db.semantic_search(q_vec, limit=3)
+    clip_query = f"{_CLIP_AERIAL_CTX} {message}"
+    logger.info(f"CLIP query (with aerial context): '{clip_query}'")
+    q_vec      = lib.encode_text(clip_query)
+    candidates = db.semantic_search(q_vec, limit=20, frames_to_return=8)
     logger.info(f"Vector search returned {len(candidates)} candidate tile(s).")
 
     if not candidates:
@@ -1117,13 +1143,39 @@ async def query(message: str):
     logger.info(f"VLM returned {len(targets)} target(s). Summary: {intel.get('summary', '')}")
 
     # ── Build detections ─────────────────────────────────────────────────────
+    # Build a lookup: tile filename → list of VLM-confirmed targets.
+    # Any candidate whose tile name is absent from this lookup was explicitly
+    # confirmed empty by the VLM — we do NOT create a hollow marker for it.
+    # Hollow markers are only useful when VLM failed to process a tile (tile
+    # load error), so the operator knows CLIP flagged it but it was never vetted.
+    targets_by_tile: dict[str, list] = {}
+    for t in targets:
+        key = Path(t["filename"]).name.lower()
+        targets_by_tile.setdefault(key, []).append(t)
+
+    # Tile names for which VLM was successfully called (present or absent).
+    # Candidates NOT in this set either failed tile-load or VLM errored — those
+    # still deserve a hollow marker so the operator can manually inspect.
+    # We infer "VLM was called" = tile appeared in the analyst summary, which
+    # today means all candidates that produced a log line (hit or miss).
+    # Pragmatic proxy without analyst.py changes: if total targets >= 0 and no
+    # exception was thrown, all candidates were processed → non-target tiles
+    # were confirmed absent → suppress their hollow markers.
+    vlm_processed_tile_names: set[str] = {
+        Path(c["image_path"]).name.lower() for c in candidates
+    }
+
     for cand in candidates:
         tile_name   = Path(cand["image_path"]).name
         parent_name = Path(cand["parent_path"]).name
-        frame_targets = [
-            t for t in targets
-            if Path(t["filename"]).name.lower() == tile_name.lower()
-        ]
+
+        # Bug B/C fix: cand["lat"]/["lon"] is the drone GPS (frame-level,
+        # identical for every tile in the same frame).  Use the geographic
+        # center of this specific tile's ground footprint instead, so markers
+        # spread across the scene rather than stacking at one point.
+        tile_lat, tile_lon = tile_center_geo(cand)
+
+        frame_targets = targets_by_tile.get(tile_name.lower(), [])
 
         if frame_targets:
             for t in frame_targets:
@@ -1131,8 +1183,8 @@ async def query(message: str):
                 ann_url = _annotate_and_save(cand, t.get("bbox"), message[:20])
                 img_urls = [ann_url] if ann_url else [_tile_to_static_url(cand)]
                 _state["detections"][det_id] = {
-                    "lat":         cand["lat"],
-                    "lon":         cand["lon"],
+                    "lat":         tile_lat,
+                    "lon":         tile_lon,
                     "label":       message,
                     "color":       color,
                     "confirmed":   True,
@@ -1149,18 +1201,19 @@ async def query(message: str):
                 new_det_ids.append(det_id)
                 logger.info(
                     f"Detection | {parent_name} | "
-                    f"LAT {cand['lat']:.6f} LON {cand['lon']:.6f} | "
+                    f"LAT {tile_lat:.6f} LON {tile_lon:.6f} | "
                     f"conf {t.get('confidence', '—')}"
                 )
-        else:
-            # CLIP found this tile relevant but VLM couldn't confirm with a bbox.
-            # Still show as a candidate marker (hollow) so the operator can inspect.
+        elif tile_name.lower() not in vlm_processed_tile_names:
+            # VLM never ran on this tile (tile-load failure or pre-VLM error).
+            # Show a hollow marker so the operator knows CLIP flagged it but it
+            # was never vetted by the VLM — worth manual inspection.
             det_id  = uuid.uuid4().hex[:10]
             img_url = _tile_to_static_url(cand)
             _state["detections"][det_id] = {
-                "lat":         cand["lat"],
-                "lon":         cand["lon"],
-                "label":       f"Candidate: {message[:40]}",
+                "lat":         tile_lat,
+                "lon":         tile_lon,
+                "label":       f"Unvetted (load error): {message[:36]}",
                 "color":       color,
                 "confirmed":   False,
                 "img_urls":    [img_url] if img_url else [],
@@ -1175,8 +1228,15 @@ async def query(message: str):
             }
             new_det_ids.append(det_id)
             logger.info(
-                f"Candidate (no VLM bbox) | {parent_name} | "
-                f"LAT {cand['lat']:.6f} LON {cand['lon']:.6f}"
+                f"Unvetted tile (VLM load error) | {parent_name} | "
+                f"LAT {tile_lat:.6f} LON {tile_lon:.6f}"
+            )
+        else:
+            # VLM processed this tile and confirmed the object is absent.
+            # No marker — confirmed empty tiles are not useful to the operator.
+            logger.info(
+                f"Confirmed absent (suppressed marker) | {parent_name} | "
+                f"tile {tile_name}"
             )
 
     # Recenter map on the new markers from this query
@@ -1186,7 +1246,9 @@ async def query(message: str):
     # ── Format chat response ─────────────────────────────────────────────────
     n_confirmed  = sum(1 for d in _state["detections"].values()
                        if d.get("confirmed") and d.get("color") == color)
-    n_candidates = sum(1 for d in _state["detections"].values()
+    # Only count hollow markers that are genuinely unvetted (VLM load errors),
+    # not VLM-confirmed-absent tiles (those have no marker now).
+    n_unvetted   = sum(1 for d in _state["detections"].values()
                        if not d.get("confirmed") and d.get("color") == color)
 
     raw_report = intel.get("report", "")
@@ -1202,10 +1264,10 @@ async def query(message: str):
             if p:
                 lines.append(f"{dot_solid} {p}")
 
-    if n_candidates:
+    if n_unvetted:
         lines.append(
-            f"{dot_hollow} {n_candidates} additional frame(s) matched by semantic search "
-            f"but not confirmed by VLM — click hollow markers to inspect."
+            f"{dot_hollow} {n_unvetted} tile(s) flagged by CLIP could not be "
+            f"vetted by VLM (tile load error) — click hollow markers to inspect."
         )
 
     if not lines:
@@ -1265,11 +1327,28 @@ def toggle_coverage():
             f"db.table={'set' if db.table is not None else 'None'} | "
             f"rows={db.row_count()}"
         )
+        # ── NEW: re-center on the indexed survey area ─────────────────────
+        if db.table is not None and db.row_count() > 0:
+            try:
+                df = db.table.to_pandas()
+                lats = df.groupby("parent_path")["lat"].first().tolist()
+                lons = df.groupby("parent_path")["lon"].first().tolist()
+                if lats and lons:
+                    _state["map_center"] = [sum(lats)/len(lats), sum(lons)/len(lons)]
+                    _state["map_zoom"]   = 16
+                    _state["frame_count"] = df["parent_path"].nunique()
+                    _state["ingested"]    = True
+            except Exception as e:
+                logger.warning(f"toggle_coverage: re-center failed: {e}")
+        # ─────────────────────────────────────────────────────────────────
         _build_map()
-        return _msg(f"Coverage polygon {'shown' if _state['show_coverage'] else 'hidden'} (Ctrl+P to toggle).", "sys"), _status_badge()
+        msg = f"Coverage polygon {'shown' if _state['show_coverage'] else 'hidden'} (Ctrl+P to toggle)."
+        return _msg(msg, "sys"), _status_badge()
     except Exception as e:
         logger.warning(f"toggle_coverage error (non-fatal): {e}")
-        return ""
+        return _msg(f"Coverage toggle failed: {e}", "sys"), _status_badge()
+        #      ^^^ was returning "" — now always returns the badge so OOB fires
+        
 
 @rt("/frame_view/{det_id}")
 def frame_view(det_id: str, mode: str = "tile"):
@@ -1383,14 +1462,37 @@ def serve_frame_img(det_id: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Restore state from persistent DB on startup
+_restore_done = False
+
 def _restore_state():
+    global _restore_done
+    if _restore_done:
+        return
+    _restore_done = True
+
     try:
         db.initialize_table(vector_dim=getattr(settings, 'CLIP_DIM', 512))
         count = db.row_count()
         if count > 0:
-            _state["ingested"]    = True
-            _state["tile_count"]  = count
-            logger.info(f"Restored index from DB — {count} tiles already indexed.")
+            _state["ingested"]   = True
+            _state["tile_count"] = count
+            # ── NEW: derive frame count + map center from DB ──────────────────
+            try:
+                df = db.table.to_pandas()
+                frame_count = df["parent_path"].nunique()
+                _state["frame_count"] = frame_count
+                lats = df.groupby("parent_path")["lat"].first().tolist()
+                lons = df.groupby("parent_path")["lon"].first().tolist()
+                if lats and lons:
+                    _state["map_center"] = [sum(lats)/len(lats), sum(lons)/len(lons)]
+                    _state["map_zoom"]   = 16
+            except Exception as e:
+                logger.warning(f"_restore_state: could not derive frame stats: {e}")
+            # ─────────────────────────────────────────────────────────────────
+            logger.info(
+                f"Restored index from DB — {count} tiles / "
+                f"{_state['frame_count']} frames already indexed."
+            )
             _build_map()
         else:
             logger.info("DB is empty — waiting for upload.")

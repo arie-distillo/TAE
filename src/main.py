@@ -27,6 +27,7 @@ from core.spatial import SpatialEngine
 from core.database import TacticalDatabase
 from ai.search import SearchLibrarian
 from ai.analyst import TacticalAnalyst
+from ai.intent import IntentClassifier, ObjectSearchParams, AnomalyDetectionParams, MovingObjectParams
 from tools.ingest_telemetry import TAESimGenerator
 from core.geo import tile_center_geo
 
@@ -111,6 +112,10 @@ analyst  = TacticalAnalyst(
     settings.AI_PROVIDER,
     settings.VLM_MODEL,
     settings.OPENROUTER_API_KEY,
+)
+intent_clf = IntentClassifier(
+    api_key    = settings.OPENROUTER_API_KEY,
+    model_name = getattr(settings, "INTENT_MODEL", None),  # optional override
 )
 _search_lib: SearchLibrarian | None = None
 
@@ -1107,6 +1112,43 @@ async def query(message: str):
     _state["ingested"] = True  # sync flag if restored from DB
 
     lib = get_search_lib()
+
+    # ── Intent classification ─────────────────────────────────────────────────
+    # Classify first — intent determines the entire downstream flow.
+    # Non-object-search intents short-circuit here before any CLIP/VLM work.
+    classified = intent_clf.classify(message)
+    intent     = classified.params.intent
+    logger.info(
+        f"Intent: {intent} | conf={classified.confidence:.2f} | {classified.reasoning}"
+    )
+
+    if intent == "anomaly_detection":
+        p = classified.params  # AnomalyDetectionParams
+        return (
+            user_bubble,
+            _msg(
+                f"⚠️ Anomaly detection is not yet implemented.<br>"
+                f"Classified: scene <i>'{p.scene_context}'</i>, "
+                f"looking for <i>'{p.anomaly_hint}'</i>. "
+                f"Try rephrasing as a specific object search for now.",
+                "sys",
+            ),
+        )
+
+    if intent == "moving_object":
+        p    = classified.params  # MovingObjectParams
+        hint = f" for <i>'{p.motion_hint}'</i>" if p.motion_hint else ""
+        return (
+            user_bubble,
+            _msg(
+                f"⚠️ Moving object detection{hint} is not yet implemented — "
+                f"it requires consecutive frame pairs for temporal differencing. "
+                f"Upload a frame sequence and re-query when this feature ships.",
+                "sys",
+            ),
+        )
+
+    # intent == "object_search" — fall through to CLIP + VLM flow
 
     # ── Vector search ────────────────────────────────────────────────────────
     # Bug A fix: limit=3 let LanceDB return multiple tiles from the same

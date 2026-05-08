@@ -33,26 +33,6 @@ def _load_tile_cv2(candidate: dict) -> np.ndarray | None:
 
 
 # ---------------------------------------------------------------------------
-# Query intent classification
-# ---------------------------------------------------------------------------
-
-QUERY_INTENT_KEYWORDS = {
-    "count":            ["how many", "count", "number of", "quantity"],
-    "area_description": ["what is", "describe", "what's in", "what do you see", "overview"],
-    "change":           ["unusual", "anomaly", "anomalies", "out of place", "changed", "different"],
-    "object_search":    [],  # default fallback
-}
-
-
-def classify_query(user_query: str) -> str:
-    q = user_query.lower()
-    for intent, keywords in QUERY_INTENT_KEYWORDS.items():
-        if any(kw in q for kw in keywords):
-            return intent
-    return "object_search"
-
-
-# ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
 
@@ -72,7 +52,7 @@ def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tup
     Returns (prompt, expects_bboxes).
     Image dimensions are passed explicitly so the VLM knows the pixel space.
     """
-    intent = classify_query(user_query)
+    intent = "object_search"   # TODO PATCH FOR NOW
     img_info = f"Image: {filename} ({img_w}x{img_h} pixels)"
 
     if intent == "object_search":
@@ -185,9 +165,8 @@ class TacticalAnalyst:
         Only tiles with confirmed detections appear in the final report.
         Tiles where the VLM found nothing are counted but not reported.
         """
-        intent = classify_query(user_query)
         logger.info(
-            f"Intent: {intent} | Query: {user_query} | "
+            f"Query: {user_query} | "
             f"Tiles: {[Path(c['image_path']).name for c in candidates]}"
         )
 

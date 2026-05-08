@@ -1,5 +1,6 @@
 ### Operations
 - [] add detailed logging at each step
+- [1] audit
 
 ### Misc
 - [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot
@@ -7,7 +8,10 @@
 - [v] Merge detections → NMS to remove duplicates from overlapping tiles
 - [3] Improve startup message if something already uploaded `_msg("TAE ready. Upload imagery to build the theater index, ""then query in natural language.", "sys"),`
 - [] Investigate bad detections
+
+### Refactoring
 - [] Split into two services - on-edge server and cloud server
+- [] Split `main.py` into UI and Orchestrator
 
 ### non-generative Visual models
 - [v] learn CLIP
@@ -19,6 +23,10 @@
 - [v] handle cases of a different intents, beyond finding a specific object
 - [] add context
 - [] agentic intent detection 
+  - [v] object search intent
+  - [] anomaly detection intent
+  - [] moving object intent
+- [] persistent queries
   
 ### Python libraries to manipulate / seacrh geo object
 - [>] see Gemini chat
@@ -32,6 +40,7 @@
 - [v] chat widget
 - [v] map with markers
 - [] remove Span("Intelligence", cls="brand-sub")
+- [] frames with detection on a timeline
 
 ### Deployment
 - [] Runpod

@@ -25,6 +25,7 @@ folium==0.14.0
 openai
 ollama
 tenacity                 # retry logic in analyst.py
+pydantic-ai
 
 # ── Web ───────────────────────────────────────────────────────────────────────
 fastapi==0.127.0

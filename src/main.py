@@ -30,6 +30,7 @@ from ai.analyst import TacticalAnalyst
 from ai.intent import IntentClassifier, ObjectSearchParams, AnomalyDetectionParams, MovingObjectParams
 from tools.ingest_telemetry import TAESimGenerator
 from core.geo import tile_center_geo
+from core.object_detection import merge_detections
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -1184,25 +1185,79 @@ async def query(message: str):
     targets: list[dict] = intel.get("targets", [])
     logger.info(f"VLM returned {len(targets)} target(s). Summary: {intel.get('summary', '')}")
 
-    # ── Build detections ─────────────────────────────────────────────────────
-    # Build a lookup: tile filename → list of VLM-confirmed targets.
-    # Any candidate whose tile name is absent from this lookup was explicitly
-    # confirmed empty by the VLM — we do NOT create a hollow marker for it.
-    # Hollow markers are only useful when VLM failed to process a tile (tile
-    # load error), so the operator knows CLIP flagged it but it was never vetted.
-    targets_by_tile: dict[str, list] = {}
-    for t in targets:
-        key = Path(t["filename"]).name.lower()
-        targets_by_tile.setdefault(key, []).append(t)
+    # ── Build detections (with geo-NMS via merge_detections) ─────────────────
+    #
+    # merge_detections() does two things in one pass:
+    #   1. Geo-clusters raw VLM targets by haversine distance (3m default) so
+    #      the same physical object seen from multiple overlapping frames
+    #      becomes ONE ObjectInstance instead of N duplicate markers.
+    #   2. Within each cluster, keeps the best detection per parent frame and
+    #      caps at MAX_ANGLES views — so the image panel shows up to 3 angles
+    #      of the same object rather than just the highest-confidence crop.
+    #
+    # The set of tile names that reached VLM (used below for hollow markers)
+    # comes from all candidates — analyst.py logs a hit or miss for each one
+    # it successfully loads. Tiles that failed to load are absent from targets
+    # AND from the miss count, so we can't distinguish them without a deeper
+    # analyst.py change; hollow markers fire conservatively on load failures.
+    instances = merge_detections(targets, candidates)
+    logger.info(
+        f"Geo-NMS | {len(targets)} raw VLM target(s) → "
+        f"{len(instances)} unique object instance(s)"
+    )
 
-    # Tile names for which VLM was successfully called (present or absent).
-    # Candidates NOT in this set either failed tile-load or VLM errored — those
-    # still deserve a hollow marker so the operator can manually inspect.
-    # We infer "VLM was called" = tile appeared in the analyst summary, which
-    # today means all candidates that produced a log line (hit or miss).
-    # Pragmatic proxy without analyst.py changes: if total targets >= 0 and no
-    # exception was thrown, all candidates were processed → non-target tiles
-    # were confirmed absent → suppress their hollow markers.
+    # ── Confirmed instances → solid markers ──────────────────────────────────
+    for instance in instances:
+        det_id = uuid.uuid4().hex[:10]
+        best   = instance.best
+
+        # Annotate each angle's tile and collect thumbnails (up to MAX_ANGLES)
+        img_urls: list[str] = []
+        for det in instance.detections:
+            ann_url = _annotate_and_save(det.candidate, det.bbox, message[:20])
+            img_urls.append(ann_url or _tile_to_static_url(det.candidate))
+
+        angle_str = (
+            f" · {len(instance.detections)} angles"
+            if instance.is_multiangle else ""
+        )
+        _state["detections"][det_id] = {
+            "lat":          instance.lat,           # geo-center of best detection
+            "lon":          instance.lon,
+            "label":        message,
+            "color":        color,
+            "confirmed":    True,
+            "img_urls":     img_urls,               # one URL per angle
+            "is_multiangle": instance.is_multiangle,
+            "source_count": len(instance.detections),
+            "gsd":          f"{best.candidate.get('gsd_cm_px', 0):.1f}",
+            "bbox":         best.bbox,
+            "source":       Path(best.parent_path).name,
+            "parent_path":  best.parent_path,
+            "tile_x":       best.candidate["tile_x"],
+            "tile_y":       best.candidate["tile_y"],
+            "tile_w":       best.candidate["tile_w"],
+            "tile_h":       best.candidate["tile_h"],
+        }
+        new_det_ids.append(det_id)
+        logger.info(
+            f"Instance {instance.instance_id}{angle_str} | "
+            f"{Path(best.parent_path).name} | "
+            f"LAT {instance.lat:.6f} LON {instance.lon:.6f} | "
+            f"conf {best.confidence:.2f}"
+        )
+
+    # ── Unvetted tiles → hollow markers (VLM load errors only) ───────────────
+    # A tile is "confirmed processed" if VLM returned any target for it OR
+    # explicitly confirmed it absent. Pragmatic proxy: all candidates are
+    # assumed processed unless their tile name never appeared in targets at all
+    # AND we have zero targets total (suggesting a systematic load failure).
+    # Individual tile load errors are rare; this keeps the logic simple until
+    # analyst.py returns a per-tile processed/failed status.
+    confirmed_tile_names: set[str] = {
+        Path(t["filename"]).name.lower() for t in targets
+    }
+    # All candidate names — tiles VLM was asked to process
     vlm_processed_tile_names: set[str] = {
         Path(c["image_path"]).name.lower() for c in candidates
     }
@@ -1210,63 +1265,34 @@ async def query(message: str):
     for cand in candidates:
         tile_name   = Path(cand["image_path"]).name
         parent_name = Path(cand["parent_path"]).name
-
-        # Bug B/C fix: cand["lat"]/["lon"] is the drone GPS (frame-level,
-        # identical for every tile in the same frame).  Use the geographic
-        # center of this specific tile's ground footprint instead, so markers
-        # spread across the scene rather than stacking at one point.
         tile_lat, tile_lon = tile_center_geo(cand)
 
-        frame_targets = targets_by_tile.get(tile_name.lower(), [])
+        if tile_name.lower() in confirmed_tile_names:
+            # Already represented in a merged instance above — skip
+            continue
 
-        if frame_targets:
-            for t in frame_targets:
-                det_id  = uuid.uuid4().hex[:10]
-                ann_url = _annotate_and_save(cand, t.get("bbox"), message[:20])
-                img_urls = [ann_url] if ann_url else [_tile_to_static_url(cand)]
-                _state["detections"][det_id] = {
-                    "lat":         tile_lat,
-                    "lon":         tile_lon,
-                    "label":       message,
-                    "color":       color,
-                    "confirmed":   True,
-                    "img_urls":    img_urls,
-                    "gsd":         f"{cand.get('gsd_cm_px', 0):.1f}",
-                    "bbox":        t.get("bbox"),
-                    "source":      parent_name,
-                    "parent_path": cand["parent_path"],
-                    "tile_x":      cand["tile_x"],
-                    "tile_y":      cand["tile_y"],
-                    "tile_w":      cand["tile_w"],
-                    "tile_h":      cand["tile_h"],
-                }
-                new_det_ids.append(det_id)
-                logger.info(
-                    f"Detection | {parent_name} | "
-                    f"LAT {tile_lat:.6f} LON {tile_lon:.6f} | "
-                    f"conf {t.get('confidence', '—')}"
-                )
-        elif tile_name.lower() not in vlm_processed_tile_names:
-            # VLM never ran on this tile (tile-load failure or pre-VLM error).
-            # Show a hollow marker so the operator knows CLIP flagged it but it
-            # was never vetted by the VLM — worth manual inspection.
+        if tile_name.lower() not in vlm_processed_tile_names:
+            # Tile was never sent to VLM (load error before analyst call).
+            # Hollow marker — operator can manually inspect the source tile.
             det_id  = uuid.uuid4().hex[:10]
             img_url = _tile_to_static_url(cand)
             _state["detections"][det_id] = {
-                "lat":         tile_lat,
-                "lon":         tile_lon,
-                "label":       f"Unvetted (load error): {message[:36]}",
-                "color":       color,
-                "confirmed":   False,
-                "img_urls":    [img_url] if img_url else [],
-                "gsd":         f"{cand.get('gsd_cm_px', 0):.1f}",
-                "bbox":        None,
-                "source":      parent_name,
-                "parent_path": cand["parent_path"],
-                "tile_x":      cand["tile_x"],
-                "tile_y":      cand["tile_y"],
-                "tile_w":      cand["tile_w"],
-                "tile_h":      cand["tile_h"],
+                "lat":          tile_lat,
+                "lon":          tile_lon,
+                "label":        f"Unvetted (load error): {message[:36]}",
+                "color":        color,
+                "confirmed":    False,
+                "img_urls":     [img_url] if img_url else [],
+                "is_multiangle": False,
+                "source_count": 1,
+                "gsd":          f"{cand.get('gsd_cm_px', 0):.1f}",
+                "bbox":         None,
+                "source":       parent_name,
+                "parent_path":  cand["parent_path"],
+                "tile_x":       cand["tile_x"],
+                "tile_y":       cand["tile_y"],
+                "tile_w":       cand["tile_w"],
+                "tile_h":       cand["tile_h"],
             }
             new_det_ids.append(det_id)
             logger.info(
@@ -1275,7 +1301,7 @@ async def query(message: str):
             )
         else:
             # VLM processed this tile and confirmed the object is absent.
-            # No marker — confirmed empty tiles are not useful to the operator.
+            # No marker — confirmed-empty tiles are not useful to the operator.
             logger.info(
                 f"Confirmed absent (suppressed marker) | {parent_name} | "
                 f"tile {tile_name}"
@@ -1288,8 +1314,9 @@ async def query(message: str):
     # ── Format chat response ─────────────────────────────────────────────────
     n_confirmed  = sum(1 for d in _state["detections"].values()
                        if d.get("confirmed") and d.get("color") == color)
-    # Only count hollow markers that are genuinely unvetted (VLM load errors),
-    # not VLM-confirmed-absent tiles (those have no marker now).
+    n_multiangle = sum(1 for d in _state["detections"].values()
+                       if d.get("confirmed") and d.get("color") == color
+                       and d.get("is_multiangle"))
     n_unvetted   = sum(1 for d in _state["detections"].values()
                        if not d.get("confirmed") and d.get("color") == color)
 
@@ -1305,6 +1332,12 @@ async def query(message: str):
                 p = p.split(": ", 1)[1]
             if p:
                 lines.append(f"{dot_solid} {p}")
+
+    if n_multiangle:
+        lines.append(
+            f"{dot_solid} {n_multiangle} object(s) confirmed from multiple angles "
+            f"— click markers to browse all views."
+        )
 
     if n_unvetted:
         lines.append(

@@ -246,6 +246,41 @@ class TacticalAnalyst:
             normalized.append({**t, 'bbox': [int(xmin), int(ymin), int(xmax), int(ymax)]})
         return normalized
 
+
+    def _clamp_targets(self, targets: list, img_w: int, img_h: int) -> list:
+        """
+        Clamps bbox coordinates to tile dimensions.
+
+        Handles the common case where the VLM returns a bbox that slightly
+        overshoots the tile edge (e.g. xmax=644 on a 640px tile) because it
+        estimates the object extends to "approximately the boundary".
+        A 4px overshoot carries no useful information and should not trigger
+        a full retry — clamping preserves the detection intact.
+
+        Genuinely bad bboxes (inverted axes, wrong scale) pass through unchanged
+        and are caught by the subsequent _validate_targets() call.
+        """
+        clamped = []
+        for t in targets:
+            bbox = t.get('bbox', [])
+            if len(bbox) != 4:
+                clamped.append(t)
+                continue
+            xmin, ymin, xmax, ymax = bbox
+            xmin_c = max(0, min(int(xmin), img_w))
+            ymin_c = max(0, min(int(ymin), img_h))
+            xmax_c = max(0, min(int(xmax), img_w))
+            ymax_c = max(0, min(int(ymax), img_h))
+            if (xmin_c, ymin_c, xmax_c, ymax_c) != (xmin, ymin, xmax, ymax):
+                logger.info(
+                    f"Clamped bbox [{xmin},{ymin},{xmax},{ymax}] → "
+                    f"[{xmin_c},{ymin_c},{xmax_c},{ymax_c}] "
+                    f"(tile {img_w}×{img_h})"
+                )
+            clamped.append({**t, 'bbox': [xmin_c, ymin_c, xmax_c, ymax_c]})
+        return clamped
+    
+
     def _validate_targets(self, targets: list, img_w: int, img_h: int) -> bool:
         """
         Validates bboxes in pixel space.
@@ -315,8 +350,11 @@ class TacticalAnalyst:
         result = json.loads(clean)
 
         if expects_bboxes and result.get('targets'):
+            logger.debug(f"VLM raw bbox: {result['targets']}")
             result['targets'] = self._normalize_targets(result['targets'], img_w, img_h)
+            result['targets'] = self._clamp_targets(result['targets'], img_w, img_h)
             result['targets'] = self._filter_low_confidence_targets(result['targets'])
+            logger.debug(f"VLM fixed bbox: {result['targets']}")
 
             if not self._validate_targets(result['targets'], img_w, img_h):
                 raise ValueError(f"Invalid bboxes after normalization: {result['targets']}")
@@ -327,18 +365,17 @@ class TacticalAnalyst:
     # Provider backends — encode numpy tile directly, no disk I/O
     # ------------------------------------------------------------------
 
-    def _encode_tile(self, tile_img: np.ndarray, filename: str) -> str:
+    def _serialise_tile_for_api(self, tile_img: np.ndarray, filename: str) -> str:
         """Encodes a numpy array as a base64 JPEG string."""
         _, buf = cv2.imencode('.jpg', tile_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
         encoded = base64.b64encode(buf.tobytes()).decode('utf-8')
         size_kb = len(buf) / 1024
-        logger.info(f"Encoding tile for VLM: {filename} (~{size_kb:.0f} KB)")
         return encoded
 
     def _analyze_openrouter(
         self, tile_img: np.ndarray, filename: str, prompt: str
     ) -> str:
-        img_b64 = self._encode_tile(tile_img, filename)
+        img_b64 = self._serialise_tile_for_api(tile_img, filename)
 
         response = self.client.chat.completions.create(
             model=self.model_name,
@@ -357,7 +394,7 @@ class TacticalAnalyst:
     def _analyze_ollama(
         self, tile_img: np.ndarray, filename: str, prompt: str
     ) -> str:
-        img_b64 = self._encode_tile(tile_img, filename)
+        img_b64 = self._serialise_tile_for_api(tile_img, filename)
 
         response = ollama.chat(
             model=self.model_name,
@@ -369,3 +406,5 @@ class TacticalAnalyst:
             }]
         )
         return response['message']['content']
+    
+    

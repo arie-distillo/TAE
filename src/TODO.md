@@ -8,6 +8,9 @@
 - [v] Merge detections → NMS to remove duplicates from overlapping tiles
 - [3] Improve startup message if something already uploaded `_msg("TAE ready. Upload imagery to build the theater index, ""then query in natural language.", "sys"),`
 - [] Investigate bad detections
+- [] Missions
+  - [] mission CRUD in UI
+  - [] databases / directories per mission
 
 ### Refactoring
 - [] Split into two services - on-edge server and cloud server

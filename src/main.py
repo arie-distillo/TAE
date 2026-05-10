@@ -31,6 +31,8 @@ from ai.intent import IntentClassifier, ObjectSearchParams, AnomalyDetectionPara
 from tools.ingest_telemetry import TAESimGenerator
 from core.geo import tile_center_geo
 from core.object_detection import merge_detections
+from core.mission import MissionManager, Mission, ALLOWED_INTENTS_DEFAULT
+from core.segment_store import SegmentStore
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -42,6 +44,22 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
     force=True,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)        # hides every HTTP GET/POST
+logging.getLogger("watchfiles.main").setLevel(logging.WARNING)  # hides file-change noise
+
+class _SuppressPollingEndpoints(logging.Filter):
+    """
+    Drops uvicorn access log lines for high-frequency polling endpoints
+    that would otherwise flood the console during uploads.
+    """
+    _SUPPRESSED = {"/upload_progress", "/upload_progress/"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(ep in msg for ep in self._SUPPRESSED)
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressPollingEndpoints())
+
 # Re-set uvicorn loggers to INFO so they don't suppress ours
 for _uv in ("uvicorn", "uvicorn.error", "uvicorn.access"):
     logging.getLogger(_uv).setLevel(logging.INFO)
@@ -97,7 +115,8 @@ _state: dict = {
     "tile_count":      0,
     "query_color_idx": 0,
     "show_coverage":   False,
-    "ingest_progress": "",    # e.g. "frame 3 of 50"
+    "ingest_progress": "",
+    "mission":         None,    # active Mission dataclass, set in _restore_state
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,8 +135,30 @@ analyst  = TacticalAnalyst(
 )
 intent_clf = IntentClassifier(
     api_key    = settings.OPENROUTER_API_KEY,
-    model_name = getattr(settings, "INTENT_MODEL", None),  # optional override
+    model_name = getattr(settings, "INTENT_MODEL", None),
 )
+
+# ── Mission management ────────────────────────────────────────────────────────
+# MissionManager owns the global missions.db catalogue.
+# The active mission is set during _restore_state() and stored in _state.
+mission_mgr = MissionManager(settings.MISSIONS_DB_PATH)
+
+# SAM2 segmentor — loaded lazily in _ingest_background to avoid startup delay.
+# is_available() returns False if neither SAM2 nor SAM weights are configured.
+_segmentor = None
+
+
+def _get_segmentor():
+    """Lazy-load the SAM2 segmentor (calls Replicate API)."""
+    global _segmentor
+    if _segmentor is None:
+        from ai.segmentor import SAM2Segmentor
+        _segmentor = SAM2Segmentor(
+            api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
+            model_version = getattr(settings, "SAM_REPLICATE_MODEL", ""),
+            max_dim       = getattr(settings, "SAM_MAX_DIM", 1024),
+        )
+    return _segmentor
 _search_lib: SearchLibrarian | None = None
 
 
@@ -410,9 +451,18 @@ def _msg_html(html_content: str, role: str = "sys") -> FT:
 
 
 def _status_badge() -> FT:
+    mission: Mission | None = _state.get("mission")
     if _state["ingested"]:
         dot_cls = "sdot active"
-        txt     = f"Index ready · {_state['frame_count']} frames"
+        mission_name = f" · {mission.name}" if mission else ""
+        intents_str  = (
+            ", ".join(mission.allowed_intents) if mission else ""
+        )
+        txt = (
+            f"Index ready · {_state['frame_count']} frames"
+            f"{mission_name}"
+            + (f" · {intents_str}" if intents_str else "")
+        )
     else:
         dot_cls = "sdot"
         txt     = "No index · Upload images to begin"
@@ -955,20 +1005,74 @@ def toggle_chat():
 
 def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
     from core.sim_provider import SimD3Environment
-    from core.ingestion import run_ingestion
+    from core.ingestion import run_ingestion, run_sam2_segmentation
     try:
+        mission: Mission | None = _state.get("mission")
+
         db.initialize_table(vector_dim=getattr(settings, "CLIP_DIM", 512))
-        sim      = SimD3Environment(str(meta_file))
-        lib      = get_search_lib()
-        total    = len(sim.frame_names)
-        logger.info("Starting CLIP ingestion…")
+        sim   = SimD3Environment(str(meta_file))
+        lib   = get_search_lib()
+        total = len(sim.frame_names)
+        logger.info("Starting ingestion…")
 
+        # ── Stage 1: CLIP tile encoding (always) ─────────────────────────────
         def _on_frame(idx: int, name: str):
-            _state["ingest_progress"] = f"frame {idx} of {total} — {name}"
+            _state["ingest_progress"] = f"[Stage 1] frame {idx} of {total} — {name}"
 
-        tiles_ok, frames_failed = run_ingestion(sim, spatial, lib, db,
-                                                on_frame=_on_frame)
-        logger.info(f"Ingestion done — {tiles_ok} tiles, {frames_failed} frame(s) failed.")
+        tiles_ok, frames_failed = run_ingestion(
+            sim, spatial, lib, db, on_frame=_on_frame
+        )
+        logger.info(
+            f"Stage 1 done — {tiles_ok} tiles, {frames_failed} frame(s) failed."
+        )
+
+        # ── Stage 2: SAM2 segmentation (anomaly_detection missions only) ──────
+        segments_written = 0
+        if mission and "anomaly_detection" in mission.allowed_intents:
+            segmentor = _get_segmentor()
+            if segmentor.is_available():
+                segment_store = SegmentStore(mission.segments_db_path)
+                sim2 = SimD3Environment(str(meta_file))  # fresh iterator
+
+                def _on_frame2(idx: int, name: str):
+                    _state["ingest_progress"] = (
+                        f"[Stage 2] segmenting frame {idx} of {total} — {name}"
+                    )
+
+                segments_written, seg_failed = run_sam2_segmentation(
+                    sim2, segmentor, segment_store, lib, on_frame=_on_frame2
+                )
+                logger.info(
+                    f"Stage 2 done — {segments_written} segments, "
+                    f"{seg_failed} frame(s) failed."
+                )
+            else:
+                logger.info(
+                    "Stage 2 skipped — no segmentation model configured. "
+                    "Set SAM2_CHECKPOINT in settings to enable."
+                )
+        else:
+            logger.info(
+                "Stage 2 skipped — anomaly_detection not in mission intents."
+                if mission else
+                "Stage 2 skipped — no active mission."
+            )
+
+        # ── Update mission counts ─────────────────────────────────────────────
+        frame_count = db.table.to_pandas()["parent_path"].nunique() if db.table else 0
+        if mission:
+            mission_mgr.update_counts(
+                mission_id    = mission.id,
+                status        = "ready",
+                frame_count   = frame_count,
+                tile_count    = tiles_ok,
+                segment_count = segments_written,
+            )
+            # Reflect on the in-memory mission object too
+            mission.status        = "ready"
+            mission.frame_count   = frame_count
+            mission.tile_count    = tiles_ok
+            mission.segment_count = segments_written
 # Count unique frames from DB — correct even with incremental uploads
         try:
             df = db.table.to_pandas()
@@ -1122,6 +1226,23 @@ async def query(message: str):
     logger.info(
         f"Intent: {intent} | conf={classified.confidence:.2f} | {classified.reasoning}"
     )
+
+    # ── Mission intent guard ──────────────────────────────────────────────────
+    # Reject queries whose intent was not declared for this mission.
+    # This surfaces a helpful error rather than running expensive compute
+    # that won't produce meaningful results (e.g. moving_object on a static
+    # photogrammetry survey).
+    mission: Mission | None = _state.get("mission")
+    if mission and not mission.allows(intent):
+        allowed_str = ", ".join(mission.allowed_intents)
+        return (
+            user_bubble,
+            _msg(
+                f"⚠️ Intent <b>{intent}</b> is not enabled for this mission.<br>"
+                f"Allowed intents: <b>{allowed_str}</b>.",
+                "sys",
+            ),
+        )
 
     if intent == "anomaly_detection":
         p = classified.params  # AnomalyDetectionParams
@@ -1545,13 +1666,22 @@ def _restore_state():
         return
     _restore_done = True
 
+    # ── Mission: resume or create ─────────────────────────────────────────────
+    segments_db_path = Path(settings.SEGMENTS_DIR) / "segments.db"
+    mission = mission_mgr.get_or_create_active(
+        upload_path      = settings.UPLOAD_PATH,
+        lancedb_path     = settings.VECTOR_DB_PATH,
+        segments_db_path = str(segments_db_path),
+    )
+    _state["mission"] = mission
+
+    # ── LanceDB: restore tile index ───────────────────────────────────────────
     try:
         db.initialize_table(vector_dim=getattr(settings, 'CLIP_DIM', 512))
         count = db.row_count()
         if count > 0:
             _state["ingested"]   = True
             _state["tile_count"] = count
-            # ── NEW: derive frame count + map center from DB ──────────────────
             try:
                 df = db.table.to_pandas()
                 frame_count = df["parent_path"].nunique()
@@ -1563,14 +1693,13 @@ def _restore_state():
                     _state["map_zoom"]   = 16
             except Exception as e:
                 logger.warning(f"_restore_state: could not derive frame stats: {e}")
-            # ─────────────────────────────────────────────────────────────────
             logger.info(
                 f"Restored index from DB — {count} tiles / "
-                f"{_state['frame_count']} frames already indexed."
+                f"{_state['frame_count']} frames | mission: {mission.name}"
             )
             _build_map()
         else:
-            logger.info("DB is empty — waiting for upload.")
+            logger.info(f"DB is empty — waiting for upload | mission: {mission.name}")
     except Exception as e:
         logger.warning(f"Could not restore DB state: {e}")
 

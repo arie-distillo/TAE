@@ -22,10 +22,25 @@ from typing import Literal, Union, Annotated
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from openai import AsyncOpenAI
 
 logger = logging.getLogger("IntentClassifier")
 
+class _Intent(BaseModel):
+    """
+    Flat schema used only inside the agent — avoids discriminated union
+    validation failures with smaller models.
+    Reconstructed into ClassifiedQuery after the LLM call.
+    """
+    intent:             Literal["object_search", "anomaly_detection", "moving_object"]
+    confidence:         float = Field(ge=0.0, le=1.0)
+    reasoning:          str
+    target_description: str   = ""   # object_search only
+    scene_context:      str   = ""   # anomaly_detection only
+    anomaly_hint:       str   = ""   # anomaly_detection only
+    motion_hint:        str   = ""   # moving_object only
 
 # ---------------------------------------------------------------------------
 # Intent parameter models  (discriminated union on the 'intent' literal)
@@ -165,6 +180,20 @@ DISAMBIGUATION RULES
 
 Always extract scene_context and anomaly_hint carefully for anomaly_detection —
 these are passed directly to the downstream VLM prompt.
+
+OUTPUT FORMAT
+=============
+Return ONLY a flat JSON object with these fields:
+{
+  "intent":             "object_search" | "anomaly_detection" | "moving_object",
+  "confidence":         0.0 to 1.0,
+  "reasoning":          "one sentence",
+  "target_description": "what to find (object_search only, else empty string)",
+  "scene_context":      "expected normal scene (anomaly_detection only, else empty string)",
+  "anomaly_hint":       "what makes something anomalous (anomaly_detection only, else empty string)",
+  "motion_hint":        "type of moving object (moving_object only, else empty string)"
+}
+No markdown, no nesting, no extra keys.
 """
 
 
@@ -238,28 +267,34 @@ class IntentClassifier:
     ) -> None:
         self._agent: Agent | None = None
         _slug = model_name or "meta-llama/llama-3.1-8b-instruct"
+        logger.info(
+            f"IntentClassifier init | api_key={'SET' if api_key else 'MISSING'} | "
+            f"model={_slug}"
+        )
 
         if api_key:
             try:
-                _model = OpenAIModel(
-                    model_name=_slug,
-                    base_url="https://openrouter.ai/api/v1",
-                    api_key=api_key,
+                _provider = OpenAIProvider(
+                    base_url = "https://openrouter.ai/api/v1",
+                    api_key  = api_key,
+                )
+                _model = OpenAIChatModel(
+                    model_name = _slug,
+                    provider   = _provider,
                 )
                 self._agent = Agent(
-                    model=_model,
-                    result_type=ClassifiedQuery,
-                    system_prompt=_SYSTEM_PROMPT,
+                    model         = _model,
+                    output_type   = _Intent,
+                    system_prompt = _SYSTEM_PROMPT,
                 )
                 logger.info(f"Intent agent ready: {_slug} via OpenRouter")
-            except Exception as exc:
+            except Exception:
+                import traceback
                 logger.warning(
-                    f"Could not initialise intent agent ({exc}); "
-                    "keyword fallback will be used."
+                    f"Could not initialise intent agent — keyword fallback will be used.\n"
+                    f"{traceback.format_exc()}"
                 )
-        else:
-            logger.info("No API key — intent classifier using keyword fallback only.")
-
+     
     def classify(self, user_query: str) -> ClassifiedQuery:
         """
         Classify a natural-language operator query.
@@ -278,8 +313,32 @@ class IntentClassifier:
             return result
 
         try:
-            run    = self._agent.run_sync(user_query)
-            result = run.data
+            import asyncio
+            from concurrent.futures import ThreadPoolExecutor
+
+            async def _run_agent():
+                result = await self._agent.run(user_query)
+                return result.output   # returns _FlatIntent
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                flat = pool.submit(asyncio.run, _run_agent()).result(timeout=30)
+
+            # Reconstruct ClassifiedQuery with proper discriminated params
+            if flat.intent == "object_search":
+                params = ObjectSearchParams(
+                    target_description=flat.target_description or user_query
+                )
+            elif flat.intent == "anomaly_detection":
+                params = AnomalyDetectionParams(
+                    scene_context=flat.scene_context or "unknown",
+                    anomaly_hint=flat.anomaly_hint  or user_query,
+                )
+            else:  # moving_object
+                params = MovingObjectParams(motion_hint=flat.motion_hint)
+
+            result = ClassifiedQuery(
+                params=params, confidence=flat.confidence, reasoning=flat.reasoning
+            )
             logger.info(
                 f"Intent (LLM): {result.params.intent} "
                 f"conf={result.confidence:.2f} | {result.reasoning}"
@@ -287,12 +346,11 @@ class IntentClassifier:
             return result
 
         except Exception as exc:
-            logger.warning(
-                f"Intent agent failed ({exc}); falling back to keyword matching."
-            )
+            logger.warning(f"Intent agent failed ({exc}); falling back to keyword matching.")
             result = _classify_keywords(user_query)
             logger.info(
                 f"Intent (keyword fallback): {result.params.intent} "
                 f"conf={result.confidence:.2f} | {result.reasoning}"
             )
             return result
+    

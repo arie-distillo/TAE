@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     CLIP_MODEL: str = "ViT-B/32"
     CLIP_DIM:   int = 512
 
+    # ── AI - SAM2 ────────────────────────────────────────────────────────────
+    ANOMALY_SCORE_MARGIN: float = 0.05 # ratio-based e.g. 0.05 means "anomaly score must be 5% higher than expected score".
+
     # ── AI — Segmentation (SAM2 via Replicate) ───────────────────────────────
     # Calls Meta SAM-2 on the Replicate cloud platform.
     # No local GPU or model weights required.

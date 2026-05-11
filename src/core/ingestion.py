@@ -25,6 +25,9 @@ import numpy as np
 
 logger = logging.getLogger("TAE.Ingestion")
 
+from config import settings
+from core.segment_viz import save_segment_overview
+
 TILE_SIZE    = 640
 TILE_OVERLAP = 64
 
@@ -259,6 +262,17 @@ def run_sam2_segmentation(
                 })
 
             n = segment_store.insert_segments(frame_path, segments_to_store)
+            # Store segements visualization for debugging if any were written this run (not already in DB)
+            if n > 0:
+                # Save overview for debugging — lives next to LanceDB in detections/segments/
+                viz_path = (
+                    Path(settings.DETECTIONS_PATH)
+                    / "segments"
+                    / f"{Path(frame_path).stem}_segments.jpg"
+                )
+                save_segment_overview(img_cv2, segments_to_store, viz_path)
+                logger.info(f"Segment overview saved → {viz_path.name}")
+
             segments_written += n
             logger.info(
                 f"[{frame_idx+1}] {frame_name} | "

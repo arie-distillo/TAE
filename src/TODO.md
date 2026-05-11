@@ -7,7 +7,7 @@
 - [v] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini)
 - [v] Merge detections → NMS to remove duplicates from overlapping tiles
 - [3] Improve startup message if something already uploaded `_msg("TAE ready. Upload imagery to build the theater index, ""then query in natural language.", "sys"),`
-- [] Investigate bad detections
+- [v] Investigate bad detections
 - [] Missions
   - [] mission CRUD in UI
   - [] databases / directories per mission
@@ -35,7 +35,7 @@
 - [>] see Gemini chat
 
 ### Jetson
-- [] what one to purchase - dev kit?
+- [] which one to purchase - dev kit?
 
 ### UI
 - [v] images upload
@@ -43,6 +43,7 @@
 - [v] chat widget
 - [v] map with markers
 - [] remove Span("Intelligence", cls="brand-sub")
+- [] show time / frame when pointed on a marker on a map, bypass inetrmediate pop-up
 - [] frames with detection on a timeline
 
 ### Deployment

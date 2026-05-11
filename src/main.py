@@ -33,6 +33,9 @@ from core.geo import tile_center_geo
 from core.object_detection import merge_detections
 from core.mission import MissionManager, Mission, ALLOWED_INTENTS_DEFAULT
 from core.segment_store import SegmentStore
+from ai.anomaly import VocabularyBuilder, score_segments, ScoredSegment, TOP_K_FOR_VLM
+from core.segment_viz import save_scored_crops
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -159,6 +162,27 @@ def _get_segmentor():
             max_dim       = getattr(settings, "SAM_MAX_DIM", 1024),
         )
     return _segmentor
+
+
+# ── Vocabulary builder (lazy) ─────────────────────────────────────────────────
+_vocab_builder: VocabularyBuilder | None = None
+
+
+def _get_vocab_builder() -> VocabularyBuilder:
+    global _vocab_builder
+    if _vocab_builder is None:
+        from openai import OpenAI
+        _client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=settings.OPENROUTER_API_KEY or "",
+            default_headers={"HTTP-Referer": "https://github.com/arie/TAE", "X-Title": "TAE"},
+        )
+        _vocab_builder = VocabularyBuilder(
+            client     = _client,
+            model_name = getattr(settings, "INTENT_MODEL", None)
+                         or "anthropic/claude-haiku-4-5",
+        )
+    return _vocab_builder
 _search_lib: SearchLibrarian | None = None
 
 
@@ -230,6 +254,255 @@ def _recenter_on_detections(det_ids: list[str]) -> None:
         f"Map recentered | center ({center_lat:.6f}, {center_lon:.6f}) | "
         f"zoom {zoom} | span ({lat_span:.5f}° lat, {lon_span:.5f}° lon)"
     )
+
+
+# ── Frame rows cache (for _segment_to_candidate) ─────────────────────────────
+_frame_rows_cache: dict[str, list[dict]] = {}
+
+
+def _get_frame_rows(frame_path: str) -> list[dict]:
+    """
+    Return all LanceDB tile rows for a frame (cached per-process).
+    Used to reconstruct the frame's footprint corners for geo-projection.
+    """
+    if frame_path not in _frame_rows_cache:
+        try:
+            df = db.table.to_pandas()
+            _frame_rows_cache[frame_path] = (
+                df[df["parent_path"] == frame_path].to_dict("records")
+            )
+        except Exception:
+            _frame_rows_cache[frame_path] = []
+    return _frame_rows_cache[frame_path]
+
+
+def _segment_to_candidate(seg: ScoredSegment) -> dict | None:
+    """
+    Convert a ScoredSegment into a candidate dict compatible with
+    analyze_multiple_views() and _annotate_and_save().
+    The segment bbox becomes a 'tile' (tile_x/y/w/h).
+    Footprint corners are bilinearly interpolated from the frame footprint.
+    """
+    rows = _get_frame_rows(seg.frame_path)
+    if not rows:
+        return None
+
+    tl = min(rows, key=lambda r: (r["tile_y"],                r["tile_x"]))
+    tr = min(rows, key=lambda r: (r["tile_y"],              -(r["tile_x"] + r["tile_w"])))
+    br = min(rows, key=lambda r: (-(r["tile_y"] + r["tile_h"]), -(r["tile_x"] + r["tile_w"])))
+    bl = min(rows, key=lambda r: (-(r["tile_y"] + r["tile_h"]),  r["tile_x"]))
+
+    frame_nw = (tl["fp_nw_lat"], tl["fp_nw_lon"])
+    frame_ne = (tr["fp_ne_lat"], tr["fp_ne_lon"])
+    frame_se = (br["fp_se_lat"], br["fp_se_lon"])
+    frame_sw = (bl["fp_sw_lat"], bl["fp_sw_lon"])
+
+    frame_w = max(r["tile_x"] + r["tile_w"] for r in rows)
+    frame_h = max(r["tile_y"] + r["tile_h"] for r in rows)
+
+    xmin, ymin, xmax, ymax = seg.bbox
+    tw, th = xmax - xmin, ymax - ymin
+    if tw <= 0 or th <= 0:
+        return None
+
+    def _bl(u: float, v: float) -> tuple[float, float]:
+        top_lat = frame_nw[0] + u * (frame_ne[0] - frame_nw[0])
+        top_lon = frame_nw[1] + u * (frame_ne[1] - frame_nw[1])
+        bot_lat = frame_sw[0] + u * (frame_se[0] - frame_sw[0])
+        bot_lon = frame_sw[1] + u * (frame_se[1] - frame_sw[1])
+        return (top_lat + v * (bot_lat - top_lat),
+                top_lon + v * (bot_lon - top_lon))
+
+    u0, v0 = xmin / frame_w, ymin / frame_h
+    u1, v1 = xmax / frame_w, ymax / frame_h
+    seg_nw = _bl(u0, v0); seg_ne = _bl(u1, v0)
+    seg_se = _bl(u1, v1); seg_sw = _bl(u0, v1)
+
+    ref = rows[0]
+    return {
+        "image_path":  f"{Path(seg.frame_path).stem}_seg_{xmin}_{ymin}.jpg",
+        "parent_path": seg.frame_path,
+        "tile_x": int(xmin), "tile_y": int(ymin),
+        "tile_w": int(tw),   "tile_h": int(th),
+        "lat":       ref["lat"],              "lon":    ref["lon"],
+        "alt_m":     ref.get("alt_m", 0.0),  "gimbal_yaw": ref.get("gimbal_yaw", 0.0),
+        "gsd_cm_px": ref.get("gsd_cm_px", 0.0),
+        "fp_nw_lat": seg_nw[0], "fp_nw_lon": seg_nw[1],
+        "fp_ne_lat": seg_ne[0], "fp_ne_lon": seg_ne[1],
+        "fp_se_lat": seg_se[0], "fp_se_lon": seg_se[1],
+        "fp_sw_lat": seg_sw[0], "fp_sw_lon": seg_sw[1],
+    }
+
+
+def _handle_anomaly_query(
+    message:     str,
+    params,
+    color:       str,
+    user_bubble,
+    mission,
+) -> tuple:
+    """
+    Full anomaly pipeline:
+    CLIP retrieval → SAM2 segment load → vocabulary → CLIP scoring →
+    VLM confirmation → geo markers
+    """
+    lib = get_search_lib()
+
+    # Phase 1: Retrieve frames whose content looks like the expected scene
+    clip_q = f"{_CLIP_AERIAL_CTX} {params.scene_context}"
+    q_vec  = lib.encode_text(clip_q)
+    cands  = db.semantic_search(q_vec, limit=40, frames_to_return=15)
+    if not cands:
+        return user_bubble, _msg(
+            f"No frames matching scene '{params.scene_context}' found.", "sys"
+        )
+    frame_paths = list({c["parent_path"] for c in cands})
+    logger.info(
+        f"Anomaly | scene='{params.scene_context}' | "
+        f"anomaly='{params.anomaly_hint}' | {len(frame_paths)} frame(s)"
+    )
+
+    # Phase 2: Load SAM2 segments
+    if not mission:
+        return user_bubble, _msg("No active mission — cannot access segment store.", "sys")
+    seg_store         = SegmentStore(mission.segments_db_path)
+    segs_by_frame     = seg_store.get_segments_for_frames(frame_paths)
+    total_segs        = sum(len(v) for v in segs_by_frame.values())
+    if total_segs == 0:
+        return user_bubble, _msg(
+            "No SAM2 segments found. Re-ingest imagery to build the segment index.", "sys"
+        )
+    logger.info(f"Anomaly | {total_segs} segments loaded")
+
+    # Phase 3: Vocabulary
+    vocab         = _get_vocab_builder().build(params.scene_context, params.anomaly_hint)
+    expected_vecs = [lib.encode_text(t) for t in vocab.expected_terms]
+    anomaly_vecs  = [lib.encode_text(t) for t in vocab.anomaly_terms]
+
+    # Phase 4: Score — use margin=-1.0 so ALL segments are ranked,
+    # not filtered. CLIP scores are unreliable for small objects (<100×100px).
+    # The margin is used only to decide the response message, not to gate VLM.
+    scored = score_segments(segs_by_frame, expected_vecs, anomaly_vecs, margin=-1.0)
+    logger.info(
+        f"Anomaly | {len(scored)} segment(s) scored | "
+        f"top score={scored[0].anomaly_score:.3f}" if scored else
+        "Anomaly | 0 segments to score"
+    )
+
+    # Log top-5 scores so we can see exactly which segments were ranked
+    if scored:
+        top5_info = " | ".join(
+            f"{Path(s.frame_path).name} seg({s.bbox[0]},{s.bbox[1]}) "
+            f"Δ={s.anomaly_score:.3f} ano={s.score_anomaly:.3f} exp={s.score_expected:.3f}"
+            for s in scored[:5]
+        )
+        logger.info(f"Top-5 scores: {top5_info}")
+
+    if not scored:
+        return user_bubble, _msg("No segments available to score.", "sys")
+
+    # Select candidates for VLM: top-1 per frame (guarantees coverage across
+    # all frames regardless of global ranking). Boat in FRAME_0029 is always
+    # included even if it scores below the global top-K.
+    seen_frames: set[str] = set()
+    vlm_candidates = []
+    for seg in scored:                      # already sorted best → worst
+        if seg.frame_path not in seen_frames:
+            seen_frames.add(seg.frame_path)
+            cand = _segment_to_candidate(seg)
+            if cand:
+                vlm_candidates.append(cand)
+
+    logger.info(
+        f"Anomaly | sending {len(vlm_candidates)} candidate(s) to VLM "
+        f"(top-1 per frame across {len(seen_frames)} frame(s))"
+    )
+
+    if not vlm_candidates:
+        return user_bubble, _msg("Could not load segment crops for VLM.", "sys")
+
+    # Phase 5: VLM confirmation
+    vlm_query = (
+        f"anomaly detection: {params.anomaly_hint} "
+        f"in {params.scene_context} scene"
+    )
+    intel   = analyst.analyze_multiple_views(vlm_candidates, vlm_query)
+    targets = intel.get("targets", [])
+    logger.info(f"Anomaly VLM | {len(targets)} confirmed | {intel.get('summary','')}")
+
+    # Phase 6: Markers
+    new_det_ids: list[str] = []
+    instances = merge_detections(targets, vlm_candidates)
+
+    for instance in instances:
+        det_id = uuid.uuid4().hex[:10]
+        best   = instance.best
+        img_urls = [
+            _annotate_and_save(det.candidate, det.bbox, "anomaly")
+            or _tile_to_static_url(det.candidate)
+            for det in instance.detections
+        ]
+        _state["detections"][det_id] = {
+            "lat": instance.lat, "lon": instance.lon,
+            "label":        f"⚠ {params.anomaly_hint[:40]}",
+            "color":        color,
+            "confirmed":    True,
+            "img_urls":     img_urls,
+            "is_multiangle": instance.is_multiangle,
+            "source_count": len(instance.detections),
+            "gsd":          f"{best.candidate.get('gsd_cm_px', 0):.1f}",
+            "bbox":         best.bbox,
+            "source":       Path(best.parent_path).name,
+            "parent_path":  best.parent_path,
+            "tile_x":       best.candidate["tile_x"],
+            "tile_y":       best.candidate["tile_y"],
+            "tile_w":       best.candidate["tile_w"],
+            "tile_h":       best.candidate["tile_h"],
+        }
+        new_det_ids.append(det_id)
+
+    if not instances:
+        # VLM found nothing — show top CLIP candidates as hollow inspect markers
+        for seg in top_k[:3]:
+            cand = _segment_to_candidate(seg)
+            if not cand:
+                continue
+            det_id = uuid.uuid4().hex[:10]
+            t_lat, t_lon = tile_center_geo(cand)
+            _state["detections"][det_id] = {
+                "lat": t_lat, "lon": t_lon,
+                "label":        f"Candidate: {params.anomaly_hint[:30]}",
+                "color":        color,
+                "confirmed":    False,
+                "img_urls":     [u for u in [_tile_to_static_url(cand)] if u],
+                "is_multiangle": False, "source_count": 1,
+                "gsd":          f"{cand.get('gsd_cm_px', 0):.1f}",
+                "bbox":         None,
+                "source":       Path(cand["parent_path"]).name,
+                "parent_path":  cand["parent_path"],
+                "tile_x":       cand["tile_x"], "tile_y": cand["tile_y"],
+                "tile_w":       cand["tile_w"], "tile_h": cand["tile_h"],
+            }
+            new_det_ids.append(det_id)
+
+    _recenter_on_detections(new_det_ids)
+    _build_map()
+
+    dot  = f'<span style="color:{color};font-size:13px">&#9679;</span>'
+    hdot = f'<span style="color:{color};font-size:13px">&#9675;</span>'
+    if instances:
+        n     = len(instances)
+        reply = (
+            f"{dot} {n} confirmed anomal{'y' if n == 1 else 'ies'}: "
+            f"<i>{params.anomaly_hint}</i><br>"
+            f"Scene: <i>{params.scene_context}</i>"
+        )
+    else:
+        reply = (
+            f"{hdot} {len(scored)} CLIP candidate(s) — VLM could not confirm. "
+            f"Showing top {len(new_det_ids)} as hollow markers."
+        )
+    return user_bubble, _msg_html(reply)
 
 
 def _build_map() -> None:
@@ -1218,6 +1491,12 @@ async def query(message: str):
 
     lib = get_search_lib()
 
+    # ── Pick query color ─────────────────────────────────────────────────────
+    # Assigned here so all intent paths (object_search, anomaly_detection, etc.)
+    # can use it for consistent marker colouring.
+    color = _MARKER_COLORS[_state["query_color_idx"] % len(_MARKER_COLORS)]
+    _state["query_color_idx"] += 1
+
     # ── Intent classification ─────────────────────────────────────────────────
     # Classify first — intent determines the entire downstream flow.
     # Non-object-search intents short-circuit here before any CLIP/VLM work.
@@ -1245,16 +1524,8 @@ async def query(message: str):
         )
 
     if intent == "anomaly_detection":
-        p = classified.params  # AnomalyDetectionParams
-        return (
-            user_bubble,
-            _msg(
-                f"⚠️ Anomaly detection is not yet implemented.<br>"
-                f"Classified: scene <i>'{p.scene_context}'</i>, "
-                f"looking for <i>'{p.anomaly_hint}'</i>. "
-                f"Try rephrasing as a specific object search for now.",
-                "sys",
-            ),
+        return _handle_anomaly_query(
+            message, classified.params, color, user_bubble, mission
         )
 
     if intent == "moving_object":
@@ -1295,11 +1566,8 @@ async def query(message: str):
             _msg("No matching frames found in the index.", "sys"),
         )
 
-    # ── Pick query color (cycles through palette per query) ──────────────────
-    color = _MARKER_COLORS[_state["query_color_idx"] % len(_MARKER_COLORS)]
-    _state["query_color_idx"] += 1
-    new_det_ids: list[str] = []  # track det_ids added by this query
     logger.info(f"Query color: {color} | Sending {len(candidates)} tiles to VLM…")
+    new_det_ids: list[str] = []  # track det_ids added by this query
 
     # ── VLM grounding ────────────────────────────────────────────────────────
     intel   = analyst.analyze_multiple_views(candidates, message)

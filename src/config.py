@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from dataclasses import dataclass
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Anchor to the project root (parent of src/ where config.py lives)
@@ -7,8 +8,50 @@ _PROJECT_ROOT    = Path(__file__).parent.parent
 _DEFAULT_DATA_DIR = str(_PROJECT_ROOT / "data")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-mission filesystem paths  (new — multi-mission support)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class MissionPaths:
+    """All filesystem paths scoped to a single mission."""
+    root:         Path
+    uploads:      Path   # original drone frames + pose_metadata.json
+    lancedb:      Path   # LanceDB vector index
+    segments:     Path   # segments.db + visualisation images
+    detections:   Path   # reserved for future use
+    maps:         Path   # generated map.html
+    sim_metadata: Path   # uploads/pose_metadata.json
+
+    @classmethod
+    def for_mission(cls, data_dir: str, mission_id: str) -> "MissionPaths":
+        root = Path(data_dir) / mission_id
+        return cls(
+            root         = root,
+            uploads      = root / "uploads",
+            lancedb      = root / "lancedb",
+            segments     = root / "segments",
+            detections   = root / "detections",
+            maps         = root / "maps",
+            sim_metadata = root / "uploads" / "pose_metadata.json",
+        )
+
+    def makedirs(self) -> None:
+        for p in (self.uploads, self.lancedb, self.segments,
+                  self.detections, self.maps):
+            p.mkdir(parents=True, exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application settings  (unchanged from original — all fields preserved)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",   # silently ignore any .env keys not declared below
+    )
 
     # ── AI — VLM ─────────────────────────────────────────────────────────────
     AI_PROVIDER:        str        = "openrouter"
@@ -20,36 +63,31 @@ class Settings(BaseSettings):
     CLIP_MODEL: str = "ViT-B/32"
     CLIP_DIM:   int = 512
 
-    # ── AI - SAM2 ────────────────────────────────────────────────────────────
-    ANOMALY_SCORE_MARGIN: float = 0.05 # ratio-based e.g. 0.05 means "anomaly score must be 5% higher than expected score".
+    # ── AI — Anomaly detection ────────────────────────────────────────────────
+    ANOMALY_SCORE_MARGIN: float = 0.05
 
     # ── AI — Segmentation (SAM2 via Replicate) ───────────────────────────────
-    # Calls Meta SAM-2 on the Replicate cloud platform.
-    # No local GPU or model weights required.
-    # Leave REPLICATE_API_KEY empty to disable Stage 2 entirely.
-    #
-    # Get your key at: https://replicate.com/account/api-tokens
-    # Install client:  pip install replicate
     REPLICATE_API_KEY:   str = ""
     SAM_REPLICATE_MODEL: str = (
         "meta/sam-2:"
         "fe97b453a6455861e3bac769b441ca1f1086110da7466dbb65cf1eecfd60dc83"
     )
-    SAM_MAX_DIM: int = 1024   # resize long edge before upload (0 = disabled)
+    SAM_MAX_DIM: int = 1024
 
     # ── Persistent storage root ───────────────────────────────────────────────
-    # Default: <project_root>/data  — resolved relative to this file, not CWD.
-    # On Railway: set DATA_DIR=/data (volume mount point).
     DATA_DIR: str = _DEFAULT_DATA_DIR
 
-    # Sub-paths — auto-derived from DATA_DIR unless overridden in .env
-    VECTOR_DB_PATH:    str = ""   # LanceDB tile index
-    UPLOAD_PATH:       str = ""   # original drone frames (permanent)
-    DETECTIONS_PATH:   str = ""   # annotated tile/frame images
-    MAP_PATH:          str = ""   # generated map.html
-    MISSIONS_DB_PATH:  str = ""   # global missions catalogue (SQLite)
-    SEGMENTS_DIR:      str = ""   # parent dir for per-mission segments.db files
-    SIM_METADATA_FILE: str = ""   # pose_metadata.json
+    # Sub-paths — auto-derived from DATA_DIR in model_post_init unless
+    # explicitly overridden in .env.  Still used by Phase-1 compat paths
+    # (MissionManager.get_or_create_active) and any code not yet migrated
+    # to per-mission MissionPaths.
+    VECTOR_DB_PATH:    str = ""
+    UPLOAD_PATH:       str = ""
+    DETECTIONS_PATH:   str = ""
+    MAP_PATH:          str = ""
+    MISSIONS_DB_PATH:  str = ""
+    SEGMENTS_DIR:      str = ""
+    SIM_METADATA_FILE: str = ""
 
     # ── Camera (DJI Mini 2 defaults) ─────────────────────────────────────────
     SENSOR_WIDTH_MM:  float = 6.3
@@ -57,7 +95,7 @@ class Settings(BaseSettings):
     FOCAL_LENGTH_MM:  float = 4.5
 
     def model_post_init(self, __context):
-        """Resolve empty path fields relative to DATA_DIR."""
+        """Resolve empty sub-path fields relative to DATA_DIR."""
         defaults = {
             "VECTOR_DB_PATH":    "lancedb",
             "UPLOAD_PATH":       "uploads",

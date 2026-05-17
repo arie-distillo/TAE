@@ -14,25 +14,34 @@ class TacticalDatabase:
     - Sensor metadata (altitude, gimbal yaw, GSD)
     """
 
-    def __init__(self):
-        self.db = lancedb.connect(settings.VECTOR_DB_PATH)
+    def __init__(self, lancedb_path: str | None = None):
+        # lancedb_path is None on cold start; reconnect() is called once the
+        # active mission is known. Using a temp placeholder avoids errors if
+        # any code path calls initialize_table() before reconnect().
+        path = lancedb_path or str(settings.DATA_DIR)
+        self.db         = lancedb.connect(path)
         self.table_name = "theater_index"
+        self.table      = None
+
+    def reconnect(self, lancedb_path: str) -> None:
+        """Switch to a different mission's LanceDB directory."""
+        self.db    = lancedb.connect(lancedb_path)
         self.table = None
 
-    def initialize_table(self, vector_dim=512):
+    def initialize_table(self, vector_dim: int = 512) -> None:
         schema = pa.schema([
             # Embedding
             pa.field("vector",       pa.list_(pa.float32(), vector_dim)),
 
             # Tile provenance
-            pa.field("image_path",   pa.string()),   # path to the TILE (temp or cached)
+            pa.field("image_path",   pa.string()),   # synthetic label (display only)
             pa.field("parent_path",  pa.string()),   # path to the original full frame
             pa.field("tile_x",       pa.int32()),    # tile top-left x in parent pixels
             pa.field("tile_y",       pa.int32()),    # tile top-left y in parent pixels
             pa.field("tile_w",       pa.int32()),    # tile width in pixels
             pa.field("tile_h",       pa.int32()),    # tile height in pixels
 
-            # Frame-level GPS (drone position, not tile center)
+            # Frame-level GPS (drone position, not tile centre)
             pa.field("lat",          pa.float64()),
             pa.field("lon",          pa.float64()),
             pa.field("alt_m",        pa.float32()),
@@ -58,14 +67,14 @@ class TacticalDatabase:
     def add_observation(
         self,
         vector,
-        tile_path: str,
-        telemetry: dict,
+        tile_path:      str,
+        telemetry:      dict,
         tile_footprint: dict,
         tile_x: int,
         tile_y: int,
         tile_w: int,
         tile_h: int,
-    ):
+    ) -> None:
         """
         Writes one tile record to the index.
 
@@ -101,29 +110,13 @@ class TacticalDatabase:
             "fp_sw_lon":   float(tile_footprint['sw'][1]),
         }])
 
-    def add_observations_batch(self, rows: list[dict]):
+    def add_observations_batch(self, rows: list[dict]) -> None:
         """Write all tile rows for one frame in a single LanceDB call."""
         if rows:
             self.table.add(rows)
 
-    def semantic_search(self, query_vector, limit: int = 5, 
-                        frames_to_return: int = 3) -> list:
-        """
-        Returns up to `frames_to_return` tiles, at most ONE tile per parent frame,
-        chosen from the top-`limit` ANN results.
-        """
-        raw = self.table.search(query_vector).limit(limit).to_list()
-        
-        seen_parents: set[str] = set()
-        diverse: list[dict] = []
-        for row in raw:
-            parent = row.get("parent_path", "")
-            if parent not in seen_parents:
-                seen_parents.add(parent)
-                diverse.append(row)
-            if len(diverse) >= frames_to_return:
-                break
-        return diverse
+    def semantic_search(self, query_vector, limit: int = 5) -> list:
+        return self.table.search(query_vector).limit(limit).to_list()
 
     def row_count(self) -> int:
         if self.table is None:

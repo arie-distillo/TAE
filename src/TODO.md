@@ -3,7 +3,7 @@
 - [1] audit
 
 ### Misc
-- [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot
+- [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot  [YOLO26](https://docs.ultralytics.com/tasks#detection)
 - [v] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini)
 - [v] Merge detections → NMS to remove duplicates from overlapping tiles
 - [3] Improve startup message if something already uploaded `_msg("TAE ready. Upload imagery to build the theater index, ""then query in natural language.", "sys"),`

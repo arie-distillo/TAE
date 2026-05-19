@@ -115,8 +115,33 @@ class TacticalDatabase:
         if rows:
             self.table.add(rows)
 
-    def semantic_search(self, query_vector, limit: int = 5) -> list:
-        return self.table.search(query_vector).limit(limit).to_list()
+    def semantic_search(
+        self,
+        query_vector,
+        limit: int = 5,
+        frames_to_return: int = 0,   # 0 = return all up to limit
+    ) -> list:
+        """
+        ANN search returning at most one tile per unique parent frame.
+
+        Parameters
+        ----------
+        limit           : number of ANN candidates to fetch from LanceDB
+        frames_to_return: max unique parent frames to keep (0 = unlimited)
+        """
+        raw = self.table.search(query_vector).limit(limit).to_list()
+        if not frames_to_return:
+            return raw
+        seen: set[str] = set()
+        diverse: list[dict] = []
+        for row in raw:
+            parent = row.get("parent_path", "")
+            if parent not in seen:
+                seen.add(parent)
+                diverse.append(row)
+            if len(diverse) >= frames_to_return:
+                break
+        return diverse
 
     def row_count(self) -> int:
         if self.table is None:

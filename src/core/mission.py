@@ -55,6 +55,7 @@ class Mission:
     tile_count:       int  = 0
     segment_count:    int  = 0
     scene_context:    str  = ""   # optional operator hint for anomaly queries
+    definition:       str  = ""   # natural-language mission goal; auto-applied on ingestion
     last_accessed:    Optional[int] = None  # Unix ms; None until first activation
 
     def allows(self, intent: str) -> bool:
@@ -108,6 +109,7 @@ class MissionManager:
                     tile_count       INTEGER NOT NULL DEFAULT 0,
                     segment_count    INTEGER NOT NULL DEFAULT 0,
                     scene_context    TEXT    NOT NULL DEFAULT '',
+                    definition       TEXT    NOT NULL DEFAULT '',
                     last_accessed    INTEGER            -- Unix ms, NULL until first activation
                 )
             """)
@@ -118,6 +120,12 @@ class MissionManager:
                 logger.info("Migrated missions table: added last_accessed column")
             except sqlite3.OperationalError:
                 pass  # column already present — normal on all runs after first migration
+
+            try:
+                conn.execute("ALTER TABLE missions ADD COLUMN definition TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated missions table: added definition column")
+            except sqlite3.OperationalError:
+                pass
 
             # global_state: persists last_active_mission_id across server restarts
             conn.execute("""
@@ -147,6 +155,7 @@ class MissionManager:
             tile_count       = row["tile_count"],
             segment_count    = row["segment_count"],
             scene_context    = row["scene_context"] or "",
+            definition       = row["definition"] or "",
             last_accessed    = row["last_accessed"],
         )
 
@@ -245,6 +254,7 @@ class MissionManager:
         name:            str | None = None,
         allowed_intents: list[str] | None = None,
         scene_context:   str | None = None,
+        definition:      str | None = None,
     ) -> None:
         """Update editable mission fields (called from the settings drawer)."""
         sets, vals = [], []
@@ -254,6 +264,8 @@ class MissionManager:
             sets.append("allowed_intents=?"); vals.append(json.dumps(allowed_intents))
         if scene_context is not None:
             sets.append("scene_context=?");   vals.append(scene_context)
+        if definition is not None:
+            sets.append("definition=?");      vals.append(definition.strip())
         if not sets:
             return
         vals.append(mission_id)

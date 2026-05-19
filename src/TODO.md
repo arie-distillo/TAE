@@ -13,7 +13,7 @@
   - [] databases / directories per mission
 
 ### Refactoring
-- [] Split into two services - on-edge server and cloud server
+- [-] Split into two services - on-edge server and cloud server
 - [] Split `main.py` into UI and Orchestrator
 
 ### non-generative Visual models
@@ -29,22 +29,25 @@
   - [v] object search intent
   - [] anomaly detection intent
   - [] moving object intent
-- [] persistent queries
+- [v] persistent queries
   
 ### Python libraries to manipulate / seacrh geo object
 - [>] see Gemini chat
 
 ### Jetson
-- [] which one to purchase - dev kit?
+- [-] which one to purchase - dev kit?
 
 ### UI
 - [v] images upload
-- [] video upload
+- [v] video upload
 - [v] chat widget
 - [v] map with markers
-- [] remove Span("Intelligence", cls="brand-sub")
 - [] show time / frame when pointed on a marker on a map, bypass inetrmediate pop-up
 - [] frames with detection on a timeline
 
 ### Deployment
 - [] Runpod
+
+### Defects
+- [] Delete mission doesn't work
+- [] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined

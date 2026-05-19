@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     SENSOR_HEIGHT_MM: float = 4.7
     FOCAL_LENGTH_MM:  float = 4.5
 
+    # ── Video ingestion ──────────────────────────────────────────────────────
+    VIDEO_SAMPLE_INTERVAL_SEC: float = 2.0   # fixed interval (used when adaptive=False)
+    VIDEO_ADAPTIVE_SAMPLING:   bool  = True  # compute interval from SRT altitude+speed
+    VIDEO_TARGET_OVERLAP_PCT:  float = 60.0  # target ground overlap between samples
+
     def model_post_init(self, __context):
         """Resolve empty sub-path fields relative to DATA_DIR."""
         defaults = {

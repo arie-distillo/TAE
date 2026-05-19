@@ -8,6 +8,7 @@ tests/*.png
 static/
 tools/*mp4
 tools/*jpg
+output/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

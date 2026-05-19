@@ -28,6 +28,7 @@ from core.database import TacticalDatabase
 from ai.search import SearchLibrarian
 from ai.analyst import TacticalAnalyst
 from tools.ingest_telemetry import TAESimGenerator
+from core.video import SRTParser, VideoSampler, AdaptiveSampler
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -60,6 +61,10 @@ analyst = TacticalAnalyst(
 )
 _search_lib: SearchLibrarian | None = None
 
+# Video telemetry helpers (singletons — stateless, safe to reuse)
+_srt_parser    = SRTParser()
+_video_sampler = VideoSampler()
+
 
 def get_search_lib() -> SearchLibrarian:
     global _search_lib
@@ -72,6 +77,10 @@ def get_search_lib() -> SearchLibrarian:
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-query state (reset on mission switch)
 # ─────────────────────────────────────────────────────────────────────────────
+# CLIP was trained on ground-level photos; prepending this context string
+# shifts text embeddings toward overhead/drone imagery representations.
+_CLIP_AERIAL_CTX = "aerial drone nadir overhead view:"
+
 _MARKER_COLORS = [
     "#4ade80", "#60a5fa", "#f59e0b", "#f472b6",
     "#a78bfa", "#34d399", "#fb923c", "#e879f9",
@@ -154,7 +163,8 @@ def _restore_state() -> None:
                 lats = df.groupby("parent_path")["lat"].first().tolist()
                 lons = df.groupby("parent_path")["lon"].first().tolist()
                 if lats and lons:
-                    _state["map_center"] = [sum(lats)/len(lats), sum(lons)/len(lons)]
+                    import statistics as _st
+                    _state["map_center"] = [_st.median(lats), _st.median(lons)]
                     _state["map_zoom"]   = 16
             except Exception as inner:
                 logger.warning(f"Could not restore frame count / map centre: {inner}")
@@ -285,6 +295,28 @@ def _build_map() -> None:
                     (r.fp_nw_lat, r.fp_nw_lon), (r.fp_ne_lat, r.fp_ne_lon),
                     (r.fp_se_lat, r.fp_se_lon), (r.fp_sw_lat, r.fp_sw_lon),
                 ]
+
+            # Outlier filter: remove corners from geographically distant sessions
+            # (e.g. still images from area A + video from area B in same LanceDB).
+            # Median is robust — 90% of tiles in area B pulls median into area B.
+            if len(pts) >= 6:
+                import statistics as _stats
+                med_lat = _stats.median(p[0] for p in pts)
+                med_lon = _stats.median(p[1] for p in pts)
+                MAX_DEG = 0.15   # ~16 km radius — generous for a single survey
+                pts_clean = [
+                    p for p in pts
+                    if abs(p[0] - med_lat) < MAX_DEG
+                    and abs(p[1] - med_lon) < MAX_DEG
+                ]
+                if len(pts_clean) >= 3:
+                    removed = len(pts) - len(pts_clean)
+                    if removed:
+                        logger.info(
+                            f"Hull outlier filter: dropped {removed} corners "
+                            f"({len(pts_clean)} of {len(pts)} kept)"
+                        )
+                    pts = pts_clean
 
             def _convex_hull(points):
                 pts_s = sorted(set(map(tuple, points)))
@@ -666,6 +698,23 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   outline: none;
 }
 .drawer-input:focus { border-color: var(--blue); }
+
+.drawer-textarea {
+  width: 100%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 7px 9px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  outline: none;
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.6;
+}
+.drawer-textarea:focus { border-color: var(--blue); }
+.drawer-hint { font-size: 9px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
 
 .intent-row {
   display: flex;
@@ -1093,7 +1142,7 @@ def _navbar() -> FT:
             " Upload",
             Input(
                 type="file", name="files", multiple=True,
-                accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv",
+                accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv,.srt,.SRT",
                 hx_post="/upload",
                 hx_target="#tae-msgs",
                 hx_swap="beforeend",
@@ -1117,8 +1166,9 @@ def _navbar() -> FT:
 
 def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> FT:
     """Inner content of the settings drawer — shared by edit and create modes."""
-    name_val = "" if is_new else (mission.name if mission else "")
-    intents  = mission.allowed_intents if (mission and not is_new) else ["object_detection"]
+    name_val       = "" if is_new else (mission.name       if mission else "")
+    definition_val = "" if is_new else (mission.definition if mission else "")
+    intents        = mission.allowed_intents if (mission and not is_new) else ["object_detection"]
     mid      = mission.id if mission else ""
     title    = "New mission" if is_new else name_val
 
@@ -1168,6 +1218,26 @@ def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> F
         ),
         Div(cls="drawer-sep"),
         Div(
+            Span("Mission definition", cls="drawer-label"),
+            Textarea(
+                definition_val,
+                id="drawer-definition",
+                name="definition",
+                cls="drawer-textarea",
+                placeholder=(
+                    "e.g. Find all isolated trees and large stones\n"
+                    "Applied automatically to every frame on ingestion."
+                ),
+                rows="4",
+            ),
+            Span(
+                "When set, TAE auto-analyses each ingested frame against this goal.",
+                cls="drawer-hint",
+            ),
+            cls="drawer-section",
+        ),
+        Div(cls="drawer-sep"),
+        Div(
             Span("Intents", cls="drawer-label"),
             Label(
                 Input(type="checkbox", name="intents", value="object_detection",
@@ -1184,7 +1254,7 @@ def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> F
             Button(
                 save_label, cls="drawer-save-btn",
                 **{save_method: save_route,
-                   "hx_include": "#drawer-name,[name='intents']",
+                   "hx_include": "#drawer-name,#drawer-definition,[name='intents']",
                    "hx_swap": "none",
                    "hx-on::after-request": after_save},
             ),
@@ -1358,6 +1428,7 @@ async def mission_create(request: Request):
     intents = form.getlist("intents")
     mid   = uuid.uuid4().hex
     paths = MissionPaths.for_mission(settings.DATA_DIR, mid)
+    definition = (form.get("definition") or "").strip()
     m = mission_mgr.create(
         name             = name,
         upload_path      = str(paths.uploads),
@@ -1366,6 +1437,8 @@ async def mission_create(request: Request):
         allowed_intents  = intents or ["object_detection"],
         mission_id       = mid,
     )
+    if definition:
+        mission_mgr.update(m.id, definition=definition)
     _activate_mission(m)
     return ""   # caller does location.reload()
 
@@ -1375,7 +1448,13 @@ async def mission_update(mission_id: str, request: Request):
     form    = await request.form()
     name    = (form.get("name") or "").strip() or None
     intents = form.getlist("intents") or None
-    mission_mgr.update(mission_id, name=name, allowed_intents=intents)
+    definition = (form.get("definition") or "").strip() or None
+    mission_mgr.update(mission_id, name=name, allowed_intents=intents, definition=definition)
+    # Keep live state in sync if this is the active mission
+    if mission_id == _state.get("mission_id") and definition is not None:
+        m = mission_mgr.get(mission_id)
+        if m:
+            _state["mission_name"] = m.name
     # Update live display name if it's the active mission
     if mission_id == _state.get("mission_id"):
         if name:
@@ -1454,7 +1533,6 @@ def missions_archived():
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes — ingestion
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
     from core.sim_provider import SimD3Environment
     from core.ingestion import run_ingestion
@@ -1478,7 +1556,8 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
             lats = df.groupby("parent_path")["lat"].first().tolist()
             lons = df.groupby("parent_path")["lon"].first().tolist()
             if lats and lons:
-                _state["map_center"] = [sum(lats)/len(lats), sum(lons)/len(lons)]
+                import statistics as _st
+                _state["map_center"] = [_st.median(lats), _st.median(lons)]
                 _state["map_zoom"]   = 16
         except Exception:
             total_frames = _state["frame_count"]
@@ -1488,11 +1567,51 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
         _state["tile_count"]  = tiles_ok
         _state["detections"]  = {}
         _state["ingesting"]   = False
-        _state["ingest_msg"]  = (
-            f"Indexed {tiles_ok} tiles across {total_frames} frame(s). "
-            f"Theater is ready — query below."
-        )
         _build_map()
+
+        # ── Auto-analysis against mission definition ──────────────────────────
+        # Runs AFTER full ingestion — wrapped in its own try/except so a
+        # failure here never masks a successful ingestion in the UI message.
+        auto_summary = ""
+        try:
+            mid = _state.get("mission_id")
+            if mid:
+                m = mission_mgr.get(mid)
+                if m and m.definition:
+                    _state["ingest_progress"] = (
+                        f"Auto-analyzing: '{m.definition[:50]}'..."
+                    )
+                    color = _MARKER_COLORS[
+                        _state["query_color_idx"] % len(_MARKER_COLORS)
+                    ]
+                    _state["query_color_idx"] += 1
+                    # Same parameters as a manual query — CLIP handles
+                    # scanning the full index, VLM sees only the top matches.
+                    result = _execute_analysis(
+                        m.definition,
+                        color,
+                        search_limit     = 20,
+                        frames_to_return = 8,
+                    )
+                    snip = m.definition[:40] + (
+                        "..." if len(m.definition) > 40 else ""
+                    )
+                    auto_summary = (
+                        f"Auto-analysis: {result['n_confirmed']} object(s) "
+                        f"found for '{snip}'."
+                        if result["n_confirmed"]
+                        else f"Auto-analysis complete — no objects confirmed "
+                             f"for '{snip}'."
+                    )
+                    logger.info(auto_summary)
+        except Exception as ae:
+            logger.error("Auto-analysis failed (ingestion was successful): %s", ae)
+            auto_summary = "Auto-analysis failed — you can still query manually."
+
+        _state["ingest_msg"] = (
+            f"Indexed {tiles_ok} tiles across {total_frames} frame(s). "
+            + (auto_summary if auto_summary else "Theater is ready — query below.")
+        )
     except Exception as e:
         logger.error(f"Background ingestion failed: {e}")
         _state["ingesting"]  = False
@@ -1518,7 +1637,12 @@ async def upload(request: Request):
     if not files or all(not f.filename for f in files):
         return _msg("⚠️  No files received.", "sys")
 
-    saved_images: list[str] = []
+    # ── Save files, separate by type ────────────────────────────────────────
+    saved_images: list[str] = []   # all JPEG paths entering the pipeline
+    video_files:  list[Path] = []  # raw video files
+    srt_files:    dict[str, Path] = {}  # stem.lower() → .SRT path
+    meta: dict = {}  # pre-populated from SRT for video frames
+
     for f in files:
         if not f.filename:
             continue
@@ -1526,25 +1650,89 @@ async def upload(request: Request):
         suffix = Path(fname).suffix.lower()
         dest   = paths.uploads / fname
         dest.write_bytes(await f.read())
-        if suffix in {".mp4", ".mov", ".avi", ".mkv"}:
-            saved_images.extend(_extract_video_frames(str(dest), paths.uploads))
+        if suffix == ".srt":
+            srt_files[Path(fname).stem.lower()] = dest
+            logger.info(f"SRT sidecar saved: {fname}")
+        elif suffix in {".mp4", ".mov", ".avi", ".mkv"}:
+            video_files.append(dest)
         elif suffix in {".jpg", ".jpeg", ".png"}:
             saved_images.append(str(dest))
 
-    if not saved_images:
-        return _msg("⚠️  No processable images found in upload.", "sys")
+    # ── Process video files with telemetry-aware sampler ─────────────────────
+    for video_path in video_files:
+        # Find matching SRT (uploaded in same batch or already on disk)
+        srt_path = srt_files.get(video_path.stem.lower())
+        if not srt_path:
+            for ext in (".SRT", ".srt"):
+                candidate = video_path.with_suffix(ext)
+                if candidate.exists():
+                    srt_path = candidate
+                    break
 
-    logger.info(f"Extracting metadata from {len(saved_images)} image(s)…")
-    gen  = TAESimGenerator(str(paths.uploads), str(paths.uploads))
-    meta = {}
-    for img_path in saved_images:
+        srt_frames = None
+        if srt_path:
+            try:
+                srt_frames = _srt_parser.parse(srt_path)
+                logger.info(
+                    f"SRT loaded for '{video_path.name}': "
+                    f"{len(srt_frames)} telemetry frames"
+                )
+            except Exception as e:
+                logger.warning(f"SRT parse failed for {srt_path}: {e}")
+        else:
+            logger.warning(
+                f"No .SRT sidecar found for '{video_path.name}' — "
+                f"video frames will have no telemetry."
+            )
+
         try:
-            meta[Path(img_path).name] = gen._extract_dji_data(Path(img_path))
+            frame_pairs = _video_sampler.sample_file(
+                video_path         = video_path,
+                out_dir            = paths.uploads,
+                srt_frames         = srt_frames,
+                interval_sec       = getattr(settings, "VIDEO_SAMPLE_INTERVAL_SEC", 2.0),
+                adaptive           = getattr(settings, "VIDEO_ADAPTIVE_SAMPLING", True),
+                target_overlap_pct = getattr(settings, "VIDEO_TARGET_OVERLAP_PCT", 60.0),
+                sensor_w_mm        = settings.SENSOR_WIDTH_MM,
+                focal_mm           = settings.FOCAL_LENGTH_MM,
+            )
         except Exception as e:
-            logger.warning(f"Metadata extraction failed for {img_path}: {e}")
+            logger.error(f"Video sampling failed for {video_path}: {e}")
+            continue
+
+        for jpeg_path, srt_frame in frame_pairs:
+            saved_images.append(str(jpeg_path))
+            if srt_frame is not None:
+                # Peek at image dimensions for the meta entry
+                img = cv2.imread(str(jpeg_path))
+                if img is not None:
+                    h, w = img.shape[:2]
+                    meta[jpeg_path.name] = _srt_parser.to_meta_entry(
+                        srt_frame, jpeg_path, w, h
+                    )
+
+    if not saved_images:
+        return _msg("⚠️  No processable files found in upload.", "sys")
+
+    # ── Extract XMP metadata from still images not already covered by SRT ─────
+    gen = TAESimGenerator(str(paths.uploads), str(paths.uploads))
+    for img_path in saved_images:
+        name = Path(img_path).name
+        if name in meta:
+            continue   # already populated from SRT
+        try:
+            entry = gen._extract_dji_data(Path(img_path))
+            if entry:
+                meta[name] = entry
+        except Exception as e:
+            logger.warning(f"XMP extraction failed for {img_path}: {e}")
 
     if not meta:
-        return _msg("⚠️  No parseable metadata in uploaded images.", "sys")
+        return _msg(
+            "⚠️  No telemetry found. For video, upload the .SRT sidecar file "
+            "alongside the .MP4. For images, ensure DJI XMP metadata is present.",
+            "sys"
+        )
 
     meta_file = paths.sim_metadata
     meta_file.write_text(json.dumps(meta))
@@ -1552,7 +1740,8 @@ async def upload(request: Request):
     lats = [v["lat"] for v in meta.values() if v.get("lat") not in (None, 0.0)]
     lons = [v["lon"] for v in meta.values() if v.get("lon") not in (None, 0.0)]
     if lats and lons:
-        _state["map_center"] = [sum(lats)/len(lats), sum(lons)/len(lons)]
+        import statistics as _st
+        _state["map_center"] = [_st.median(lats), _st.median(lons)]
         _state["map_zoom"]   = 16
 
     from starlette.background import BackgroundTasks
@@ -1595,6 +1784,114 @@ def upload_progress():
 # Routes — query
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def _execute_analysis(
+    message:         str,
+    color:           str,
+    search_limit:    int = 20,
+    frames_to_return: int = 8,
+) -> dict:
+    """
+    Single shared analysis pipeline used by both the interactive query route
+    and the post-ingestion auto-analysis hook.
+
+    Encodes the query with aerial CLIP context, retrieves the best-matching
+    tiles (one per unique parent frame), runs the VLM, builds detections in
+    _state, recentres the map, and returns a summary dict.
+
+    Returns
+    -------
+    {
+      "det_ids":       list[str]   — new detection IDs added this call
+      "n_confirmed":   int         — VLM-confirmed detections
+      "n_unconfirmed": int         — CLIP candidates not confirmed by VLM
+      "report":        str         — raw VLM report string
+      "color":         str         — marker colour used
+    }
+    """
+    lib        = get_search_lib()
+    clip_query = f"{_CLIP_AERIAL_CTX} {message}"
+    q_vec      = lib.encode_text(clip_query)
+    logger.info("CLIP query: '%s'", clip_query)
+
+    candidates = db.semantic_search(
+        q_vec,
+        limit            = search_limit,
+        frames_to_return = frames_to_return,
+    )
+    if not candidates:
+        return {"det_ids": [], "n_confirmed": 0, "n_unconfirmed": 0,
+                "report": "", "color": color}
+
+    logger.info("%d candidate tile(s) → VLM", len(candidates))
+    intel   = analyst.analyze_multiple_views(candidates, message)
+    targets = intel.get("targets", [])
+    new_det_ids: list[str] = []
+
+    for cand in candidates:
+        tile_name     = Path(cand["image_path"]).name
+        parent_name   = Path(cand["parent_path"]).name
+        frame_targets = [
+            t for t in targets
+            if Path(t["filename"]).name.lower() == tile_name.lower()
+        ]
+        if frame_targets:
+            for t in frame_targets:
+                det_id  = uuid.uuid4().hex[:10]
+                ann_url = _annotate_and_save(cand, t.get("bbox"), message[:20])
+                _state["detections"][det_id] = {
+                    "lat":         cand["lat"],
+                    "lon":         cand["lon"],
+                    "label":       message,
+                    "color":       color,
+                    "confirmed":   True,
+                    "img_urls":    [ann_url] if ann_url else [_tile_to_static_url(cand)],
+                    "gsd":         f"{cand.get('gsd_cm_px', 0):.1f}",
+                    "bbox":        t.get("bbox"),
+                    "source":      parent_name,
+                    "parent_path": cand["parent_path"],
+                    "tile_x":      cand["tile_x"],
+                    "tile_y":      cand["tile_y"],
+                    "tile_w":      cand["tile_w"],
+                    "tile_h":      cand["tile_h"],
+                }
+                new_det_ids.append(det_id)
+        else:
+            det_id  = uuid.uuid4().hex[:10]
+            img_url = _tile_to_static_url(cand)
+            _state["detections"][det_id] = {
+                "lat":         cand["lat"],
+                "lon":         cand["lon"],
+                "label":       f"Candidate: {message[:40]}",
+                "color":       color,
+                "confirmed":   False,
+                "img_urls":    [img_url] if img_url else [],
+                "gsd":         f"{cand.get('gsd_cm_px', 0):.1f}",
+                "bbox":        None,
+                "source":      parent_name,
+                "parent_path": cand["parent_path"],
+                "tile_x":      cand["tile_x"],
+                "tile_y":      cand["tile_y"],
+                "tile_w":      cand["tile_w"],
+                "tile_h":      cand["tile_h"],
+            }
+            new_det_ids.append(det_id)
+
+    _recenter_on_detections(new_det_ids)
+    _build_map()
+
+    n_confirmed   = sum(1 for d in _state["detections"].values()
+                        if d.get("confirmed") and d.get("color") == color)
+    n_unconfirmed = sum(1 for d in _state["detections"].values()
+                        if not d.get("confirmed") and d.get("color") == color)
+    return {
+        "det_ids":       new_det_ids,
+        "n_confirmed":   n_confirmed,
+        "n_unconfirmed": n_unconfirmed,
+        "report":        intel.get("report", ""),
+        "color":         color,
+    }
+
 @rt("/query", methods=["POST"])
 async def query(message: str):
     if not message.strip():
@@ -1607,80 +1904,30 @@ async def query(message: str):
 
     _state["ingested"] = True
 
-    lib        = get_search_lib()
-    q_vec      = lib.encode_text(message)
-    candidates = db.semantic_search(q_vec, limit=3)
-    if not candidates:
-        return user_bubble, _msg("No matching frames found in the index.", "sys")
-
     color = _MARKER_COLORS[_state["query_color_idx"] % len(_MARKER_COLORS)]
     _state["query_color_idx"] += 1
-    new_det_ids: list[str] = []
 
-    intel   = analyst.analyze_multiple_views(candidates, message)
-    targets = intel.get("targets", [])
+    result = _execute_analysis(message, color, search_limit=20, frames_to_return=8)
 
-    for cand in candidates:
-        tile_name   = Path(cand["image_path"]).name
-        parent_name = Path(cand["parent_path"]).name
-        frame_targets = [t for t in targets
-                         if Path(t["filename"]).name.lower() == tile_name.lower()]
+    if not result["det_ids"]:
+        return user_bubble, _msg("No matching frames found in the index.", "sys")
 
-        if frame_targets:
-            for t in frame_targets:
-                det_id  = uuid.uuid4().hex[:10]
-                ann_url = _annotate_and_save(cand, t.get("bbox"), message[:20])
-                img_urls = [ann_url] if ann_url else [_tile_to_static_url(cand)]
-                _state["detections"][det_id] = {
-                    "lat": cand["lat"], "lon": cand["lon"],
-                    "label": message, "color": color, "confirmed": True,
-                    "img_urls": img_urls,
-                    "gsd": f"{cand.get('gsd_cm_px',0):.1f}",
-                    "bbox": t.get("bbox"), "source": parent_name,
-                    "parent_path": cand["parent_path"],
-                    "tile_x": cand["tile_x"], "tile_y": cand["tile_y"],
-                    "tile_w": cand["tile_w"], "tile_h": cand["tile_h"],
-                }
-                new_det_ids.append(det_id)
-        else:
-            det_id  = uuid.uuid4().hex[:10]
-            img_url = _tile_to_static_url(cand)
-            _state["detections"][det_id] = {
-                "lat": cand["lat"], "lon": cand["lon"],
-                "label": f"Candidate: {message[:40]}",
-                "color": color, "confirmed": False,
-                "img_urls": [img_url] if img_url else [],
-                "gsd": f"{cand.get('gsd_cm_px',0):.1f}",
-                "bbox": None, "source": parent_name,
-                "parent_path": cand["parent_path"],
-                "tile_x": cand["tile_x"], "tile_y": cand["tile_y"],
-                "tile_w": cand["tile_w"], "tile_h": cand["tile_h"],
-            }
-            new_det_ids.append(det_id)
-
-    _recenter_on_detections(new_det_ids)
-    _build_map()
-
-    raw_report  = intel.get("report", "")
-    dot_solid   = f'<span style="color:{color};font-size:13px">&#9679;</span>'
-    dot_hollow  = f'<span style="color:{color};font-size:13px">&#9675;</span>'
-    n_confirmed = sum(1 for d in _state["detections"].values()
-                      if d.get("confirmed") and d.get("color") == color)
-    n_cands     = sum(1 for d in _state["detections"].values()
-                      if not d.get("confirmed") and d.get("color") == color)
+    raw_report = result["report"]
+    dot_solid  = f'<span style="color:{color};font-size:13px">&#9679;</span>'
+    dot_hollow = f'<span style="color:{color};font-size:13px">&#9675;</span>'
 
     lines = []
-    if raw_report and targets:
+    if raw_report and result["n_confirmed"]:
         for p in raw_report.split(" | "):
             p = p.strip()
             if ": " in p:
                 p = p.split(": ", 1)[1]
             if p:
                 lines.append(f"{dot_solid} {p}")
-    if n_cands:
+    if result["n_unconfirmed"]:
         lines.append(
-            f"{dot_hollow} {n_cands} additional frame(s) matched semantically "
-            f"but not confirmed by VLM — click hollow markers to inspect."
+            f"{dot_hollow} {result['n_unconfirmed']} additional frame(s) matched "
+            f"semantically but not confirmed by VLM — click hollow markers to inspect."
         )
     if not lines:
         lines = [raw_report or "No objects matching the query were found."]

@@ -14,7 +14,7 @@
 
 ### Refactoring
 - [-] Split into two services - on-edge server and cloud server
-- [] Split `main.py` into UI and Orchestrator
+- [] Refactor `main.py` into UI and business logic
 
 ### non-generative Visual models
 - [v] learn CLIP
@@ -27,7 +27,7 @@
 - [] add context
 - [] agentic intent detection 
   - [v] object search intent
-  - [] anomaly detection intent
+  - [v] anomaly detection intent
   - [] moving object intent
 - [v] persistent queries
   
@@ -44,10 +44,12 @@
 - [v] map with markers
 - [] show time / frame when pointed on a marker on a map, bypass inetrmediate pop-up
 - [] frames with detection on a timeline
+- [] video panel vs. chat panel vs. image panel - inconsistency
 
 ### Deployment
 - [] Runpod
 
 ### Defects
 - [] Delete mission doesn't work
-- [] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
+- [x] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
+- [] video playback doesn't work

@@ -65,7 +65,7 @@ def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tup
             "{\n"
             '  "report": "brief summary of findings",\n'
             '  "targets": [\n'
-            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0}\n'
+            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0, "description": "concise label of what was detected"}\n'
             '  ]\n'
             "}\n\n"
             + _BBOX_RULES
@@ -83,7 +83,7 @@ def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tup
             '  "report": "total count and summary",\n'
             '  "count": 0,\n'
             '  "targets": [\n'
-            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0}\n'
+            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0, "description": "concise label of what was detected"}\n'
             '  ]\n'
             "}\n\n"
             + _BBOX_RULES
@@ -115,8 +115,7 @@ def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tup
             "{\n"
             '  "report": "description of anomalies found",\n'
             '  "targets": [\n'
-            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], '
-            '"confidence": 0.0, "reason": "why flagged"}\n'
+            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0, "description": "concise label of what was detected", "reason": "why flagged"}\n'
             '  ]\n'
             "}\n\n"
             + _BBOX_RULES

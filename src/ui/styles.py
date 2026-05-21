@@ -600,6 +600,13 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   background: var(--blue-dim);
 }
 
+.video-det-row.vdet-active {
+  background: var(--blue-dim) !important;
+  border-left: 2px solid var(--blue);
+  padding-left: 6px;
+  margin-left: -6px;
+}
+
 /* ── Misc ────────────────────────────────────────────────────────────────── */
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator { display: flex; align-items: center; gap: 7px; }
@@ -678,11 +685,23 @@ function toggleDeleteConfirm() {
 // ── Map / image panel messages ────────────────────────────────────────────
 window.addEventListener('message', function(e) {
     if (!e.data || e.data.type !== 'show_images') return;
+    const detId = e.data.id;
+    // Show image panel
     closeDrawer();
-    htmx.ajax('GET', '/images/' + e.data.id, {
+    htmx.ajax('GET', '/images/' + detId, {
         target: '#tae-imgpanel', swap: 'innerHTML'
     });
     document.getElementById('tae-imgpanel').classList.add('open');
+    // Fix 4: if video panel is open, sync it
+    const vp = document.getElementById('video-panel');
+    if (vp && vp.classList.contains('open')) {
+        const det = _vDets.find(d => d.id === detId);
+        if (det) {
+            if (det.timestamp_ms !== null && det.timestamp_ms !== undefined)
+                seekToDet(det.timestamp_ms);
+            _highlightDetRow(detId);
+        }
+    }
 });
 
 function closeImages() {
@@ -739,9 +758,13 @@ function onVideoTime() {
     const ms = v.currentTime * 1000;
     _drawTimeline(ms);
     _drawBboxes(ms);
-    // Update time display
     const el = document.getElementById('vtime');
     if (el) el.textContent = _fmtTime(v.currentTime) + ' / ' + _fmtTime(v.duration || 0);
+    // Fix 3: highlight closest detection every 2s to avoid thrashing
+    if (!onVideoTime._last || ms - onVideoTime._last > 2000) {
+        onVideoTime._last = ms;
+        _highlightClosestDet(ms);
+    }
 }
 
 function _fmtTime(s) {
@@ -812,14 +835,50 @@ function seekVideo(e) {
     const r = c.getBoundingClientRect();
     const pad = 8;
     const frac = Math.max(0, Math.min(1, (e.clientX - r.left - pad) / (c.offsetWidth - pad*2)));
-    v.currentTime = frac * _vDurMs / 1000;
+    const targetMs = frac * _vDurMs;
+    v.currentTime = targetMs / 1000;
+    _highlightClosestDet(targetMs);   // Fix 3: sync detection list
 }
 
 function seekToDet(ms) {
     const v = document.getElementById('tae-video');
-    if (!v || !ms) return;
+    if (!v || ms === undefined || ms === null) return;
     v.currentTime = ms / 1000;
     v.pause();
+    _highlightClosestDet(ms);   // Fix 3: sync list
+}
+
+// Fix 3: highlight the detection in the list closest to timestamp ms
+function _highlightClosestDet(ms) {
+    let bestId = null, bestDist = Infinity;
+    for (const d of _vDets) {
+        if (d.timestamp_ms === null || d.timestamp_ms === undefined) continue;
+        const dist = Math.abs(d.timestamp_ms - ms);
+        if (dist < bestDist) { bestDist = dist; bestId = d.id; }
+    }
+    if (bestId && bestDist < 4000) {   // within 4 seconds
+        _highlightDetRow(bestId);
+        const det = _vDets.find(d => d.id === bestId);
+        if (det && det.lat != null) _centerMapOnDet(det.lat, det.lon);  // Fix 4
+    }
+}
+
+// Fix 3: scroll & highlight a detection row by id
+function _highlightDetRow(detId) {
+    document.querySelectorAll('.video-det-row.vdet-active')
+            .forEach(r => r.classList.remove('vdet-active'));
+    const row = document.querySelector('.video-det-row[data-id="' + detId + '"]');
+    if (row) {
+        row.classList.add('vdet-active');
+        row.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+    }
+}
+
+// Fix 4: tell the Leaflet map iframe to pan to lat/lon
+function _centerMapOnDet(lat, lon) {
+    const frame = document.getElementById('tae-map-frame');
+    if (frame && frame.contentWindow)
+        frame.contentWindow.postMessage({type:'center_on', lat, lon, zoom:18}, '*');
 }
 
 function _drawBboxes(curMs) {
@@ -865,7 +924,8 @@ function _updateDetList() {
     el.innerHTML = sorted.map(d => {
         const t = _fmtTime((d.timestamp_ms||0)/1000);
         const dot = d.confirmed ? '●' : '○';
-        return '<div class="video-det-row" onclick="seekToDet(' + d.timestamp_ms + ')">'
+        return '<div class="video-det-row" data-id="' + d.id + '"'
+             + ' onclick="seekToDet(' + d.timestamp_ms + ')">' 
              + '<span class="video-det-time">' + t + '</span>'
              + '<span style="color:' + (d.color||'#4ade80') + ';margin-right:5px">' + dot + '</span>'
              + '<span class="video-det-label">' + (d.label||'').slice(0,40) + '</span>'

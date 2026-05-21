@@ -110,33 +110,28 @@ def _build_map() -> None:
     for det_id, det in _state["detections"].items():
         color     = det.get("color", "#4ade80")
         confirmed = det.get("confirmed", True)
+        label     = det.get("label", "")
+        tip = f"{label[:50]} | {det['lat']:.5f}, {det['lon']:.5f}"
+        # onclick directly on the dot — no popup intermediate step
+        onclick = (
+            f"window.parent.postMessage("
+            f"{{type:\'show_images\',id:\'{det_id}\'}},"
+            f"\'*\')"
+        )
         dot_html = (
-            f'<div style="width:18px;height:18px;'
+            f'<div onclick="{onclick}" title="{tip}" '
+            f'style="width:18px;height:18px;'
             f'background:{"" if not confirmed else color};'
             f'border-radius:50%;border:2.5px solid {color};'
             f'box-shadow:0 0 {"8" if confirmed else "6"}px {color};'
-            f'cursor:pointer"></div>'
+            f'cursor:pointer;transition:transform .1s" '
+            f'onmouseenter="this.style.transform=\'scale(1.4)\'" '
+            f'onmouseleave="this.style.transform=\'scale(1.0)\'"'
+            f'></div>'
         )
         icon = folium.DivIcon(html=dot_html, icon_size=(18, 18), icon_anchor=(9, 9))
-        popup_html = (
-            f'<div style="font-family:\'JetBrains Mono\',monospace;'
-            f'min-width:210px;padding:6px 2px">'
-            f'<div style="color:{color};font-weight:700;font-size:13px;margin-bottom:5px">'
-            f'{"●" if confirmed else "○"} {det["label"][:40]}</div>'
-            f'<div style="font-size:11px;line-height:1.7;color:#334155">'
-            f'LAT &nbsp;{det["lat"]:.6f}<br>'
-            f'LON &nbsp;{det["lon"]:.6f}<br>'
-            f'GSD &nbsp;{det.get("gsd", "—")} cm/px</div>'
-            f'<button onclick="window.parent.postMessage('
-            f'{{type:\'show_images\',id:\'{det_id}\'}},'
-            f'\'*\')" '
-            f'style="margin-top:9px;padding:5px 14px;background:{color};color:#1a1b26;'
-            f'border:none;border-radius:5px;cursor:pointer;font-weight:700;font-size:12px">'
-            f'📸 View Images</button></div>'
-        )
         folium.Marker(
             location=[det["lat"], det["lon"]],
-            popup=folium.Popup(popup_html, max_width=240),
             icon=icon,
         ).add_to(m)
 
@@ -204,6 +199,14 @@ def _build_map() -> None:
             logger.error("Coverage polygon error: %s\n%s", e, traceback.format_exc())
 
     map_file = paths.maps / "map.html"
+    # Allow parent window to center the map via postMessage
+    map_var = f"map_{m._id}"
+    m.get_root().html.add_child(folium.Element(
+        f'<script>window.addEventListener("message",function(ev){{'
+        f'if(ev.data&&ev.data.type==="center_on"){{'
+        f'{map_var}.setView([ev.data.lat,ev.data.lon],'
+        f'ev.data.zoom||17,{{animate:true}});}}}});</script>'
+    ))
     m.save(str(map_file))
 
 
@@ -329,11 +332,13 @@ def _execute_analysis(
         if frame_targets:
             for t in frame_targets:
                 det_id  = uuid.uuid4().hex[:10]
-                ann_url = _annotate_and_save(cand, t.get("bbox"), message[:20])
+                det_label = (t.get("description") or t.get("label") or "").strip() or message
+                ann_url = _annotate_and_save(cand, t.get("bbox"), det_label[:20])
                 _state["detections"][det_id] = {
                     "lat":         cand["lat"],
                     "lon":         cand["lon"],
-                    "label":       message,
+                    "label":       det_label,
+                    "query":       message,
                     "color":       color,
                     "confirmed":   True,
                     "img_urls":    [ann_url] if ann_url else [_tile_to_static_url(cand)],
@@ -353,7 +358,8 @@ def _execute_analysis(
             _state["detections"][det_id] = {
                 "lat":         cand["lat"],
                 "lon":         cand["lon"],
-                "label":       f"Candidate: {message[:40]}",
+                "label":       "Candidate match",
+                "query":       message,
                 "color":       color,
                 "confirmed":   False,
                 "img_urls":    [img_url] if img_url else [],

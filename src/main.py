@@ -766,9 +766,12 @@ def video_detections():
         result.append({
             "id":           det_id,
             "timestamp_ms": ts_ms,
+            "lat":          det.get("lat"),
+            "lon":          det.get("lon"),
             "color":        det.get("color", "#4ade80"),
             "confirmed":    det.get("confirmed", False),
-            "label":        det.get("label", "")[:40],
+            "label":        det.get("label", "")[:60],
+            "query":        det.get("query", "")[:60],
             "bbox":         det.get("bbox"),
             "tile_x":       det.get("tile_x", 0),
             "tile_y":       det.get("tile_y", 0),

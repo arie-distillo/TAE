@@ -48,4 +48,5 @@ _state: dict = {
     # video playback
     "video_files":      [],   # [filename, ...] in upload order
     "frame_timestamps": {},   # {frame_name: timestamp_ms}
+    "last_query":       None,
 }

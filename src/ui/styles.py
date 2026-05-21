@@ -757,30 +757,51 @@ function _drawTimeline(curMs) {
     c.width = c.offsetWidth; c.height = c.offsetHeight;
     const w = c.width, h = c.height, pad = 8;
 
-    // Track
+    // Background
+    ctx.fillStyle = '#1a1b2e';
+    ctx.fillRect(0, 0, w, h);
+
+    // Track line
     ctx.fillStyle = '#2a2c45';
     ctx.fillRect(pad, h/2 - 2, w - pad*2, 4);
 
-    // Detection markers
-    for (const d of _vDets) {
-        if (!d.timestamp_ms && d.timestamp_ms !== 0) continue;
-        const x = pad + (d.timestamp_ms / _vDurMs) * (w - pad*2);
-        ctx.fillStyle = d.color || '#4ade80';
-        ctx.beginPath();
-        ctx.arc(x, h/2, d.confirmed ? 6 : 4, 0, Math.PI*2);
-        ctx.fill();
-        if (!d.confirmed) {
-            ctx.strokeStyle = d.color || '#4ade80';
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
+    // Detection markers — coloured dots at detection timestamps
+    const hasTimestamps = _vDets.some(d => d.timestamp_ms !== null && d.timestamp_ms !== undefined);
+    if (!hasTimestamps && _vDets.length === 0) {
+        // Show hint in empty state
+        ctx.fillStyle = '#3a3c55';
+        ctx.font = '9px JetBrains Mono, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Run a query to place detection markers', w/2, h/2 + 3);
+        ctx.textAlign = 'left';
+    } else {
+        for (const d of _vDets) {
+            if (d.timestamp_ms === null || d.timestamp_ms === undefined) continue;
+            const x = pad + (d.timestamp_ms / _vDurMs) * (w - pad*2);
+            ctx.fillStyle = d.color || '#4ade80';
+            ctx.beginPath();
+            ctx.arc(x, h/2, d.confirmed ? 6 : 4, 0, Math.PI*2);
+            ctx.fill();
+            if (!d.confirmed) {
+                ctx.strokeStyle = d.color || '#4ade80';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
         }
     }
 
-    // Playhead
+    // Playhead — white vertical bar showing current position
     if (_vDurMs > 0) {
         const x = pad + (curMs / _vDurMs) * (w - pad*2);
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.fillRect(x - 1, 3, 2, h - 6);
+        // Triangle tick above
         ctx.fillStyle = '#ffffff';
-        ctx.fillRect(x - 1, 2, 2, h - 4);
+        ctx.beginPath();
+        ctx.moveTo(x - 4, 2);
+        ctx.lineTo(x + 4, 2);
+        ctx.lineTo(x, 7);
+        ctx.fill();
     }
 }
 

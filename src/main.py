@@ -143,6 +143,7 @@ def _activate_mission(mission: Mission) -> None:
         "ingest_progress": "",
         "video_files":     [],
         "frame_timestamps": {},
+        "last_query":       None,
     })
 
     db.reconnect(str(paths.lancedb))
@@ -210,6 +211,26 @@ def _restore_state() -> None:
                 )
     except Exception as e:
         logger.warning("Could not restore video state: %s", e)
+
+    # ── Replay last query in background so startup is not blocked ─────────
+    mid = _state.get("mission_id")
+    if mid and _state.get("ingested"):
+        import threading
+        def _replay_query() -> None:
+            try:
+                m = mission_mgr.get(mid)
+                last_q = m.scene_context if m else None
+                if last_q:
+                    logger.info("Replaying last query in background: '%s'", last_q)
+                    color = _MARKER_COLORS[0]
+                    _execute_analysis(last_q, color,
+                                      search_limit=20, frames_to_return=8)
+                    _state["last_query"] = last_q
+                    logger.info("Query replay complete — %d detection(s)",
+                                len(_state["detections"]))
+            except Exception as e:
+                logger.warning("Could not replay last query: %s", e)
+        threading.Thread(target=_replay_query, daemon=True).start()
 
 
 def _startup() -> None:
@@ -606,17 +627,24 @@ def index():
 # Routes — Phase C: Video playback
 # ─────────────────────────────────────────────────────────────────────────────
 
-@rt("/video/{filename}")
-async def serve_video(filename: str, request: Request):
-    """Range-aware video file serving — required for browser seek support."""
+@rt("/serve_video")
+def serve_video(filename: str = ""):
+    """
+    Range-aware video serving via query param: /serve_video?filename=foo.mp4
+    NOTE: do not name the param 'f' — FastHTML uses 'f' internally in _handle().
+    """
+    logger.info("serve_video called: filename=%s", filename)
+    if not filename:
+        from starlette.responses import Response
+        return Response("Missing filename", status_code=400)
     paths = _state.get("mission_paths")
     if paths is None:
+        logger.warning("serve_video: mission_paths is None")
         from starlette.responses import Response
         return Response("No active mission", status_code=404)
-    video_file = paths.uploads / filename
-    logger.info("serve_video: looking for %s", video_file)
+    video_file = paths.uploads / Path(filename).name   # sanitise — no path traversal
+    logger.info("serve_video: resolved=%s exists=%s", video_file, video_file.exists())
     if not video_file.exists():
-        logger.warning("serve_video: 404 — file not at %s", video_file)
         from starlette.responses import Response
         return Response("Video not found", status_code=404)
     suffix = video_file.suffix.lower()
@@ -682,7 +710,7 @@ def video_panel_content():
         Div(
             NotStr(
                 f'<video id="tae-video" controls preload="metadata"'
-                f' src="/video/{vfile}"'
+                f' src="/serve_video?filename={vfile}"'
                 f' onloadedmetadata="onVideoMeta()"'
                 f' ontimeupdate="onVideoTime()"'
                 f' style="width:100%;display:block;max-height:280px;'
@@ -1216,7 +1244,11 @@ async def query(message: str):
     if not _state["ingested"] and db.row_count() == 0:
         return user_bubble, _msg("⚠️  No imagery indexed yet. Upload images first.", "sys")
 
-    _state["ingested"] = True
+    _state["ingested"]   = True
+    _state["last_query"] = message
+    mid = _state.get("mission_id")
+    if mid:
+        mission_mgr.update(mid, scene_context=message)
 
     color = _MARKER_COLORS[_state["query_color_idx"] % len(_MARKER_COLORS)]
     _state["query_color_idx"] += 1

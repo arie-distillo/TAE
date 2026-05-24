@@ -44,17 +44,20 @@ _DARK_TILES = (
 _db:              object = None
 _analyst:         object = None
 _get_search_lib:  Callable = None
+_spatial:         object = None
 
 
-def init(db, analyst, get_search_lib: Callable) -> None:
+def init(db, analyst, get_search_lib: Callable, spatial=None) -> None:
     """
     Wire up external dependencies.  Called once from main.py after the
     singletons (TacticalDatabase, TacticalAnalyst, SearchLibrarian) are ready.
+    spatial is needed for the auto-tracking pipeline (YOLO-World + SORT).
     """
-    global _db, _analyst, _get_search_lib
+    global _db, _analyst, _get_search_lib, _spatial
     _db             = db
     _analyst        = analyst
     _get_search_lib = get_search_lib
+    _spatial        = spatial
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,6 +202,43 @@ def _build_map() -> None:
             logger.error("Coverage polygon error: %s\n%s", e, traceback.format_exc())
 
     map_file = paths.maps / "map.html"
+    # ── Track polylines (Phase D) ──────────────────────────────────────────
+    try:
+        paths = _state.get("mission_paths")
+        if paths:
+            from core.tracker import load_tracks
+            tracks = load_tracks(paths.maps / "tracks.json")
+            for trk in tracks:
+                traj = trk.get("trajectory", [])
+                color = trk.get("color", "#60a5fa")
+                label = trk.get("label", "object")
+                tid   = trk.get("id", "?")
+                if len(traj) >= 2:
+                    coords = [(p["lat"], p["lon"]) for p in traj]
+                    folium.PolyLine(
+                        locations  = coords,
+                        color      = color,
+                        weight     = 3,
+                        opacity    = 0.85,
+                        tooltip    = f"Track {tid}: {label} ({len(traj)} pts)",
+                    ).add_to(m)
+                    # Start dot
+                    folium.CircleMarker(
+                        location  = coords[0],
+                        radius    = 5, color=color, fill=True,
+                        fill_opacity=1.0, weight=1,
+                        tooltip   = f"Track {tid} start",
+                    ).add_to(m)
+                    # End arrow (slightly larger)
+                    folium.CircleMarker(
+                        location  = coords[-1],
+                        radius    = 7, color=color, fill=True,
+                        fill_opacity=1.0, weight=2,
+                        tooltip   = f"Track {tid} end",
+                    ).add_to(m)
+    except Exception as _te:
+        logger.warning("Track rendering error: %s", _te)
+
     # Allow parent window to center the map via postMessage
     map_var = f"map_{m._id}"
     m.get_root().html.add_child(folium.Element(
@@ -276,14 +316,53 @@ def _extract_video_frames(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Detection persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _save_detections(maps_path) -> None:
+    """
+    Persist _state["detections"] to detections.json.
+    img_urls are excluded — they are in-memory cache keys that don't
+    survive a restart.  Annotations are regenerated on demand by the
+    /images/{det_id} route.
+    """
+    try:
+        dets_file = Path(maps_path) / "detections.json"
+        data = {
+            det_id: {k: v for k, v in det.items() if k != "img_urls"}
+            for det_id, det in _state["detections"].items()
+        }
+        dets_file.write_text(
+            __import__("json").dumps(data, indent=2), encoding="utf-8"
+        )
+        logger.debug("Saved %d detection(s) → %s", len(data), dets_file)
+    except Exception as e:
+        logger.warning("Could not save detections: %s", e)
+
+
+def _load_detections(maps_path) -> dict:
+    """Load detections from detections.json.  Returns {} if file absent."""
+    try:
+        dets_file = Path(maps_path) / "detections.json"
+        if not dets_file.exists():
+            return {}
+        data = __import__("json").loads(dets_file.read_text(encoding="utf-8"))
+        logger.info("Loaded %d detection(s) from disk", len(data))
+        return data
+    except Exception as e:
+        logger.warning("Could not load detections: %s", e)
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Query execution — single shared pipeline for manual queries and auto-analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _execute_analysis(
     message:          str,
     color:            str,
-    search_limit:     int = 20,
-    frames_to_return: int = 8,
+    search_limit:     int  = 20,
+    frames_to_return: int  = 8,
 ) -> dict:
     """
     Single shared analysis pipeline used by both the interactive query route
@@ -332,7 +411,14 @@ def _execute_analysis(
         if frame_targets:
             for t in frame_targets:
                 det_id  = uuid.uuid4().hex[:10]
-                det_label = (t.get("description") or t.get("label") or "").strip() or message
+                # Use VLM per-detection description (needs "description" in prompt schema)
+                # Fallback chain: description → label → report snippet → query
+                det_label = (
+                    (t.get("description") or t.get("label") or "").strip()
+                    or message
+                )
+                # Cap to 60 chars for display
+                det_label = det_label[:60]
                 ann_url = _annotate_and_save(cand, t.get("bbox"), det_label[:20])
                 _state["detections"][det_id] = {
                     "lat":         cand["lat"],
@@ -381,6 +467,18 @@ def _execute_analysis(
                         if d.get("confirmed") and d.get("color") == color)
     n_unconfirmed = sum(1 for d in _state["detections"].values()
                         if not d.get("confirmed") and d.get("color") == color)
+
+    # Auto-trigger YOLO-World + SORT tracking in background.
+    # Does not block the query response — map polylines appear once done.
+    # Persist to disk so restarts load from file instead of replaying API calls
+    paths = _state.get("mission_paths")
+    if paths:
+        _save_detections(paths.maps)
+
+    # Note: _auto_track_background is NOT called here.
+    # Tracking runs once per ingestion (called in main._ingest_background),
+    # not on every query. User queries add detections only.
+
     return {
         "det_ids":       new_det_ids,
         "n_confirmed":   n_confirmed,
@@ -388,3 +486,70 @@ def _execute_analysis(
         "report":        intel.get("report", ""),
         "color":         color,
     }
+
+
+def _auto_track_background(message: str) -> None:
+    """
+    Spawn a background thread that runs YOLO-World dense detection
+    + SORT tracking on all mission frames, then rebuilds the map
+    with trajectory polylines.
+
+    Called automatically at the end of every _execute_analysis().
+    Non-blocking: the CLIP+VLM detections are already on the map
+    before this function returns.
+    """
+    paths = _state.get("mission_paths")
+    if paths is None or _db is None or _db.table is None:
+        return
+
+    import threading
+
+    def _run() -> None:
+        try:
+            from core.tracker import run_tracking, save_tracks
+            import re as _re
+
+            # img_w_px/img_h_px not in LanceDB — reconstruct from tile extents
+            df_all = _db.table.to_pandas()[
+                ["parent_path", "lat", "lon", "alt_m", "gimbal_yaw",
+                 "tile_x", "tile_y", "tile_w", "tile_h"]
+            ]
+            if df_all.empty:
+                return
+
+            frame_ts = _state.get("frame_timestamps", {})
+            frames = []
+            for parent_path, grp in df_all.groupby("parent_path"):
+                ref   = grp.iloc[0]
+                img_w = int((grp["tile_x"] + grp["tile_w"]).max())
+                img_h = int((grp["tile_y"] + grp["tile_h"]).max())
+                fname = Path(parent_path).name
+                m_ts  = _re.search(r"_s(\d{5})", fname)
+                fidx  = int(m_ts.group(1)) if m_ts else 0
+                frames.append({
+                    "parent_path": parent_path,
+                    "lat":         float(ref["lat"]),
+                    "lon":         float(ref["lon"]),
+                    "alt_m":       float(ref.get("alt_m", 80.0)),
+                    "gimbal_yaw":  float(ref.get("gimbal_yaw", 0.0)),
+                    "img_w_px":    img_w if img_w > 0 else 1920,
+                    "img_h_px":    img_h if img_h > 0 else 1080,
+                    "frame_idx":   fidx,
+                    "timestamp_ms": frame_ts.get(fname, fidx * 2000),
+                })
+            frames.sort(key=lambda r: r["frame_idx"])
+
+            logger.info("Auto-tracking %d frames for: %s", len(frames), message)
+            tracks = run_tracking(
+                frames    = frames,
+                spatial   = _spatial,
+                query     = message,
+                confidence= 0.15,
+            )
+            save_tracks(tracks, paths.maps / "tracks.json")
+            _build_map()   # re-render with polylines
+            logger.info("Auto-tracking done: %d track(s)", len(tracks))
+        except Exception as e:
+            logger.error("Auto-tracking failed: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()

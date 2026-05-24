@@ -3,18 +3,18 @@
 - [1] audit
 
 ### Misc
-- [] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot  [YOLO26](https://docs.ultralytics.com/tasks#detection)
+- [v] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot  [YOLO26](https://docs.ultralytics.com/tasks#detection)
 - [v] Multi-Angle Persistence - how is it manifesetd in top 3 candidates? (see Gemini)
 - [v] Merge detections → NMS to remove duplicates from overlapping tiles
 - [3] Improve startup message if something already uploaded `_msg("TAE ready. Upload imagery to build the theater index, ""then query in natural language.", "sys"),`
 - [v] Investigate bad detections
-- [] Missions
-  - [] mission CRUD in UI
-  - [] databases / directories per mission
+- [v] Missions
+  - [v] mission CRUD in UI
+  - [v] databases / directories per mission
 
 ### Refactoring
 - [-] Split into two services - on-edge server and cloud server
-- [] Refactor `main.py` into UI and business logic
+- [v] Refactor `main.py` into UI and business logic
 
 ### non-generative Visual models
 - [v] learn CLIP
@@ -42,14 +42,15 @@
 - [v] video upload
 - [v] chat widget
 - [v] map with markers
-- [] show time / frame when pointed on a marker on a map, bypass inetrmediate pop-up
-- [] frames with detection on a timeline
-- [] video panel vs. chat panel vs. image panel - inconsistency
+- [v] show time / frame when pointed on a marker on a map, bypass inetrmediate pop-up
+- [v] frames with detection on a timeline
+- [v] video panel vs. chat panel vs. image panel - inconsistency
+- [] have panels resizeable (and movable?). By default a large video panel takes a central place
 
 ### Deployment
 - [] Runpod
 
 ### Defects
-- [] Delete mission doesn't work
-- [x] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
-- [] video playback doesn't work
+- [v] Delete mission doesn't work
+- [v] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
+- [v] video playback doesn't work

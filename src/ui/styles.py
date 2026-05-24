@@ -607,6 +607,66 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   margin-left: -6px;
 }
 
+/* ── Live streaming ─────────────────────────────────────────────────────── */
+.live-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color .15s, color .15s;
+  display: flex; align-items: center; gap: 6px;
+}
+.live-btn:hover { border-color: #f87171; color: #f87171; }
+.live-btn.streaming {
+  border-color: #f87171;
+  color: #f87171;
+  background: rgba(248,113,113,.08);
+}
+.live-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #f87171;
+  display: inline-block;
+  opacity: 0;
+}
+.live-btn.streaming .live-dot {
+  opacity: 1;
+  animation: live-pulse 1.2s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%,100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: .3; transform: scale(.7); }
+}
+.stream-form {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px;
+}
+.stream-form label { font-size: 9px; color: var(--muted); letter-spacing:.1em; text-transform:uppercase; }
+.stream-form input { width:100%; background:var(--bg3); border:1px solid var(--border);
+  border-radius:5px; padding:6px 9px; color:var(--text);
+  font-family:var(--font-mono); font-size:11px; outline:none; }
+.stream-form input:focus { border-color:var(--blue); }
+.stream-status {
+  font-size: 9px; color: var(--muted); padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+}
+
+/* ── Tracking (Phase D) ─────────────────────────────────────────────────── */
+.track-btn {
+  background: none; border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 11px;
+  font-size: 11px; font-family: var(--font-mono);
+  color: var(--muted); cursor: pointer;
+  transition: border-color .15s, color .15s;
+}
+.track-btn:hover { border-color: #a78bfa; color: #a78bfa; }
+.track-btn.active { border-color: #a78bfa; color: #a78bfa; background: rgba(167,139,250,.08); }
+
 /* ── Misc ────────────────────────────────────────────────────────────────── */
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator { display: flex; align-items: center; gap: 7px; }
@@ -627,6 +687,125 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   gap:10px; padding:30px; text-align:center;
 }
 .empty-txt { font-size:12px; color:var(--muted); line-height:1.7; }
+// ── Live streaming ───────────────────────────────────────────────────────
+let _streamPollTimer = null;
+
+function openFeedPanel() {
+    closeDrawer();
+    const vp = document.getElementById('video-panel');
+    if (vp) {
+        vp.classList.add('open');
+        htmx.ajax('GET', '/feed_panel', { target: '#video-panel', swap: 'innerHTML' });
+    }
+}
+
+function closeFeedPanel() {
+    // If video is loaded, switch back to video view; otherwise close panel
+    const vp = document.getElementById('video-panel');
+    if (!vp) return;
+    const hasVideo = document.getElementById('tae-video');
+    if (hasVideo) {
+        htmx.ajax('GET', '/video_panel', { target: '#video-panel', swap: 'innerHTML' });
+    } else {
+        vp.classList.remove('open');
+    }
+}
+
+function startStream(e) {
+    e.preventDefault();
+    const url = document.getElementById('stream-url').value.trim();
+    const lat = parseFloat(document.getElementById('stream-lat').value) || 0;
+    const lon = parseFloat(document.getElementById('stream-lon').value) || 0;
+    if (!url) return;
+    fetch('/stream/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url, lat, lon})
+    }).then(r => r.json()).then(d => {
+        if (d.ok) {
+            const dot = document.getElementById('live-dot-nav');
+            if (dot) dot.style.display = 'inline-block';
+            htmx.ajax('GET', '/stream/panel', { target: '#video-panel', swap: 'innerHTML' });
+            _streamPollTimer = setInterval(_pollStream, 5000);
+        } else {
+            alert('Stream error: ' + (d.error || 'unknown'));
+        }
+    });
+}
+
+function stopStream() {
+    fetch('/stream/stop', { method: 'POST' })
+        .then(() => {
+            const dot = document.getElementById('live-dot-nav');
+            if (dot) dot.style.display = 'none';
+            if (_streamPollTimer) { clearInterval(_streamPollTimer); _streamPollTimer = null; }
+            htmx.ajax('GET', '/feed_panel', { target: '#video-panel', swap: 'innerHTML' });
+        });
+}
+
+function _pollStream() {
+    fetch('/stream/status').then(r => r.json()).then(d => {
+        const el = document.getElementById('stream-frame-count');
+        if (el) el.textContent = d.frame_count + ' frames';
+        const lb = document.getElementById('live-btn');
+        const dot = document.getElementById('live-dot-nav');
+        if (dot) dot.style.display = d.running ? 'inline-block' : 'none';
+        if (!d.running) {
+            clearInterval(_streamPollTimer); _streamPollTimer = null;
+        }
+        if (d.running) refreshMap();
+    });
+}
+
+// ── Object tracking (Phase D) ───────────────────────────────────────────
+let _trackPollTimer = null;
+
+function openTrackPanel() {
+    const query = prompt(
+        'Track query — describe objects to track:\n'
+        + '  e.g. "vehicle", "car", "person", "building"\n\n'
+        + 'YOLO-World will scan every frame for these objects.'
+    );
+    if (!query) return;
+    const conf = 0.15;
+    fetch('/track', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({query, confidence: conf})
+    }).then(r => r.json()).then(d => {
+        if (d.ok) {
+            document.getElementById('track-btn').classList.add('active');
+            _trackPollTimer = setInterval(_pollTracking, 2000);
+            // Show progress in chat
+            htmx.ajax('GET', '/track_progress', {target:'#tae-msgs', swap:'beforeend'});
+        } else {
+            alert('Tracking error: ' + (d.error || 'unknown'));
+        }
+    });
+}
+
+function _pollTracking() {
+    fetch('/track_progress').then(r => r.json()).then(d => {
+        const pct = d.total > 0 ? Math.round(d.done/d.total*100) : 0;
+        const btn = document.getElementById('track-btn');
+        if (btn) btn.title = d.running
+            ? `Tracking… ${d.done}/${d.total} frames (${pct}%)`
+            : (d.n_tracks != null ? `${d.n_tracks} track(s) — click to re-run` : 'Track objects');
+        if (!d.running) {
+            clearInterval(_trackPollTimer); _trackPollTimer = null;
+            if (btn) btn.classList.remove('active');
+            refreshMap();
+            if (d.n_tracks != null) {
+                const msg = document.createElement('div');
+                msg.className = 'msg sys-msg';
+                msg.textContent = `Tracking complete: ${d.n_tracks} track(s) for '${d.query}'.`;
+                const chat = document.getElementById('tae-msgs');
+                if (chat) { chat.appendChild(msg); scrollChat(); }
+            }
+        }
+    });
+}
+
 """)
 
 
@@ -747,9 +926,39 @@ function onVideoMeta() {
     const v = document.getElementById('tae-video');
     if (!v) return;
     _vDurMs = v.duration * 1000;
+    _loadVideoDetections();
+}
+
+function _loadVideoDetections() {
     fetch('/video_detections')
         .then(r => r.json())
-        .then(data => { _vDets = data; _drawTimeline(0); _updateDetList(); });
+        .then(data => {
+            _vDets = data;
+            _drawTimeline(0);
+            _updateDetList();
+            // If no detections yet, poll until background replay delivers them
+            if (data.length === 0) {
+                _pollForDetections();
+            }
+        });
+}
+
+function _pollForDetections() {
+    let attempts = 0;
+    const timer = setInterval(() => {
+        attempts++;
+        fetch('/detections_ready')
+            .then(r => r.json())
+            .then(d => {
+                if (d.ready && d.count > 0) {
+                    clearInterval(timer);
+                    _loadVideoDetections();
+                    refreshMap();
+                } else if (attempts > 30) {  // give up after 60s
+                    clearInterval(timer);
+                }
+            });
+    }, 2000);
 }
 
 function onVideoTime() {

@@ -30,6 +30,7 @@ from ai.search import SearchLibrarian
 from ai.analyst import TacticalAnalyst
 from tools.ingest_telemetry import TAESimGenerator
 from core.video import SRTParser, VideoSampler, AdaptiveSampler
+from core.streaming import StreamManager
 from core.app_state import (
     _state, _frame_img_cache, _tile_img_cache,
     _MARKER_COLORS, _CLIP_AERIAL_CTX,
@@ -78,6 +79,9 @@ _search_lib: SearchLibrarian | None = None
 # Video telemetry helpers (singletons — stateless, safe to reuse)
 _srt_parser    = SRTParser()
 _video_sampler = VideoSampler()
+
+# Live streaming manager (Phase D)
+stream_mgr = StreamManager()
 
 
 def get_search_lib() -> SearchLibrarian:
@@ -212,25 +216,23 @@ def _restore_state() -> None:
     except Exception as e:
         logger.warning("Could not restore video state: %s", e)
 
-    # ── Replay last query in background so startup is not blocked ─────────
-    mid = _state.get("mission_id")
-    if mid and _state.get("ingested"):
-        import threading
-        def _replay_query() -> None:
-            try:
-                m = mission_mgr.get(mid)
-                last_q = m.scene_context if m else None
-                if last_q:
-                    logger.info("Replaying last query in background: '%s'", last_q)
-                    color = _MARKER_COLORS[0]
-                    _execute_analysis(last_q, color,
-                                      search_limit=20, frames_to_return=8)
-                    _state["last_query"] = last_q
-                    logger.info("Query replay complete — %d detection(s)",
-                                len(_state["detections"]))
-            except Exception as e:
-                logger.warning("Could not replay last query: %s", e)
-        threading.Thread(target=_replay_query, daemon=True).start()
+    # ── Restore detections from disk — zero API calls on startup ───────────
+    try:
+        paths = _state.get("mission_paths")
+        if paths and _state.get("ingested"):
+            from core.analysis import _load_detections
+            dets = _load_detections(paths.maps)
+            if dets:
+                _state["detections"]      = dets
+                _state["detections_ready"] = True
+                logger.info("Restored %d detection(s) from disk", len(dets))
+                _build_map()   # re-render with restored detections + tracks
+            else:
+                logger.info(
+                    "No saved detections — run a query to populate them"
+                )
+    except Exception as e:
+        logger.warning("Could not restore detections from disk: %s", e)
 
 
 def _startup() -> None:
@@ -396,21 +398,17 @@ def _navbar() -> FT:
         Span("TAE", cls="brand"),
         Div(cls="sep"),
 
-        # ── Upload ───────────────────────────────────────────────────────────
-        Label(
-            I(cls="fas fa-cloud-upload-alt", style="font-size:11px"),
-            " Upload",
-            Input(
-                type="file", name="files", multiple=True,
-                accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv,.srt,.SRT",
-                hx_post="/upload",
-                hx_target="#tae-msgs",
-                hx_swap="beforeend",
-                hx_encoding="multipart/form-data",
-                hx_indicator="#upload-ind",
-                **{"hx-on::after-request": "scrollChat(); refreshMap();"},
-            ),
+        # ── Feed: opens settings drawer ───────────────────────────────────────
+        Button(
+            I(cls="fas fa-satellite-dish", style="font-size:11px"),
+            " Feed",
             cls="upload-btn",
+            id="feed-btn",
+            title="Upload video/images or connect a live stream",
+            hx_get    = "/feed_drawer",
+            hx_target = "#settings-drawer",
+            hx_swap   = "innerHTML",
+            onclick   = "openDrawer()",
         ),
         Span(
             Span(cls="spinner"),
@@ -418,22 +416,8 @@ def _navbar() -> FT:
             id="upload-ind",
             cls="htmx-indicator",
         ),
-
-        Button(
-            I(cls="fas fa-film", style="font-size:11px"),
-            " Video",
-            cls="video-btn",
-            id="video-btn",
-            title="Video playback panel",
-            # HTMX loads panel content; onclick only toggles CSS classes
-            hx_get="/video_panel",
-            hx_target="#video-panel",
-            hx_swap="innerHTML",
-            **{"hx-on::after-request":
-               "document.getElementById('video-panel').classList.add('open');"
-               "document.getElementById('tae-imgpanel').classList.remove('open');"
-               "document.getElementById('video-btn').classList.add('active');"},
-        ),
+        Span(cls="live-dot", id="live-dot-nav",
+             style="width:7px;height:7px;border-radius:50%;background:#f87171;display:none"),
         _status_badge(),
         cls="tae-nav",
     )
@@ -464,10 +448,10 @@ def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> F
                    onclick="toggleDeleteConfirm()"),
             Div(
                 Span(f'Type "{name_val}" to confirm:', cls="del-hint"),
-                Input(id="del-confirm-input", cls="del-confirm-input",
-                      placeholder=name_val),
+                Input(id="del-confirm-input", name="del-confirm-input",
+                      cls="del-confirm-input", placeholder=name_val),
                 Button("Permanently delete", cls="del-go",
-                       hx_delete=f"/missions/{mid}",
+                       hx_post=f"/missions/{mid}/delete",
                        hx_include="#del-confirm-input",
                        hx_swap="none",
                        **{"hx-on::after-request": "location.reload()"}),
@@ -612,7 +596,13 @@ def index():
         Title("TAE · Tactical Awareness Engine"),
         _navbar(),
         Div(
-            Div(id="video-panel", cls="video-panel"),
+            Div(
+                id="video-panel",
+                cls="video-panel" + (" open" if _state.get("video_files") else ""),
+                hx_get="/video_panel" if _state.get("video_files") else None,
+                hx_trigger="load" if _state.get("video_files") else None,
+                hx_swap="innerHTML" if _state.get("video_files") else None,
+            ),
             Div(Iframe(src="/map", id="tae-map-frame"), cls="map-wrap"),
             Div(*_image_panel_empty(), id="tae-imgpanel", cls="img-panel"),
             Div(id="settings-drawer", cls="settings-drawer"),
@@ -626,6 +616,513 @@ def index():
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes — Phase C: Video playback
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes — Phase D: Live streaming
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+
+@rt("/feed_drawer")
+def feed_drawer():
+    """Settings-drawer content: file upload + live stream input."""
+    lat0, lon0 = _state["map_center"]
+    has_stream  = stream_mgr.running
+    stream_style = (
+        "width:100%;padding:7px;border-radius:5px;cursor:pointer;"
+        "font-size:12px;font-family:var(--font-mono);font-weight:700;"
+        + ("background:var(--blue-dim);color:var(--blue);border:1px solid var(--blue)"
+           if not has_stream else
+           "background:#7f1d1d;color:#fca5a5;border:1px solid #f87171")
+    )
+    return (
+        Div(
+            I(cls="fas fa-satellite-dish", style="font-size:12px;color:var(--muted)"),
+            Span("Feed", cls="drawer-title"),
+            Button("✕", cls="drawer-close", onclick="closeDrawer()"),
+            cls="drawer-header",
+        ),
+        Div(
+            Span("Upload files",
+                 style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                       "text-transform:uppercase;display:block;margin-bottom:8px"),
+            Label(
+                Div(
+                    I(cls="fas fa-cloud-upload-alt",
+                      style="font-size:22px;color:var(--blue);margin-bottom:6px;display:block"),
+                    Div("Drop files here or click to browse",
+                        style="font-size:11px;color:var(--muted);line-height:1.6"),
+                    Div(".mp4 + .srt  ·  .jpg / .jpeg",
+                        style="font-size:9px;color:var(--border);margin-top:2px"),
+                    style="text-align:center;padding:18px",
+                ),
+                Input(
+                    type="file", name="files", multiple=True,
+                    accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv,.srt,.SRT",
+                    hx_post="/upload",
+                    hx_target="#tae-msgs",
+                    hx_swap="beforeend",
+                    hx_encoding="multipart/form-data",
+                    hx_indicator="#upload-ind",
+                    style="display:none",
+                    **{"hx-on::after-request": "scrollChat(); refreshMap(); closeDrawer();"},
+                ),
+                style=(
+                    "display:block;cursor:pointer;border:1.5px dashed var(--border);"
+                    "border-radius:8px;transition:border-color .15s;"
+                    "margin-bottom:12px"
+                ),
+            ),
+            Div(style="height:1px;background:var(--border);margin:0 0 12px"),
+            Span("Or connect a live stream",
+                 style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                       "text-transform:uppercase;display:block;margin-bottom:8px"),
+            Div(
+                Span("RTSP / RTMP URL",
+                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                           "text-transform:uppercase"),
+                Input(id="stream-url", type="text",
+                      placeholder="rtsp://192.168.1.1:554/live",
+                      style="width:100%;background:var(--bg3);border:1px solid var(--border);"
+                            "border-radius:5px;padding:6px 9px;color:var(--text);"
+                            "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
+                style="margin-bottom:8px",
+            ),
+            Div(
+                Span("GPS anchor",
+                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                           "text-transform:uppercase"),
+                Div(
+                    Input(id="stream-lat", type="number", step="any",
+                          value=str(round(lat0, 5)), placeholder="Lat",
+                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
+                                "border-radius:5px;padding:6px 8px;color:var(--text);"
+                                "font-family:var(--font-mono);font-size:11px;outline:none"),
+                    Input(id="stream-lon", type="number", step="any",
+                          value=str(round(lon0, 5)), placeholder="Lon",
+                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
+                                "border-radius:5px;padding:6px 8px;color:var(--text);"
+                                "font-family:var(--font-mono);font-size:11px;outline:none"),
+                    style="display:flex;gap:6px;margin-top:4px",
+                ),
+                style="margin-bottom:10px",
+            ),
+            Button(
+                "▶  Start stream" if not has_stream else "■  Stop stream",
+                onclick="startStream(event)" if not has_stream else "stopStream()",
+                style=stream_style,
+            ),
+            Span("ffmpeg must be in PATH",
+                 style="font-size:9px;color:var(--muted);margin-top:6px;display:block"),
+            cls="drawer-section",
+        ),
+    )
+
+@rt("/feed_panel")
+def feed_panel():
+    """Feed panel — unified file upload + live stream input."""
+    lat0, lon0 = _state["map_center"]
+    has_stream = stream_mgr.running
+    stream_btn_style = (
+        "width:100%;padding:7px;border-radius:5px;cursor:pointer;"
+        "font-size:12px;font-family:var(--font-mono);font-weight:700;"
+        + ("background:var(--blue-dim);color:var(--blue);border:1px solid var(--blue)"
+           if not has_stream else
+           "background:#7f1d1d;color:#fca5a5;border:1px solid #f87171")
+    )
+    upload_label_style = (
+        "display:block;cursor:pointer;border:1.5px dashed var(--border);"
+        "border-radius:8px;transition:border-color .15s"
+    )
+    return (
+        Div(
+            Span("📡 Feed",
+                 style="font-family:var(--font-head);font-size:13px;font-weight:700;"
+                       "color:var(--blue);letter-spacing:.06em"),
+            Span("×", cls="video-panel-close", onclick="closeFeedPanel()"),
+            cls="video-panel-header",
+        ),
+        Div(
+            Div("Upload files",
+                style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                      "text-transform:uppercase;margin-bottom:8px"),
+            Label(
+                Div(
+                    I(cls="fas fa-cloud-upload-alt",
+                      style="font-size:22px;color:var(--blue);margin-bottom:6px"),
+                    Div("Drop files here or click to browse",
+                        style="font-size:11px;color:var(--muted);line-height:1.6"),
+                    Div(".mp4 + .srt  ·  .jpg / .jpeg",
+                        style="font-size:9px;color:var(--border);margin-top:2px"),
+                    style="display:flex;flex-direction:column;align-items:center;padding:18px",
+                ),
+                Input(
+                    type="file", name="files", multiple=True,
+                    accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv,.srt,.SRT",
+                    hx_post="/upload",
+                    hx_target="#tae-msgs",
+                    hx_swap="beforeend",
+                    hx_encoding="multipart/form-data",
+                    hx_indicator="#upload-ind",
+                    style="display:none",
+                    **{"hx-on::after-request": "scrollChat(); refreshMap(); closeFeedPanel();"},
+                ),
+                style=upload_label_style,
+            ),
+            style="padding:14px 14px 10px",
+        ),
+        Div(
+            Div(style="flex:1;height:1px;background:var(--border)"),
+            Span("or live stream",
+                 style="font-size:9px;color:var(--muted);padding:0 10px;white-space:nowrap"),
+            Div(style="flex:1;height:1px;background:var(--border)"),
+            style="display:flex;align-items:center;padding:0 14px;margin-bottom:10px",
+        ),
+        Div(
+            Div(
+                Span("Stream URL (RTSP / RTMP)",
+                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                           "text-transform:uppercase"),
+                Input(id="stream-url", type="text",
+                      placeholder="rtsp://192.168.1.1:554/live",
+                      style="width:100%;background:var(--bg3);border:1px solid var(--border);"
+                            "border-radius:5px;padding:6px 9px;color:var(--text);"
+                            "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
+                style="margin-bottom:8px",
+            ),
+            Div(
+                Span("GPS anchor",
+                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                           "text-transform:uppercase"),
+                Div(
+                    Input(id="stream-lat", type="number", step="any",
+                          value=str(round(lat0, 5)), placeholder="Lat",
+                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
+                                "border-radius:5px;padding:6px 8px;color:var(--text);"
+                                "font-family:var(--font-mono);font-size:11px;outline:none"),
+                    Input(id="stream-lon", type="number", step="any",
+                          value=str(round(lon0, 5)), placeholder="Lon",
+                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
+                                "border-radius:5px;padding:6px 8px;color:var(--text);"
+                                "font-family:var(--font-mono);font-size:11px;outline:none"),
+                    style="display:flex;gap:6px;margin-top:4px",
+                ),
+                style="margin-bottom:10px",
+            ),
+            Button(
+                "▶  Start stream" if not has_stream else "■  Stop stream",
+                onclick="startStream(event)" if not has_stream else "stopStream()",
+                style=stream_btn_style,
+            ),
+            Span("ffmpeg must be in PATH",
+                 style="font-size:9px;color:var(--muted);margin-top:6px;display:block"),
+            style="padding:0 14px 14px",
+        ),
+    )
+
+@rt("/stream/panel")
+def stream_panel():
+    """HTMX: returns the stream panel — either setup form or live player."""
+    st = stream_mgr.status()
+    paths = _state.get("mission_paths")
+    lat0  = _state["map_center"][0]
+    lon0  = _state["map_center"][1]
+
+    header = Div(
+        Span("🔴 Live Stream",
+             style="font-family:var(--font-head);font-size:13px;font-weight:700;"
+                   "color:#f87171;letter-spacing:.06em"),
+        Span("×", cls="video-panel-close", onclick="closeVideoPanel()"),
+        cls="video-panel-header",
+    )
+
+    if st["running"]:
+        # ── Live player ───────────────────────────────────────────────────────
+        return (
+            header,
+            Div(
+                NotStr("""
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<video id="tae-live-video" controls autoplay muted
+  style="width:100%;display:block;max-height:280px;object-fit:contain;background:#000">
+</video>
+<script>
+(function(){
+  const v = document.getElementById('tae-live-video');
+  if (Hls.isSupported()) {
+    const h = new Hls({lowLatencyMode:true});
+    h.loadSource('/hls/stream.m3u8');
+    h.attachMedia(v);
+  } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+    v.src = '/hls/stream.m3u8';
+  }
+})();
+</script>"""),
+                cls="video-wrap",
+            ),
+            Div(
+                Div(
+                    Span("● LIVE", style="color:#f87171;font-size:10px;font-weight:700"),
+                    Span("", id="stream-frame-count",
+                         style="color:var(--muted);font-size:9px"),
+                    style="display:flex;justify-content:space-between;padding:10px 14px 6px",
+                ),
+                Button(
+                    "■ Stop stream",
+                    onclick="stopStream()",
+                    style="margin:0 14px 12px;padding:6px 12px;background:#7f1d1d;"
+                          "color:#fca5a5;border:1px solid #f87171;border-radius:5px;"
+                          "cursor:pointer;font-size:11px;font-family:var(--font-mono);width:calc(100% - 28px)",
+                ),
+                cls="stream-status",
+            ),
+        )
+    else:
+        # ── Setup form ────────────────────────────────────────────────────────
+        return (
+            header,
+            Div(
+                Div(
+                    Span("Stream URL (RTSP / RTMP / file path)", style="font-size:9px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase"),
+                    Input(id="stream-url", type="text", placeholder="rtsp://192.168.1.1:554/live",
+                          style="width:100%;background:var(--bg3);border:1px solid var(--border);"
+                                "border-radius:5px;padding:6px 9px;color:var(--text);"
+                                "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
+                    style="margin-bottom:10px",
+                ),
+                Div(
+                    Span("Anchor GPS (used when stream has no telemetry)", style="font-size:9px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase"),
+                    Div(
+                        Input(id="stream-lat", type="number", step="any",
+                              value=str(round(lat0, 5)), placeholder="Latitude",
+                              style="flex:1;background:var(--bg3);border:1px solid var(--border);"
+                                    "border-radius:5px;padding:6px 9px;color:var(--text);"
+                                    "font-family:var(--font-mono);font-size:11px;outline:none"),
+                        Input(id="stream-lon", type="number", step="any",
+                              value=str(round(lon0, 5)), placeholder="Longitude",
+                              style="flex:1;background:var(--bg3);border:1px solid var(--border);"
+                                    "border-radius:5px;padding:6px 9px;color:var(--text);"
+                                    "font-family:var(--font-mono);font-size:11px;outline:none"),
+                        style="display:flex;gap:6px;margin-top:4px",
+                    ),
+                    style="margin-bottom:12px",
+                ),
+                Button(
+                    "▶ Start stream",
+                    onclick="startStream(event)",
+                    style="width:100%;padding:8px;background:var(--blue-dim);"
+                          "color:var(--blue);border:1px solid var(--blue);"
+                          "border-radius:5px;cursor:pointer;font-size:12px;"
+                          "font-family:var(--font-mono);font-weight:700",
+                ),
+                Span(
+                    "ffmpeg must be installed and reachable in PATH.",
+                    style="font-size:9px;color:var(--muted);margin-top:8px;display:block",
+                ),
+                style="padding:14px",
+            ),
+        )
+
+
+@rt("/stream/start", methods=["POST"])
+async def stream_start(request: Request):
+    """Start the live stream. Body: {url, lat, lon}"""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+        url  = (body.get("url") or "").strip()
+        lat  = float(body.get("lat") or _state["map_center"][0])
+        lon  = float(body.get("lon") or _state["map_center"][1])
+        if not url:
+            return JSONResponse({"ok": False, "error": "URL required"})
+
+        paths = _state.get("mission_paths")
+        if not paths:
+            return JSONResponse({"ok": False, "error": "No active mission"})
+
+        hls_dir    = paths.uploads.parent / "hls"
+        frames_dir = paths.uploads / "live_frames"
+
+        stream_mgr.start(url, lat, lon, hls_dir, frames_dir)
+        _state["video_files"] = list(_state.get("video_files", []))  # keep existing
+        logger.info("Stream started: url=%s lat=%s lon=%s", url, lat, lon)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logger.error("Stream start error: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@rt("/stream/stop", methods=["POST"])
+def stream_stop():
+    """Stop the live stream."""
+    from starlette.responses import JSONResponse
+    stream_mgr.stop()
+    return JSONResponse({"ok": True})
+
+
+@rt("/stream/status")
+def stream_status():
+    """Poll endpoint for stream state."""
+    from starlette.responses import JSONResponse
+    return JSONResponse(stream_mgr.status())
+
+
+@rt("/hls/{filename}")
+def serve_hls(filename: str):
+    """Serve HLS playlist and segment files."""
+    from starlette.responses import Response
+    paths = _state.get("mission_paths")
+    if not paths:
+        return Response("No active mission", status_code=404)
+    hls_dir  = paths.uploads.parent / "hls"
+    hls_file = hls_dir / Path(filename).name   # sanitise
+    if not hls_file.exists():
+        return Response("Not found", status_code=404)
+    suffix = hls_file.suffix.lower()
+    mime = {".m3u8": "application/vnd.apple.mpegurl",
+            ".ts":   "video/mp2t"}.get(suffix, "application/octet-stream")
+    return FileResponse(str(hls_file), media_type=mime,
+                        headers={"Cache-Control": "no-cache"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes — Phase D: Object tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+@rt("/track", methods=["POST"])
+async def track(request: Request):
+    """
+    Dense object tracking over all mission frames.
+    Body: {query: "track all vehicles", confidence: 0.15}
+    Fires as a background task; progress streamed via /track_progress.
+    """
+    from starlette.responses import JSONResponse
+    body  = await request.json()
+    query = (body.get("query") or "").strip()
+    conf  = float(body.get("confidence", 0.15))
+
+    if not query:
+        return JSONResponse({"ok": False, "error": "query required"})
+
+    paths = _state.get("mission_paths")
+    if not paths:
+        return JSONResponse({"ok": False, "error": "No active mission"})
+
+    if not _state.get("ingested"):
+        return JSONResponse({"ok": False, "error": "Ingest video frames first"})
+
+    _state["tracking"]      = True
+    _state["track_progress"] = 0
+    _state["track_total"]    = 0
+    _state["track_query"]    = query
+
+    import threading
+    threading.Thread(
+        target=_tracking_background,
+        args=(query, conf, paths),
+        daemon=True,
+    ).start()
+
+    return JSONResponse({"ok": True, "message": f"Tracking started for: {query}"})
+
+
+def _tracking_background(query: str, confidence: float, paths) -> None:
+    """Background thread: dense detection + SORT tracking + map rebuild."""
+    from core.tracker import run_tracking, save_tracks
+    try:
+        # Gather one row per unique parent frame, sorted by frame_idx
+        if db.table is None or db.row_count() == 0:
+            _state["track_error"] = "No frames indexed"
+            return
+
+        # img_w_px / img_h_px are not in LanceDB — reconstruct from tile extents
+        import re as _re
+        df_all = db.table.to_pandas()[
+            ["parent_path", "lat", "lon", "alt_m", "gimbal_yaw",
+             "tile_x", "tile_y", "tile_w", "tile_h"]
+        ]
+
+        frame_ts = _state.get("frame_timestamps", {})
+        frames   = []
+        for parent_path, grp in df_all.groupby("parent_path"):
+            ref   = grp.iloc[0]
+            img_w = int((grp["tile_x"] + grp["tile_w"]).max())
+            img_h = int((grp["tile_y"] + grp["tile_h"]).max())
+            fname = Path(parent_path).name
+            m_re  = _re.search(r"_s(\d{5})", fname)
+            fidx  = int(m_re.group(1)) if m_re else 0
+            frames.append({
+                "parent_path": parent_path,
+                "lat":         float(ref["lat"]),
+                "lon":         float(ref["lon"]),
+                "alt_m":       float(ref.get("alt_m", 80.0)),
+                "gimbal_yaw":  float(ref.get("gimbal_yaw", 0.0)),
+                "img_w_px":    img_w if img_w > 0 else 1920,
+                "img_h_px":    img_h if img_h > 0 else 1080,
+                "frame_idx":   fidx,
+                "timestamp_ms": frame_ts.get(fname, fidx * 2000),
+            })
+
+        frames.sort(key=lambda r: r["frame_idx"])
+        _state["track_total"] = len(frames)
+        logger.info("Tracking %d frames for query: %s", len(frames), query)
+
+        def on_progress(done, total):
+            _state["track_progress"] = done
+
+        tracks = run_tracking(
+            frames       = frames,
+            spatial      = spatial,
+            query        = query,
+            confidence   = confidence,
+            on_progress  = on_progress,
+        )
+
+        tracks_file = paths.maps / "tracks.json"
+        save_tracks(tracks, tracks_file)
+
+        # Rebuild map with polylines
+        _build_map()
+
+        logger.info("Tracking complete: %d tracks", len(tracks))
+        _state["track_done"]   = len(tracks)
+        _state["tracking"]     = False
+
+    except Exception as e:
+        logger.error("Tracking failed: %s", e)
+        _state["track_error"] = str(e)
+        _state["tracking"]    = False
+
+
+@rt("/track_progress")
+def track_progress():
+    """Poll endpoint for tracking progress."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({
+        "running":   _state.get("tracking", False),
+        "done":      _state.get("track_progress", 0),
+        "total":     _state.get("track_total", 0),
+        "n_tracks":  _state.get("track_done"),
+        "error":     _state.get("track_error"),
+        "query":     _state.get("track_query", ""),
+    })
+
+
+@rt("/track_clear", methods=["POST"])
+def track_clear():
+    """Remove tracks for the active mission and rebuild the map."""
+    from starlette.responses import JSONResponse
+    paths = _state.get("mission_paths")
+    if paths:
+        tf = paths.maps / "tracks.json"
+        if tf.exists():
+            tf.unlink()
+    _build_map()
+    for k in ("tracking", "track_progress", "track_total",
+              "track_done", "track_error", "track_query"):
+        _state.pop(k, None)
+    return JSONResponse({"ok": True})
 
 @rt("/serve_video")
 def serve_video(filename: str = ""):
@@ -654,6 +1151,16 @@ def serve_video(filename: str = ""):
                         headers={"Accept-Ranges": "bytes"})
 
 
+
+
+@rt("/detections_ready")
+def detections_ready():
+    """Lightweight poll: returns True once background replay has populated detections."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({
+        "ready":  _state.get("detections_ready", len(_state["detections"]) > 0),
+        "count":  len(_state["detections"]),
+    })
 
 @rt("/video_ping")
 def video_ping():
@@ -909,17 +1416,25 @@ def mission_archive(mission_id: str):
     return ""
 
 
-@rt("/missions/{mission_id}", methods=["DELETE"])
+@rt("/missions/{mission_id}/delete", methods=["POST"])
 async def mission_delete(mission_id: str, request: Request):
     form         = await request.form()
     confirm_name = (form.get("del-confirm-input") or "").strip()
     m = mission_mgr.get(mission_id)
-    if not m or confirm_name != m.name:
-        return ""   # silently reject wrong confirmation
-    # Wipe data directory
-    data_root = Path(settings.DATA_DIR) / mission_id
+    if not m:
+        return ""
+    if confirm_name != m.name:
+        logger.warning("Delete rejected: typed %r != %r", confirm_name, m.name)
+        return ""
+    # Wipe data directory — name-based folder scheme
+    folder    = _mission_folder(m.name, mission_id)
+    data_root = Path(settings.DATA_DIR) / folder
     if data_root.exists():
         shutil.rmtree(str(data_root))
+    # Also wipe legacy bare-ID path if present
+    legacy = Path(settings.DATA_DIR) / mission_id
+    if legacy.exists() and legacy != data_root:
+        shutil.rmtree(str(legacy))
     # If it was active, switch before deleting the DB record
     if mission_id == _state.get("mission_id"):
         mission_mgr.delete(mission_id)
@@ -1026,6 +1541,10 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                         search_limit     = 20,
                         frames_to_return = 8,
                     )
+                    # Persist so restart replay works without a manual query
+                    mission_mgr.update(mid, scene_context=m.definition)
+                    _state["last_query"] = m.definition
+                    _state["detections_ready"] = True
                     snip = m.definition[:40] + (
                         "..." if len(m.definition) > 40 else ""
                     )
@@ -1040,6 +1559,19 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
         except Exception as ae:
             logger.error("Auto-analysis failed (ingestion was successful): %s", ae)
             auto_summary = "Auto-analysis failed — you can still query manually."
+
+        # Run YOLO-World + SORT once after ingestion — this is the
+        # ONLY place tracking is triggered. Not on every query, not on restart.
+        _trk_mid = _state.get("mission_id")
+        if _trk_mid:
+            try:
+                _trk_m = mission_mgr.get(_trk_mid)
+                _trk_q = (_trk_m.definition if _trk_m else None) or ""
+                if _trk_q:
+                    from core.analysis import _auto_track_background
+                    _auto_track_background(_trk_q)
+            except Exception as _te:
+                logger.warning("Post-ingestion tracking failed: %s", _te)
 
         _state["ingest_msg"] = (
             f"Indexed {tiles_ok} tiles across {total_frames} frame(s). "
@@ -1202,6 +1734,19 @@ async def upload(request: Request):
     _state["frame_count"] = len(meta)
     tasks = BackgroundTasks()
     tasks.add_task(_ingest_background, saved_images, meta_file, meta)
+
+    # If video files are now present, activate the video panel immediately.
+    # The panel div is already in the DOM but was rendered without "open"
+    # (because video_files was empty at page load time).
+    video_activation = Script(
+        "const vp=document.getElementById('video-panel');"
+        "if(vp && !vp.classList.contains('open')){"
+        "  vp.classList.add('open');"
+        "  htmx.ajax('GET','/video_panel',"
+        "    {target:'#video-panel',swap:'innerHTML'});"
+        "}"
+    ) if _state.get("video_files") else ""
+
     return (
         _msg(f"{len(saved_images)} image(s) received. Indexing in background…", "sys"),
         Div(
@@ -1212,6 +1757,7 @@ async def upload(request: Request):
             hx_swap="outerHTML",
         ),
         _status_badge(),
+        video_activation,
     ), tasks
 
 
@@ -1228,7 +1774,15 @@ def upload_progress():
         )
     msg = _state.pop("ingest_msg", None)
     if msg:
-        return _msg(msg, "sys"), _status_badge(), Script("refreshMap();")
+        video_act = Script(
+            "const vp=document.getElementById('video-panel');"
+            "if(vp && !vp.classList.contains('open')){"
+            "  vp.classList.add('open');"
+            "  htmx.ajax('GET','/video_panel',"
+            "    {target:'#video-panel',swap:'innerHTML'});"
+            "}"
+        ) if _state.get("video_files") else ""
+        return _msg(msg, "sys"), _status_badge(), Script("refreshMap();"), video_act
     return ""
 
 
@@ -1401,7 +1955,59 @@ def frame_view(det_id: str, mode: str = "tile"):
 # Boot
 # ─────────────────────────────────────────────────────────────────────────────
 # Wire injected dependencies into the analysis service layer
-_init_analysis(db, analyst, get_search_lib)
+_init_analysis(db, analyst, get_search_lib, spatial)
+
+# Wire stream callbacks
+def _stream_on_frames(paths, lat, lon):
+    """Index a batch of new live frames into LanceDB."""
+    import cv2 as _cv2
+    paths_obj = _state.get('mission_paths')
+    if not paths_obj:
+        return
+    gen = TAESimGenerator(str(paths_obj.uploads), str(paths_obj.uploads))
+    meta = {}
+    for p in paths:
+        img = _cv2.imread(str(p))
+        if img is not None:
+            h, w = img.shape[:2]
+            meta[p.name] = {
+                "full_path":    str(p),
+                "lat":          lat,
+                "lon":          lon,
+                "z":            80.0,
+                "gimbal_pitch": -90.0,
+                "gimbal_yaw":   0.0,
+                "gimbal_roll":  0.0,
+                "img_w_px":     w,
+                "img_h_px":     h,
+            }
+    if not meta:
+        return
+    meta_file = paths_obj.uploads / 'live_meta.json'
+    meta_file.write_text(json.dumps(meta))
+    sim = TAESimGenerator(str(paths_obj.uploads), str(paths_obj.uploads))
+    sim.pose_metadata = meta
+    from core.ingestion import run_ingestion
+    tiles_ok, _ = run_ingestion(sim, spatial, get_search_lib(), db)
+    _state['frame_count'] = _state.get('frame_count', 0) + len(paths)
+    _state['tile_count']  = _state.get('tile_count',  0) + tiles_ok
+    _state['ingested']    = True
+    logger.info('Stream: indexed %d tiles from %d frames', tiles_ok, len(paths))
+
+def _stream_on_analyse():
+    """Trigger auto-analysis against mission definition."""
+    mid = _state.get('mission_id')
+    if not mid:
+        return
+    m = mission_mgr.get(mid)
+    if not (m and m.definition):
+        return
+    color = _MARKER_COLORS[_state['query_color_idx'] % len(_MARKER_COLORS)]
+    _state['query_color_idx'] += 1
+    _execute_analysis(m.definition, color, search_limit=20, frames_to_return=8)
+    logger.info('Stream auto-analysis complete')
+
+stream_mgr.init(_stream_on_frames, _stream_on_analyse)
 
 _startup()
 _PORT = int(os.environ.get("PORT", 8000))

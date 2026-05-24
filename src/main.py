@@ -26,8 +26,8 @@ from config import settings, MissionPaths
 from core.mission import MissionManager, Mission
 from core.spatial import SpatialEngine
 from core.database import TacticalDatabase
-from ai.search import SearchLibrarian
-from ai.analyst import TacticalAnalyst
+from ai.clip import SearchLibrarian
+from ai.vlm import TacticalAnalyst
 from tools.ingest_telemetry import TAESimGenerator
 from core.video import SRTParser, VideoSampler, AdaptiveSampler
 from core.streaming import StreamManager
@@ -35,7 +35,7 @@ from core.app_state import (
     _state, _frame_img_cache, _tile_img_cache,
     _MARKER_COLORS, _CLIP_AERIAL_CTX,
 )
-from core.analysis import (
+from core.pipeline import (
     _build_map, _optimal_zoom, _recenter_on_detections,
     _load_tile, _annotate_and_save, _tile_to_static_url,
     _extract_video_frames, _execute_analysis,
@@ -220,7 +220,7 @@ def _restore_state() -> None:
     try:
         paths = _state.get("mission_paths")
         if paths and _state.get("ingested"):
-            from core.analysis import _load_detections
+            from core.pipeline import _load_detections
             dets = _load_detections(paths.maps)
             if dets:
                 _state["detections"]      = dets
@@ -1568,7 +1568,7 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                 _trk_m = mission_mgr.get(_trk_mid)
                 _trk_q = (_trk_m.definition if _trk_m else None) or ""
                 if _trk_q:
-                    from core.analysis import _auto_track_background
+                    from core.pipeline import _auto_track_background
                     _auto_track_background(_trk_q)
             except Exception as _te:
                 logger.warning("Post-ingestion tracking failed: %s", _te)

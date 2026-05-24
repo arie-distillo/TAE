@@ -7,13 +7,13 @@ from pathlib import Path
 import numpy as np
 import time
 
-from ai import analyst
+from ai import vlm
 from config import settings
 from core.sim_provider import SimD3Environment
 from core.spatial import SpatialEngine
 from core.database import TacticalDatabase
-from ai.search import SearchLibrarian
-from ai.analyst import TacticalAnalyst
+from ai.clip import SearchLibrarian
+from ai.vlm import TacticalAnalyst
 from core.object_detection import merge_detections, ObjectInstance, Detection
 from core.ingestion import run_ingestion 
 

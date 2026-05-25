@@ -7,138 +7,57 @@ Imported by main.py and passed directly into the fast_app() headers.
 
 from fasthtml.common import Style, Script
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────────────────────
 _CSS = Style("""
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Rajdhani:wght@500;700&display=swap');
-
+ 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
+ 
 :root {
-  --bg0: #0d0e1a;
-  --bg1: #12131f;
-  --bg2: #181929;
-  --bg3: #1e1f32;
-  --bg4: #252637;
-  --border: #2a2c45;
-  --accent: #4ade80;
-  --accent-dim: rgba(74,222,128,.15);
-  --blue: #7aa2f7;
-  --blue-dim: rgba(122,162,247,.12);
-  --text: #c0caf5;
-  --muted: #6272a4;
-  --danger: #f7768e;
-  --danger-dim: rgba(247,118,142,.12);
-  --font-mono: 'JetBrains Mono', monospace;
-  --font-head: 'Rajdhani', sans-serif;
+  --bg0:        #080910;
+  --bg1:        #0f1020;
+  --bg2:        #14162a;
+  --bg3:        #1b1d30;
+  --bg4:        #22253a;
+  --border:     #2b2e48;
+  --border-hi:  #3d4270;
+  --accent:     #4ade80;
+  --accent-dim: rgba(74,222,128,.12);
+  --blue:       #7aa2f7;
+  --blue-dim:   rgba(122,162,247,.12);
+  --cyan:       #22d3ee;
+  --text:       #c0caf5;
+  --muted:      #525880;
+  --danger:     #f7768e;
+  --amber:      #e0af68;
+  --font-mono:  'JetBrains Mono', monospace;
+  --font-head:  'Rajdhani', sans-serif;
+  --panel-r:    12px;
 }
-
-html, body { height:100%; background: var(--bg0); color: var(--text); font-family: var(--font-mono); overflow: hidden; }
-
-/* ── Navbar ─────────────────────────────────────────────────────────────── */
+ 
+html, body {
+  height: 100%;
+  background: var(--bg0);
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow: hidden;
+}
+ 
+/* ── Navbar ──────────────────────────────────────────────────────────────── */
 .tae-nav {
-  position: fixed; top:0; left:0; right:0; z-index:200;
+  position: fixed; top: 0; left: 0; right: 0; z-index: 900;
   height: 52px;
-  background: var(--bg1);
+  background: rgba(15, 16, 32, 0.97);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
-  padding: 0 14px;
-  gap: 10px;
+  padding: 0 18px;
+  gap: 14px;
+  backdrop-filter: blur(12px);
 }
-
-/* ── Mission chip ────────────────────────────────────────────────────────── */
-.m-chip-wrap { position: relative; }
-
-.m-chip {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  padding: 5px 10px;
-  font-size: 10px;
-  cursor: pointer;
-  min-width: 150px;
-  max-width: 220px;
-  user-select: none;
-  transition: border-color .15s, background .15s;
-}
-.m-chip:hover, .m-chip.open { border-color: var(--blue); background: var(--blue-dim); }
-.m-chip-name { font-weight: 600; color: var(--text); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.m-chip-chev { font-size: 8px; color: var(--muted); transition: transform .15s; flex-shrink: 0; }
-.m-chip.open .m-chip-chev { transform: rotate(180deg); }
-
-/* ── Mission dropdown ────────────────────────────────────────────────────── */
-.m-dropdown {
-  display: none;
-  position: absolute;
-  top: calc(100% + 5px);
-  left: 0;
-  width: 272px;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 8px 28px rgba(0,0,0,.55);
-  overflow: hidden;
-  z-index: 300;
-}
-.m-dropdown.open { display: block; }
-
-.m-item {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 9px 12px;
-  font-size: 10px;
-  cursor: pointer;
-  transition: background .1s;
-}
-.m-item:hover { background: var(--bg3); }
-.m-item.cur { background: var(--accent-dim); }
-.m-item-name { flex: 1; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.m-item-date { color: var(--muted); font-size: 9px; white-space: nowrap; }
-
-.m-sep { height: 1px; background: var(--border); margin: 2px 0; }
-
-.m-new {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 9px 12px;
-  font-size: 10px;
-  color: var(--accent);
-  cursor: pointer;
-  font-weight: 600;
-}
-.m-new:hover { background: var(--accent-dim); }
-
-.m-archived {
-  padding: 7px 12px;
-  font-size: 9px;
-  color: var(--muted);
-  cursor: pointer;
-}
-.m-archived:hover { color: var(--text); }
-
-/* ── Settings (config) button ────────────────────────────────────────────── */
-.cfg-btn {
-  background: none;
-  border: none;
-  color: var(--muted);
-  cursor: pointer;
-  font-size: 15px;
-  width: 30px;
-  height: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 5px;
-  transition: color .15s, background .15s;
-  flex-shrink: 0;
-}
-.cfg-btn:hover, .cfg-btn.active { color: var(--text); background: var(--bg4); }
-
-/* ── Brand ───────────────────────────────────────────────────────────────── */
+ 
 .brand {
   font-family: var(--font-head);
   font-size: 20px;
@@ -146,12 +65,18 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   color: var(--accent);
   letter-spacing: .12em;
   text-transform: uppercase;
-  flex-shrink: 0;
 }
-
-.sep { width:1px; height:28px; background: var(--border); margin: 0 2px; flex-shrink:0; }
-
-/* ── Upload button ───────────────────────────────────────────────────────── */
+.brand-sub {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .15em;
+  text-transform: uppercase;
+  align-self: flex-end;
+  margin-bottom: 3px;
+}
+.sep { width: 1px; height: 28px; background: var(--border); margin: 0 4px; }
+ 
 .upload-btn {
   display: flex;
   align-items: center;
@@ -167,9 +92,8 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   transition: border-color .18s, background .18s;
 }
 .upload-btn:hover { border-color: var(--blue); background: var(--blue-dim); }
-.upload-btn input[type="file"] { display:none; }
-
-/* ── Status badge ────────────────────────────────────────────────────────── */
+.upload-btn input[type="file"] { display: none; }
+ 
 .status-badge {
   display: flex;
   align-items: center;
@@ -188,229 +112,281 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   background: var(--accent);
   box-shadow: 0 0 6px var(--accent);
 }
-
-/* ── Main layout ─────────────────────────────────────────────────────────── */
-.tae-main {
+ 
+/* nav toolbar pills on the right */
+.nav-pill {
   display: flex;
-  height: calc(100vh - 52px);
-  margin-top: 52px;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 4px 6px;
 }
-
-/* ── Map ─────────────────────────────────────────────────────────────────── */
-.map-wrap {
-  flex: 1;
-  position: relative;
+.nav-pill-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 14px;
+  cursor: pointer;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: .05em;
+  color: var(--muted);
+  border: none;
+  background: transparent;
+  transition: background .15s, color .15s;
+  white-space: nowrap;
+}
+.nav-pill-btn:hover { background: var(--bg4); color: var(--text); }
+.nav-pill-btn.active { background: var(--bg0); color: var(--blue); }
+ 
+/* ── Workspace ────────────────────────────────────────────────────────────── */
+.tae-workspace {
+  position: fixed;
+  top: 52px; left: 0; right: 0; bottom: 0;
   overflow: hidden;
 }
-.map-wrap iframe {
+ 
+#bg-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+ 
+/* ── Panel system ─────────────────────────────────────────────────────────── */
+.tae-panel {
+  position: absolute;
+  min-width: 260px;
+  min-height: 44px;
+  background: rgba(14, 15, 26, 0.94);
+  border: 1px solid var(--border);
+  border-radius: var(--panel-r);
+  box-shadow:
+    0 0 0 0.5px rgba(255,255,255,.04) inset,
+    0 12px 48px rgba(0,0,0,.75);
+  backdrop-filter: blur(18px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 100;
+  transition: box-shadow .18s, border-color .18s;
+}
+ 
+.tae-panel.is-focused {
+  z-index: 300;
+  border-color: var(--border-hi);
+  box-shadow:
+    0 0 0 0.5px rgba(255,255,255,.06) inset,
+    0 16px 60px rgba(0,0,0,.9);
+}
+ 
+.tae-panel.is-collapsed .panel-body  { display: none !important; }
+.tae-panel.is-collapsed .panel-foot  { display: none !important; }
+.tae-panel.is-collapsed .panel-resize { display: none !important; }
+ 
+/* ── Panel header ─────────────────────────────────────────────────────────── */
+.panel-header {
+  height: 44px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px 0 12px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  cursor: grab;
+  user-select: none;
+}
+.panel-header:active { cursor: grabbing; }
+ 
+.panel-icon {
+  width: 26px; height: 26px;
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px;
+  flex-shrink: 0;
+  opacity: .9;
+}
+.pi-map   { background: rgba(122,162,247,.18); color: var(--blue); }
+.pi-chat  { background: rgba(74,222,128,.16);  color: var(--accent); }
+.pi-video { background: rgba(34,211,238,.16);  color: var(--cyan); }
+.pi-frame { background: rgba(224,175,104,.16); color: var(--amber); }
+ 
+.panel-title {
+  font-family: var(--font-head);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1;
+}
+ 
+.panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+ 
+.panel-btn {
+  width: 26px; height: 26px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted);
+  font-size: 10px;
+  transition: background .12s, color .12s;
+}
+.panel-btn:hover  { background: var(--bg4); color: var(--text); }
+ 
+/* ── Panel body ───────────────────────────────────────────────────────────── */
+.panel-body {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  min-height: 0;
+}
+ 
+/* ── Resize handle ────────────────────────────────────────────────────────── */
+.panel-resize {
+  position: absolute;
+  right: 0; bottom: 0;
+  width: 18px; height: 18px;
+  cursor: nwse-resize;
+  z-index: 10;
+}
+.panel-resize::before {
+  content: '';
+  position: absolute;
+  right: 3px; bottom: 3px;
+  width: 9px; height: 9px;
+  border-right: 2px solid var(--border-hi);
+  border-bottom: 2px solid var(--border-hi);
+  border-radius: 0 0 3px 0;
+  opacity: .6;
+}
+ 
+/* ── Map panel ────────────────────────────────────────────────────────────── */
+#tae-map-panel { top: 20px; left: 20px; width: 640px; height: 480px; }
+ 
+.map-panel-body iframe {
   width: 100%; height: 100%;
   border: none; display: block;
 }
-
-/* ── Settings drawer ─────────────────────────────────────────────────────── */
-.settings-drawer {
-  width: 300px;
-  min-width: 300px;
-  background: var(--bg1);
-  border-left: 1px solid var(--border);
-  display: none;
-  flex-direction: column;
+ 
+/* ── Chat panel ───────────────────────────────────────────────────────────── */
+#tae-chat-panel { bottom: 20px; left: 20px; width: 370px; height: 420px; top: auto; }
+ 
+.chat-msgs {
+  flex: 1;
   overflow-y: auto;
-  transition: width .22s ease;
+  padding: 12px 14px;
+  min-height: 0;
 }
-.settings-drawer.open { display: flex; }
-.settings-drawer::-webkit-scrollbar { width: 4px; }
-.settings-drawer::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-.drawer-header {
-  position: sticky; top: 0; z-index: 1;
-  background: var(--bg1);
-  padding: 13px 15px;
-  border-bottom: 1px solid var(--border);
+.chat-msgs::-webkit-scrollbar { width: 3px; }
+.chat-msgs::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+ 
+.panel-foot { flex-shrink: 0; }
+.chat-divider { height: 1px; background: var(--border); }
+.chat-input-row {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 10px 12px;
 }
-.drawer-title { font-size: 11px; font-weight: 600; color: var(--text); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.drawer-close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 4px; }
-.drawer-close:hover { color: var(--text); }
-
-.drawer-section { padding: 13px 15px; }
-.drawer-label { font-size: 9px; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 7px; }
-.drawer-sep { height: 1px; background: var(--border); }
-
-.drawer-input {
-  width: 100%;
+.chat-input-row input {
+  flex: 1;
   background: var(--bg3);
   border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 7px 9px;
-  color: var(--text);
+  border-radius: 7px;
+  padding: 7px 11px;
+  font-size: 12px;
   font-family: var(--font-mono);
-  font-size: 10px;
-  outline: none;
-}
-.drawer-input:focus { border-color: var(--blue); }
-
-.drawer-textarea {
-  width: 100%;
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 7px 9px;
   color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 10px;
   outline: none;
-  resize: vertical;
-  min-height: 72px;
-  line-height: 1.6;
+  transition: border-color .15s;
 }
-.drawer-textarea:focus { border-color: var(--blue); }
-.drawer-hint { font-size: 9px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
-
-.intent-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-  cursor: pointer;
-  font-size: 10px;
-  color: var(--text);
-  border: none !important;
-  box-shadow: none !important;
-  background: none !important;
-  padding: 0 !important;
-}
-.intent-row input[type="checkbox"] {
-  accent-color: var(--accent);
-  cursor: pointer;
-  width: 15px !important;
-  height: 15px !important;
-  min-width: 15px;
-  flex-shrink: 0;
-  margin: 0;
-  padding: 0;
+.chat-input-row input::placeholder { color: var(--muted); }
+.chat-input-row input:focus { border-color: var(--blue); }
+ 
+.send-btn {
+  background: var(--blue);
+  color: var(--bg0);
   border: none;
-  background: none;
-  box-shadow: none;
-  appearance: auto;
-  -webkit-appearance: checkbox;
-}
-
-.drawer-save-btn {
-  margin-top: 10px;
-  background: var(--accent-dim);
-  border: 1px solid var(--accent);
-  border-radius: 5px;
-  padding: 6px 12px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--accent);
+  border-radius: 7px;
+  padding: 7px 14px;
   cursor: pointer;
-  font-weight: 600;
-}
-.drawer-save-btn:hover { background: var(--accent); color: var(--bg0); }
-
-.arch-btn {
-  width: 100%;
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 6px 11px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--muted);
-  cursor: pointer;
-  text-align: left;
-  margin-bottom: 7px;
-}
-.arch-btn:hover { border-color: var(--text); color: var(--text); }
-
-.del-btn {
-  width: 100%;
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 6px 11px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--danger);
-  cursor: pointer;
-  text-align: left;
-}
-.del-btn:hover { border-color: var(--danger); background: var(--danger-dim); }
-
-.del-confirm { margin-top: 8px; display: none; }
-.del-confirm.show { display: block; }
-.del-hint { font-size: 9px; color: var(--muted); margin-bottom: 5px; }
-.del-confirm-input {
-  width: 100%;
-  background: var(--bg3);
-  border: 1px solid var(--danger);
-  border-radius: 5px;
-  padding: 6px 9px;
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  outline: none;
-  margin-bottom: 6px;
-}
-.del-go {
-  width: 100%;
-  background: var(--danger-dim);
-  border: 1px solid var(--danger);
-  border-radius: 5px;
-  padding: 6px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--danger);
-  cursor: pointer;
-  font-weight: 600;
-}
-.del-go:hover { background: var(--danger); color: var(--bg0); }
-
-/* ── Image panel (right side) ────────────────────────────────────────────── */
-.img-panel {
-  width: 380px;
-  min-width: 380px;
-  background: var(--bg2);
-  border-left: 1px solid var(--border);
-  display: none;
-  flex-direction: column;
-  overflow-y: auto;
-}
-.img-panel.open { display: flex; }
-.img-panel::-webkit-scrollbar { width: 4px; }
-.img-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-.panel-header {
-  position: sticky; top: 0; z-index: 1;
-  background: var(--bg2);
-  padding: 13px 16px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-family: var(--font-head);
-  font-size: 14px;
   font-weight: 700;
-  color: var(--blue);
-  letter-spacing: .06em;
-  text-transform: uppercase;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  transition: background .15s;
 }
-.panel-close {
-  cursor: pointer; font-size: 20px; line-height: 1;
-  color: var(--muted); transition: color .15s;
+.send-btn:hover { background: #89b4fa; }
+ 
+/* ── Video panel ──────────────────────────────────────────────────────────── */
+#tae-video-panel { top: 20px; right: 20px; width: 480px; height: 300px; }
+ 
+.video-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 14px;
+  color: var(--muted);
 }
-.panel-close:hover { color: var(--text); }
-
+.video-placeholder i { font-size: 40px; opacity: .4; }
+.video-placeholder p { font-size: 11px; letter-spacing: .04em; opacity: .6; }
+ 
+/* ── Frame / detection panel ──────────────────────────────────────────────── */
+#tae-frame-panel { bottom: 20px; right: 20px; width: 400px; height: 480px; top: auto; }
+ 
+.frame-panel-body {
+  overflow-y: auto;
+  min-height: 0;
+}
+.frame-panel-body::-webkit-scrollbar { width: 4px; }
+.frame-panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+ 
+/* ── Message styles ───────────────────────────────────────────────────────── */
+.msg { margin-bottom: 10px; }
+.msg-time { font-size: 9px; color: var(--muted); margin-bottom: 3px; }
+.msg-bubble {
+  display: inline-block;
+  padding: 7px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  max-width: 94%;
+}
+.msg.user { text-align: right; }
+.msg.user .msg-time { text-align: right; }
+.msg.user .msg-bubble { background: var(--bg4); color: var(--text); text-align: left; }
+.msg.sys  .msg-bubble { background: var(--bg3); color: #a9b1d6; }
+ 
+/* ── Detection cards ──────────────────────────────────────────────────────── */
 .det-card {
   margin: 12px;
   border-radius: 8px;
   overflow: hidden;
   border: 1px solid var(--border);
 }
+.det-img { width: 100%; display: block; }
 .det-meta {
   padding: 8px 12px;
   font-size: 10px;
@@ -419,727 +395,897 @@ html, body { height:100%; background: var(--bg0); color: var(--text); font-famil
   line-height: 1.7;
 }
 .det-meta .label {
-  color: var(--accent); font-weight: 600; font-size: 11px;
-  margin-bottom: 3px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 11px;
+  margin-bottom: 3px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
 }
-
-/* ── Chat ────────────────────────────────────────────────────────────────── */
-.chat-wrap {
-  position: fixed;
-  bottom: 20px; left: 20px;
-  z-index: 100;
-  width: 370px;
-}
-.chat-box {
-  background: rgba(18,19,31,.97);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  box-shadow: 0 12px 40px rgba(0,0,0,.7);
-  backdrop-filter: blur(14px);
-}
-.chat-head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 14px; border-bottom: 1px solid var(--border);
-  cursor: pointer; user-select: none;
-}
-.chat-head-label {
-  font-family: var(--font-head); font-size: 12px; font-weight: 700;
-  letter-spacing: .1em; text-transform: uppercase; color: var(--blue);
-}
-.chat-head-chevron { color: var(--muted); font-size: 11px; transition: transform .2s; }
-.chat-msgs {
-  height: 260px; overflow-y: auto; padding: 12px 14px;
-}
-.chat-msgs::-webkit-scrollbar { width: 4px; }
-.chat-msgs::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-.chat-divider { height: 1px; background: var(--border); }
-.chat-input-row { padding: 10px 12px; }
-.chat-input-row form { display: flex; gap: 8px; }
-.chat-input-row input {
-  flex: 1; background: var(--bg3); border: 1px solid var(--border);
-  border-radius: 6px; padding: 8px 10px; color: var(--text);
-  font-family: var(--font-mono); font-size: 11px; outline: none;
-}
-.chat-input-row input:focus { border-color: var(--blue); }
-.send-btn {
-  background: var(--accent-dim); border: 1px solid var(--accent);
-  border-radius: 6px; padding: 8px 14px; cursor: pointer;
-  color: var(--accent); font-size: 14px; font-weight: 700;
-}
-.send-btn:hover { background: var(--accent); color: var(--bg0); }
-
-.msg {
-  display: flex; flex-direction: column; margin-bottom: 10px;
-}
-.msg.user { align-items: flex-end; }
-.msg.sys  { align-items: flex-start; }
-.msg-time { font-size: 9px; color: var(--muted); margin-bottom: 3px; }
-.msg-bubble {
-  max-width: 92%; padding: 8px 11px; border-radius: 8px;
-  font-size: 11px; line-height: 1.6;
-  background: var(--bg3); color: var(--text);
-}
-.msg.user .msg-bubble { background: var(--blue-dim); border: 1px solid var(--blue); }
-
-/* ── Video panel (left side) ─────────────────────────────────────────────── */
-.video-panel {
-  width: 420px;
-  min-width: 420px;
-  background: var(--bg1);
-  border-right: 1px solid var(--border);
-  display: none;
+ 
+/* ── Empty state ──────────────────────────────────────────────────────────── */
+.empty-state {
+  display: flex;
   flex-direction: column;
-  overflow: hidden;
-  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  gap: 12px;
+  color: var(--muted);
+  text-align: center;
+  height: 100%;
 }
-.video-panel.open { display: flex; }
-
-.video-panel-header {
+.empty-state i  { font-size: 32px; opacity: .3; }
+.empty-txt { font-size: 11px; line-height: 1.7; opacity: .6; }
+ 
+/* ── Upload indicator ─────────────────────────────────────────────────────── */
+.htmx-indicator { display: none; }
+.htmx-request ~ .htmx-indicator,
+.htmx-request.htmx-indicator { display: inline-flex; align-items: center; gap: 6px; }
+ 
+@keyframes spin  { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+ 
+.spinner {
+  width: 12px; height: 12px;
+  border: 2px solid var(--accent);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+.pulse-txt { font-size: 11px; color: var(--accent); animation: pulse 1.4s ease infinite; }
+/* ── Mission selector ────────────────────────────────────────────────────── */
+.mission-selector {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
-  font-family: var(--font-head);
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--blue);
-  letter-spacing: .06em;
-  text-transform: uppercase;
-  flex-shrink: 0;
+  gap: 4px;
 }
-.video-panel-close {
-  cursor: pointer; font-size: 18px; color: var(--muted);
-}
-.video-panel-close:hover { color: var(--text); }
 
-.video-wrap {
-  position: relative;
-  background: #000;
-  flex-shrink: 0;
+.mission-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  transition: border-color .15s, background .15s;
+  max-width: 200px;
 }
-.video-wrap video {
-  width: 100%;
-  display: block;
-  max-height: 280px;
-  object-fit: contain;
+.mission-btn:hover { border-color: var(--blue); background: var(--blue-dim); }
+
+.m-active-name {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  max-width: 140px;
 }
-.bbox-overlay {
+
+.mission-cog {
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted);
+  font-size: 11px;
+  transition: background .12s, color .12s, border-color .15s;
+}
+.mission-cog:hover { background: var(--bg4); color: var(--text); border-color: var(--border-hi); }
+
+/* Mission dropdown */
+.mission-drop {
+  display: none;
   position: absolute;
-  top: 0; left: 0;
-  width: 100%; height: 100%;
-  pointer-events: none;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 240px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.7);
+  z-index: 800;
+  padding: 4px 0;
+  overflow: hidden;
+}
+.mission-drop.open { display: block; }
+
+.m-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background .12s;
+  font-size: 11px;
+}
+.m-item:hover { background: var(--bg3); }
+.m-item-active { background: var(--bg4); }
+
+.m-item-name {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-item-date {
+  color: var(--muted);
+  font-size: 9px;
+  margin-top: 1px;
 }
 
-.timeline-wrap {
-  padding: 10px 14px 6px;
+/* ── Settings drawer ─────────────────────────────────────────────────────── */
+.drawer-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.45);
+  z-index: 800;
+  backdrop-filter: blur(2px);
+}
+.drawer-overlay.open { display: block; }
+
+.drawer-panel {
+  display: none;
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 340px;
+  background: var(--bg1);
+  border-left: 1px solid var(--border);
+  z-index: 801;
+  flex-direction: column;
+  overflow-y: auto;
+  box-shadow: -8px 0 40px rgba(0,0,0,.6);
+}
+.drawer-panel.open { display: flex; }
+
+.drawer-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.timeline-label {
+.drawer-title {
+  font-family: var(--font-head);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  flex: 1;
+}
+.drawer-close {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 16px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color .12s, background .12s;
+}
+.drawer-close:hover { color: var(--text); background: var(--bg4); }
+
+.drawer-section {
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.drawer-sep { height: 1px; background: var(--border); flex-shrink: 0; }
+.drawer-label {
   font-size: 9px;
   color: var(--muted);
   letter-spacing: .1em;
   text-transform: uppercase;
-  margin-bottom: 5px;
-  display: flex;
-  justify-content: space-between;
+  font-family: var(--font-mono);
 }
-.timeline-canvas {
-  width: 100%;
-  height: 36px;
-  display: block;
-  cursor: pointer;
-  border-radius: 4px;
+.drawer-input, .drawer-textarea {
   background: var(--bg3);
   border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 11px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  outline: none;
+  transition: border-color .15s;
+  width: 100%;
 }
+.drawer-input:focus, .drawer-textarea:focus { border-color: var(--blue); }
+.drawer-textarea { resize: vertical; min-height: 80px; }
+.drawer-hint { font-size: 10px; color: var(--muted); line-height: 1.6; }
 
-.video-detlist {
-  flex: 1;
-  overflow-y: auto;
-  padding: 0 14px 12px;
+.drawer-save-btn {
+  background: var(--blue);
+  color: var(--bg0);
+  border: none;
+  border-radius: 6px;
+  padding: 8px 18px;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  transition: background .15s;
+  align-self: flex-start;
+  margin-top: 4px;
 }
-.video-detlist::-webkit-scrollbar { width: 4px; }
-.video-detlist::-webkit-scrollbar-thumb { background: var(--border); border-radius:2px; }
+.drawer-save-btn:hover { background: #89b4fa; }
 
-.video-det-row {
+.intent-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--border);
-  font-size: 10px;
-  cursor: pointer;
-}
-.video-det-row:hover { background: var(--bg3); margin: 0 -4px; padding: 6px 4px; border-radius:4px; }
-.video-det-time { color: var(--muted); font-size: 9px; white-space: nowrap; min-width: 44px; }
-.video-det-label { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.video-empty {
-  display: flex; flex-direction: column;
-  align-items: center; justify-content: center;
-  flex: 1; gap: 10px; padding: 30px;
-  text-align: center; color: var(--muted); font-size: 11px; line-height: 1.7;
-}
-
-.video-btn {
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 5px 11px;
   font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--muted);
-  cursor: pointer;
-  transition: border-color .15s, color .15s;
-}
-.video-btn:hover, .video-btn.active {
-  border-color: var(--blue);
   color: var(--text);
-  background: var(--blue-dim);
+  cursor: pointer;
+  padding: 3px 0;
 }
+.intent-row input[type="checkbox"] { accent-color: var(--blue); }
 
-.video-det-row.vdet-active {
-  background: var(--blue-dim) !important;
-  border-left: 2px solid var(--blue);
-  padding-left: 6px;
-  margin-left: -6px;
-}
-
-/* ── Live streaming ─────────────────────────────────────────────────────── */
-.live-btn {
-  background: none;
+.arch-btn, .del-btn {
+  background: var(--bg4);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 5px 11px;
+  padding: 7px 14px;
+  cursor: pointer;
   font-size: 11px;
   font-family: var(--font-mono);
   color: var(--muted);
+  transition: background .12s, color .12s;
+}
+.arch-btn:hover { color: var(--text); background: var(--bg3); }
+.del-btn:hover  { color: var(--danger); border-color: var(--danger); background: rgba(247,118,142,.08); }
+
+.del-confirm { display: none; flex-direction: column; gap: 6px; margin-top: 6px; }
+.del-confirm.open { display: flex; }
+.del-hint { font-size: 10px; color: var(--muted); }
+.del-confirm-input {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  outline: none;
+}
+.del-go {
+  background: rgba(247,118,142,.15);
+  border: 1px solid var(--danger);
+  border-radius: 5px;
+  padding: 7px 14px;
   cursor: pointer;
-  transition: border-color .15s, color .15s;
-  display: flex; align-items: center; gap: 6px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--danger);
+  transition: background .12s;
 }
-.live-btn:hover { border-color: #f87171; color: #f87171; }
-.live-btn.streaming {
-  border-color: #f87171;
-  color: #f87171;
-  background: rgba(248,113,113,.08);
+.del-go:hover { background: rgba(247,118,142,.25); }
+
+/* ── Detection panel ─────────────────────────────────────────────────────── */
+#tae-det-panel { top: 340px; right: 20px; width: 480px; height: 280px; }
+
+.pi-det { background: rgba(247,118,142,.16); color: var(--danger); }
+
+.det-panel-body {
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
 }
-.live-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  background: #f87171;
-  display: inline-block;
-  opacity: 0;
+.det-panel-body::-webkit-scrollbar { width: 4px; }
+.det-panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.det-rows-wrap { padding: 6px 0; }
+
+.det-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  cursor: pointer;
+  transition: background .12s;
+  border-bottom: 1px solid rgba(43,46,72,.5);
 }
-.live-btn.streaming .live-dot {
-  opacity: 1;
-  animation: live-pulse 1.2s ease-in-out infinite;
-}
-@keyframes live-pulse {
-  0%,100% { opacity: 1; transform: scale(1); }
-  50%      { opacity: .3; transform: scale(.7); }
-}
-.stream-form {
-  display: flex; flex-direction: column; gap: 10px;
-  padding: 14px;
-}
-.stream-form label { font-size: 9px; color: var(--muted); letter-spacing:.1em; text-transform:uppercase; }
-.stream-form input { width:100%; background:var(--bg3); border:1px solid var(--border);
-  border-radius:5px; padding:6px 9px; color:var(--text);
-  font-family:var(--font-mono); font-size:11px; outline:none; }
-.stream-form input:focus { border-color:var(--blue); }
-.stream-status {
-  font-size: 9px; color: var(--muted); padding: 8px 14px;
-  border-top: 1px solid var(--border);
-  display: flex; justify-content: space-between; align-items: center;
+.det-row:hover       { background: var(--bg3); }
+.det-row-active      { background: var(--bg4); border-left: 2px solid var(--blue); padding-left: 12px; }
+.det-row-label       { font-size: 11px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.det-row-meta        { font-size: 9px;  color: var(--muted); margin-top: 2px; }
+
+/* Timeline tooltip */
+#timeline-tooltip {
+  position: fixed;
+  background: rgba(14,15,26,.97);
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  pointer-events: none;
+  display: none;
+  z-index: 9999;
+  white-space: nowrap;
+  box-shadow: 0 4px 20px rgba(0,0,0,.7);
+  line-height: 1.7;
 }
 
-/* ── Tracking (Phase D) ─────────────────────────────────────────────────── */
-.track-btn {
-  background: none; border: 1px solid var(--border);
-  border-radius: 6px; padding: 5px 11px;
-  font-size: 11px; font-family: var(--font-mono);
-  color: var(--muted); cursor: pointer;
-  transition: border-color .15s, color .15s;
+/* ── Video panel content (output of /video_panel route) ─────────────────── */
+.video-panel-inner {
+  flex: 1; overflow-y: auto; display: flex; flex-direction: column; min-height: 0;
 }
-.track-btn:hover { border-color: #a78bfa; color: #a78bfa; }
-.track-btn.active { border-color: #a78bfa; color: #a78bfa; background: rgba(167,139,250,.08); }
+.video-panel-inner::-webkit-scrollbar { width: 4px; }
+.video-panel-inner::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-/* ── Misc ────────────────────────────────────────────────────────────────── */
-.htmx-indicator { display: none; }
-.htmx-request .htmx-indicator { display: flex; align-items: center; gap: 7px; }
-@keyframes spin  { to { transform: rotate(360deg); } }
-@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
-.spinner {
-  width: 14px; height: 14px;
-  border: 2px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin .7s linear infinite;
+.video-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px; border-bottom: 1px solid var(--border);
+  background: var(--bg3); flex-shrink: 0;
+  font-size: 11px; color: var(--muted);
 }
-.pulse-txt { font-size: 11px; color: var(--accent); animation: pulse 1.5s ease-in-out infinite; }
-
-.empty-state {
-  flex:1; display:flex; flex-direction:column;
-  align-items:center; justify-content:center;
-  gap:10px; padding:30px; text-align:center;
+.video-panel-close {
+  cursor: pointer; color: var(--muted); font-size: 16px;
+  line-height: 1; transition: color .15s;
 }
-.empty-txt { font-size:12px; color:var(--muted); line-height:1.7; }
-// ── Live streaming ───────────────────────────────────────────────────────
-let _streamPollTimer = null;
+.video-panel-close:hover { color: var(--text); }
 
-function openFeedPanel() {
-    closeDrawer();
-    const vp = document.getElementById('video-panel');
-    if (vp) {
-        vp.classList.add('open');
-        htmx.ajax('GET', '/feed_panel', { target: '#video-panel', swap: 'innerHTML' });
+.video-wrap { position: relative; flex: 1; min-height: 0; background: #000; }
+.video-wrap video { max-height: none !important; width: 100%; height: 100%; display: block; object-fit: contain; }
+.bbox-overlay {
+  position: absolute; top: 0; left: 0;
+  width: 100%; height: 100%; pointer-events: none;
+}
+.video-empty { padding: 24px; font-size: 12px; color: var(--muted); text-align: center; line-height: 1.7; }
+.timeline-wrap { padding: 6px 14px 8px; flex-shrink: 0; }
+.timeline-canvas { cursor: pointer; display: block; }
+.stream-status { flex-shrink: 0; }
+.video-detlist { padding: 0 14px 10px; flex-shrink: 0; font-size: 10px; color: var(--muted); }
+
+/* Detection images — below video in video panel */
+.tae-imgpanel-inner { border-top: 1px solid var(--border); overflow-y: auto; max-height: 340px; }
+.tae-imgpanel-inner::-webkit-scrollbar { width: 4px; }
+.tae-imgpanel-inner::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* panel-close used by /images/ route output */
+.panel-close { cursor: pointer; color: var(--muted); font-size: 16px; transition: color .15s; }
+.panel-close:hover { color: var(--text); }
+
+""")
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# JS
+# ─────────────────────────────────────────────────────────────────────────────
+_JS = Script("""
+// ══ Background dot-grid canvas ════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', function() {
+
+(function initBg() {
+  const canvas = document.getElementById('bg-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+ 
+  // Perfectly regular grid — no jitter, no random placement
+  const SPACING = 38;   // px between dots
+  const BASE_R  = 1.4;  // dim dot radius
+  const HI_R    = 2.4;  // bright node radius
+  const CONN    = 120;  // max connection distance between bright nodes
+ 
+  let W, H, dots = [], t = 0;
+ 
+  function buildDots() {
+    dots = [];
+    const cols = Math.ceil(W / SPACING) + 2;
+    const rows = Math.ceil(H / SPACING) + 2;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        // Deterministic bright pattern — every ~11th dot (spread evenly)
+        const bright = ((r * 7 + c * 3) % 11 === 0);
+        dots.push({
+          x:     c * SPACING,
+          y:     r * SPACING,
+          bright,
+          phase: (r * 0.7 + c * 1.3) % (Math.PI * 2),  // spread phases
+        });
+      }
     }
+  }
+ 
+  function resize() {
+    W = canvas.width  = canvas.parentElement.offsetWidth;
+    H = canvas.height = canvas.parentElement.offsetHeight;
+    buildDots();
+  }
+ 
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    t += 0.012;
+ 
+    // Connections between bright nodes
+    ctx.lineWidth = 0.6;
+    for (let i = 0; i < dots.length; i++) {
+      const a = dots[i];
+      if (!a.bright) continue;
+      for (let j = i + 1; j < dots.length; j++) {
+        const b = dots[j];
+        if (!b.bright) continue;
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < CONN) {
+          const alpha = (1 - dist / CONN) * 0.13;
+          ctx.strokeStyle = `rgba(122,162,247,${alpha.toFixed(3)})`;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+      }
+    }
+ 
+    // Dots
+    for (const d of dots) {
+      if (d.bright) {
+        const pulse = 0.55 + 0.45 * Math.sin(t + d.phase);
+        ctx.fillStyle = `rgba(122,162,247,${(0.55 * pulse).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, HI_R * (0.8 + 0.25 * pulse), 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        const breathe = 0.85 + 0.15 * Math.sin(t * 0.4 + d.phase);
+        ctx.fillStyle = `rgba(72,82,138,${(0.32 * breathe).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, BASE_R, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+ 
+    requestAnimationFrame(draw);
+  }
+ 
+  const ro = new ResizeObserver(resize);
+  ro.observe(canvas.parentElement);
+  resize();
+  draw();
+})();
+ 
+ 
+// ══ Panel system ══════════════════════════════════════════════════════════
+(function initPanels() {
+  let topZ = 200;
+ 
+  function focusPanel(panel) {
+    document.querySelectorAll('.tae-panel').forEach(p => p.classList.remove('is-focused'));
+    panel.classList.add('is-focused');
+    panel.style.zIndex = ++topZ;
+  }
+ 
+  function initPanel(panel) {
+    const header      = panel.querySelector('.panel-header');
+    const collapseBtn = panel.querySelector('[data-collapse]');
+    const resizeEl    = panel.querySelector('.panel-resize');
+ 
+    /* Focus */
+    panel.addEventListener('mousedown', () => focusPanel(panel), true);
+ 
+    /* Drag ---------------------------------------------------------------- */
+    let dragging = false, dragSX = 0, dragSY = 0, origX = 0, origY = 0;
+ 
+    header.addEventListener('mousedown', (e) => {
+      if (e.target.closest('.panel-controls')) return;
+      dragging = true;
+      dragSX   = e.clientX;
+      dragSY   = e.clientY;
+      origX    = panel.offsetLeft;
+      origY    = panel.offsetTop;
+      header.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+ 
+    /* Collapse ------------------------------------------------------------ */
+    if (collapseBtn) {
+      collapseBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isCollapsed = panel.classList.toggle('is-collapsed');
+ 
+        if (isCollapsed) {
+          // Pin height to header only; stash the previous height for restore
+          panel.dataset.prevH = panel.offsetHeight + 'px';
+          panel.style.height  = '44px';
+        } else {
+          // Restore — fall back to empty string if nothing was stored
+          panel.style.height = panel.dataset.prevH || '';
+        }
+ 
+        const icon = collapseBtn.querySelector('i');
+        if (icon) icon.className = isCollapsed ? 'fas fa-chevron-down' : 'fas fa-chevron-up';
+      });
+    }
+ 
+    /* Resize -------------------------------------------------------------- */
+    let resizing = false, rSX = 0, rSY = 0, rW = 0, rH = 0;
+    if (resizeEl) {
+      resizeEl.addEventListener('mousedown', (e) => {
+        resizing = true;
+        rSX = e.clientX; rSY = e.clientY;
+        rW  = panel.offsetWidth; rH = panel.offsetHeight;
+        e.preventDefault(); e.stopPropagation();
+      });
+    }
+ 
+    /* Global move/up ―― registered once per panel ----------------------- */
+    document.addEventListener('mousemove', (e) => {
+      if (dragging) {
+        let nx = origX + e.clientX - dragSX;
+        let ny = origY + e.clientY - dragSY;
+        nx = Math.max(0, Math.min(window.innerWidth  - panel.offsetWidth,  nx));
+        ny = Math.max(0, Math.min(window.innerHeight - 44,                 ny));
+        panel.style.left = nx + 'px';
+        panel.style.top  = ny + 'px';
+        panel.style.bottom = 'auto';  /* clear bottom/right anchors */
+        panel.style.right  = 'auto';
+      }
+      if (resizing) {
+        panel.style.width  = Math.max(260, rW + e.clientX - rSX) + 'px';
+        panel.style.height = Math.max(100, rH + e.clientY - rSY) + 'px';
+      }
+    });
+    document.addEventListener('mouseup', () => {
+      if (dragging) { dragging = false; header.style.cursor = 'grab'; }
+      resizing = false;
+    });
+  }
+ 
+  document.querySelectorAll('.tae-panel').forEach(initPanel);
+ 
+  /* Expose for panels injected later (e.g. frame panel after HTMX swap) */
+  window.taeInitPanel = initPanel;
+})();
+
+}); // DOMContentLoaded
+
+
+// ══ Map iframe → detection images ═════════════════════════════════════════
+// The map popup button does: window.parent.postMessage({type:'show_images', id:det_id})
+// We intercept it here and load the detection images into #tae-imgpanel (inside frame panel)
+window.addEventListener('message', function(e) {
+  if (!e.data || e.data.type !== 'show_images') return;
+  htmx.ajax('GET', '/images/' + e.data.id, {target: '#tae-imgpanel', swap: 'innerHTML'});
+  showPanel('tae-frame-panel');
+});
+
+// Ctrl+P = toggle coverage polygon
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.key === 'p') {
+    e.preventDefault();
+    htmx.ajax('GET', '/toggle_coverage', {target: '#tae-msgs', swap: 'beforeend'});
+    setTimeout(function() { scrollChat(); refreshMap(); }, 400);
+  }
+});
+ 
+ 
+// ══ Helpers ═══════════════════════════════════════════════════════════════
+function scrollChat() {
+  const el = document.getElementById('tae-msgs');
+  if (el) el.scrollTop = el.scrollHeight;
+}
+ 
+function refreshMap() {
+  const f = document.getElementById('tae-map-frame');
+  if (f) { const s = f.src; f.src = ''; f.src = s; }
+}
+ 
+function showPanel(id) {
+  const p = document.getElementById(id);
+  if (!p) return;
+  p.style.display = 'flex';
+  p.classList.remove('is-collapsed');
+  p.style.height = p.dataset.prevH || '';
+  // bring to front
+  document.querySelectorAll('.tae-panel').forEach(function(x){x.classList.remove('is-focused');});
+  p.classList.add('is-focused');
+}
+ 
+function closeImages() {
+  const p = document.getElementById('tae-frame-panel');
+  if (p) p.style.display = 'none';
+}
+ 
+/* Called by map marker click */
+function openImages(detId) {
+  showPanel('tae-frame-panel');
+}
+ 
+/* Timestamp used by map-refresh query param to bust cache */
+
+// ══ Feed / Video panel helpers ═══════════════════════════════════════════════
+function openFeedPanel() {
+  showPanel('tae-video-panel');
+  htmx.ajax('GET', '/feed_panel', {target: '#video-panel', swap: 'innerHTML'});
 }
 
 function closeFeedPanel() {
-    // If video is loaded, switch back to video view; otherwise close panel
-    const vp = document.getElementById('video-panel');
-    if (!vp) return;
-    const hasVideo = document.getElementById('tae-video');
-    if (hasVideo) {
-        htmx.ajax('GET', '/video_panel', { target: '#video-panel', swap: 'innerHTML' });
-    } else {
-        vp.classList.remove('open');
-    }
-}
-
-function startStream(e) {
-    e.preventDefault();
-    const url = document.getElementById('stream-url').value.trim();
-    const lat = parseFloat(document.getElementById('stream-lat').value) || 0;
-    const lon = parseFloat(document.getElementById('stream-lon').value) || 0;
-    if (!url) return;
-    fetch('/stream/start', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({url, lat, lon})
-    }).then(r => r.json()).then(d => {
-        if (d.ok) {
-            const dot = document.getElementById('live-dot-nav');
-            if (dot) dot.style.display = 'inline-block';
-            htmx.ajax('GET', '/stream/panel', { target: '#video-panel', swap: 'innerHTML' });
-            _streamPollTimer = setInterval(_pollStream, 5000);
-        } else {
-            alert('Stream error: ' + (d.error || 'unknown'));
-        }
-    });
-}
-
-function stopStream() {
-    fetch('/stream/stop', { method: 'POST' })
-        .then(() => {
-            const dot = document.getElementById('live-dot-nav');
-            if (dot) dot.style.display = 'none';
-            if (_streamPollTimer) { clearInterval(_streamPollTimer); _streamPollTimer = null; }
-            htmx.ajax('GET', '/feed_panel', { target: '#video-panel', swap: 'innerHTML' });
-        });
-}
-
-function _pollStream() {
-    fetch('/stream/status').then(r => r.json()).then(d => {
-        const el = document.getElementById('stream-frame-count');
-        if (el) el.textContent = d.frame_count + ' frames';
-        const lb = document.getElementById('live-btn');
-        const dot = document.getElementById('live-dot-nav');
-        if (dot) dot.style.display = d.running ? 'inline-block' : 'none';
-        if (!d.running) {
-            clearInterval(_streamPollTimer); _streamPollTimer = null;
-        }
-        if (d.running) refreshMap();
-    });
-}
-
-// ── Object tracking (Phase D) ───────────────────────────────────────────
-let _trackPollTimer = null;
-
-function openTrackPanel() {
-    const query = prompt(
-        'Track query — describe objects to track:\n'
-        + '  e.g. "vehicle", "car", "person", "building"\n\n'
-        + 'YOLO-World will scan every frame for these objects.'
-    );
-    if (!query) return;
-    const conf = 0.15;
-    fetch('/track', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({query, confidence: conf})
-    }).then(r => r.json()).then(d => {
-        if (d.ok) {
-            document.getElementById('track-btn').classList.add('active');
-            _trackPollTimer = setInterval(_pollTracking, 2000);
-            // Show progress in chat
-            htmx.ajax('GET', '/track_progress', {target:'#tae-msgs', swap:'beforeend'});
-        } else {
-            alert('Tracking error: ' + (d.error || 'unknown'));
-        }
-    });
-}
-
-function _pollTracking() {
-    fetch('/track_progress').then(r => r.json()).then(d => {
-        const pct = d.total > 0 ? Math.round(d.done/d.total*100) : 0;
-        const btn = document.getElementById('track-btn');
-        if (btn) btn.title = d.running
-            ? `Tracking… ${d.done}/${d.total} frames (${pct}%)`
-            : (d.n_tracks != null ? `${d.n_tracks} track(s) — click to re-run` : 'Track objects');
-        if (!d.running) {
-            clearInterval(_trackPollTimer); _trackPollTimer = null;
-            if (btn) btn.classList.remove('active');
-            refreshMap();
-            if (d.n_tracks != null) {
-                const msg = document.createElement('div');
-                msg.className = 'msg sys-msg';
-                msg.textContent = `Tracking complete: ${d.n_tracks} track(s) for '${d.query}'.`;
-                const chat = document.getElementById('tae-msgs');
-                if (chat) { chat.appendChild(msg); scrollChat(); }
-            }
-        }
-    });
-}
-
-""")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# JavaScript
-# ─────────────────────────────────────────────────────────────────────────────
-
-_JS = Script("""
-function scrollChat() {
-    const el = document.getElementById('tae-msgs');
-    if (el) el.scrollTop = el.scrollHeight;
-}
-
-function refreshMap() {
-    const f = document.getElementById('tae-map-frame');
-    if (f) f.src = '/map?' + Date.now();
-}
-
-// ── Mission dropdown toggle ───────────────────────────────────────────────
-function toggleMissionDropdown() {
-    const chip = document.querySelector('.m-chip');
-    const dd   = document.getElementById('m-dropdown');
-    const open = dd.classList.toggle('open');
-    chip.classList.toggle('open', open);
-}
-
-document.addEventListener('click', function(e) {
-    if (!e.target.closest('.m-chip-wrap')) {
-        const dd   = document.getElementById('m-dropdown');
-        const chip = document.querySelector('.m-chip');
-        if (dd)   dd.classList.remove('open');
-        if (chip) chip.classList.remove('open');
-    }
-});
-
-// ── Settings drawer ───────────────────────────────────────────────────────
-function openDrawer() {
-    const dd   = document.getElementById('m-dropdown');
-    const chip = document.querySelector('.m-chip');
-    if (dd)   dd.classList.remove('open');
-    if (chip) chip.classList.remove('open');
-    document.getElementById('tae-imgpanel').classList.remove('open');
-    document.getElementById('settings-drawer').classList.add('open');
-    document.querySelector('.cfg-btn').classList.add('active');
-}
-
-function closeDrawer() {
-    document.getElementById('settings-drawer').classList.remove('open');
-    document.querySelector('.cfg-btn').classList.remove('active');
-}
-
-function toggleDeleteConfirm() {
-    document.getElementById('del-confirm-box').classList.toggle('show');
-}
-
-// ── Map / image panel messages ────────────────────────────────────────────
-window.addEventListener('message', function(e) {
-    if (!e.data || e.data.type !== 'show_images') return;
-    const detId = e.data.id;
-    // Show image panel
-    closeDrawer();
-    htmx.ajax('GET', '/images/' + detId, {
-        target: '#tae-imgpanel', swap: 'innerHTML'
-    });
-    document.getElementById('tae-imgpanel').classList.add('open');
-    // Fix 4: if video panel is open, sync it
-    const vp = document.getElementById('video-panel');
-    if (vp && vp.classList.contains('open')) {
-        const det = _vDets.find(d => d.id === detId);
-        if (det) {
-            if (det.timestamp_ms !== null && det.timestamp_ms !== undefined)
-                seekToDet(det.timestamp_ms);
-            _highlightDetRow(detId);
-        }
-    }
-});
-
-function closeImages() {
-    document.getElementById('tae-imgpanel').classList.remove('open');
-}
-
-document.addEventListener('keydown', function(e) {
-    if (e.ctrlKey && e.key === 'p') {
-        e.preventDefault();
-        htmx.ajax('GET', '/toggle_coverage', {
-            target: '#tae-msgs', swap: 'beforeend'
-        });
-        setTimeout(() => { scrollChat(); refreshMap(); }, 400);
-    }
-    if (e.key === 'Escape') { closeDrawer(); }
-});
-
-// ── Video panel ───────────────────────────────────────────────────────────
-let _vDets   = [];   // [{id,timestamp_ms,color,confirmed,label,bbox,tile_x,tile_y,tile_w,tile_h}]
-let _vDurMs  = 0;
-
-function openVideoPanel() {
-    // Close other panels safely, guarding against missing elements
-    const sd = document.getElementById('settings-drawer');
-    if (sd) sd.classList.remove('open');
-    const cfg = document.querySelector('.cfg-btn');
-    if (cfg) cfg.classList.remove('active');
-    document.getElementById('tae-imgpanel').classList.remove('open');
-    document.getElementById('video-panel').classList.add('open');
-    document.querySelector('.video-btn').classList.add('active');
-    htmx.ajax('GET', '/video_panel', {
-        target: '#video-panel', swap: 'innerHTML'
-    });
+  htmx.ajax('GET', '/video_panel', {target: '#video-panel', swap: 'innerHTML'});
 }
 
 function closeVideoPanel() {
-    document.getElementById('video-panel').classList.remove('open');
-    const btn = document.querySelector('.video-btn');
-    if (btn) btn.classList.remove('active');
+  var p = document.getElementById('tae-video-panel');
+  if (p) p.style.display = 'none';
 }
+
+function startStream(event) {
+  var url = (document.getElementById('stream-url') || {}).value || '';
+  var lat = parseFloat((document.getElementById('stream-lat') || {}).value || '0');
+  var lon = parseFloat((document.getElementById('stream-lon') || {}).value || '0');
+  fetch('/stream/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url: url, lat: lat, lon: lon})
+  }).then(function(r){return r.json();}).then(function(d){
+    if (d.ok) htmx.ajax('GET', '/stream/panel', {target: '#video-panel', swap: 'innerHTML'});
+    else alert('Stream error: ' + d.error);
+  });
+}
+
+function stopStream() {
+  fetch('/stream/stop', {method:'POST'})
+    .then(function(){htmx.ajax('GET','/stream/panel',{target:'#video-panel',swap:'innerHTML'});});
+}
+
+// ── Video playback ────────────────────────────────────────────────────────────
+var _videoDets = [];
 
 function onVideoMeta() {
-    const v = document.getElementById('tae-video');
-    if (!v) return;
-    _vDurMs = v.duration * 1000;
-    _loadVideoDetections();
-}
-
-function _loadVideoDetections() {
-    fetch('/video_detections')
-        .then(r => r.json())
-        .then(data => {
-            _vDets = data;
-            _drawTimeline(0);
-            _updateDetList();
-            // If no detections yet, poll until background replay delivers them
-            if (data.length === 0) {
-                _pollForDetections();
-            }
-        });
-}
-
-function _pollForDetections() {
-    let attempts = 0;
-    const timer = setInterval(() => {
-        attempts++;
-        fetch('/detections_ready')
-            .then(r => r.json())
-            .then(d => {
-                if (d.ready && d.count > 0) {
-                    clearInterval(timer);
-                    _loadVideoDetections();
-                    refreshMap();
-                } else if (attempts > 30) {  // give up after 60s
-                    clearInterval(timer);
-                }
-            });
-    }, 2000);
+  fetch('/video_detections').then(function(r){return r.json();}).then(function(data){
+    _videoDets = data;
+    _drawTimeline();
+    _initTimelineTooltip();
+    refreshDetPanel();
+  });
 }
 
 function onVideoTime() {
-    const v = document.getElementById('tae-video');
-    if (!v) return;
-    const ms = v.currentTime * 1000;
-    _drawTimeline(ms);
-    _drawBboxes(ms);
-    const el = document.getElementById('vtime');
-    if (el) el.textContent = _fmtTime(v.currentTime) + ' / ' + _fmtTime(v.duration || 0);
-    // Fix 3: highlight closest detection every 2s to avoid thrashing
-    if (!onVideoTime._last || ms - onVideoTime._last > 2000) {
-        onVideoTime._last = ms;
-        _highlightClosestDet(ms);
+  var v = document.getElementById('tae-video');
+  var el = document.getElementById('vtime');
+  if (v && el) {
+    var s = Math.floor(v.currentTime);
+    el.textContent = Math.floor(s/60) + ':' + String(s%60).padStart(2,'0');
+  }
+  _drawBbox();
+}
+
+function seekVideo(event) {
+  var canvas = document.getElementById('timeline-canvas');
+  var v = document.getElementById('tae-video');
+  if (!canvas || !v || !v.duration) return;
+  var rect = canvas.getBoundingClientRect();
+  v.currentTime = ((event.clientX - rect.left) / rect.width) * v.duration;
+}
+
+function _drawTimeline() {
+  var canvas = document.getElementById('timeline-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var v = document.getElementById('tae-video');
+  if (!v || !v.duration) return;
+  var W = canvas.offsetWidth, H = 36;
+  canvas.width = W; canvas.height = H;
+  ctx.fillStyle = '#1b1d30';
+  ctx.fillRect(0,0,W,H);
+  _videoDets.forEach(function(d) {
+    if (d.timestamp_ms == null) return;
+    var x = (d.timestamp_ms / (v.duration * 1000)) * W;
+    ctx.fillStyle = d.color || '#4ade80';
+    ctx.fillRect(Math.max(0, x-2), 4, 4, H-8);
+  });
+}
+
+function _drawBbox() {
+  var canvas = document.getElementById('bbox-canvas');
+  var v = document.getElementById('tae-video');
+  if (!canvas || !v) return;
+  var ctx = canvas.getContext('2d');
+  canvas.width  = canvas.offsetWidth;
+  canvas.height = canvas.offsetHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  var nowMs = v.currentTime * 1000, tol = 2000;
+  var frameW = v.videoWidth  || 1920;
+  var frameH = v.videoHeight || 1080;
+
+  // Compute the actual video-content rect inside the canvas
+  // (object-fit:contain adds letterbox / pillarbox bars)
+  var cW = canvas.width, cH = canvas.height;
+  var vAspect = frameW / frameH;
+  var cAspect = cW / cH;
+  var vx, vy, vw, vh;
+  if (vAspect > cAspect) {
+    // wider than canvas — bars top & bottom
+    vw = cW; vh = cW / vAspect;
+    vx = 0;  vy = (cH - vh) / 2;
+  } else {
+    // taller than canvas — bars left & right
+    vh = cH; vw = cH * vAspect;
+    vy = 0;  vx = (cW - vw) / 2;
+  }
+  var sx = vw / frameW;
+  var sy = vh / frameH;
+
+  _videoDets.forEach(function(d) {
+    if (d.timestamp_ms == null) return;
+    if (Math.abs(d.timestamp_ms - nowMs) > tol) return;
+    var b = d.bbox;
+    if (!b || b.length !== 4) return;
+
+    // bbox is relative to the tile; tile is positioned in the full frame
+    var tx = d.tile_x || 0, ty = d.tile_y || 0;
+    var x1 = vx + (tx + b[0]) * sx;
+    var y1 = vy + (ty + b[1]) * sy;
+    var x2 = vx + (tx + b[2]) * sx;
+    var y2 = vy + (ty + b[3]) * sy;
+
+    ctx.strokeStyle = d.color || '#4ade80';
+    ctx.lineWidth = Math.max(1.5, 2 * sx);
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  });
+}
+
+
+// ══ Detection selection — syncs Frame, Video, Map ═════════════════════════
+function selectDetection(detId, lat, lon, tsMs) {
+  // Frame panel: load detection image
+  htmx.ajax('GET', '/images/' + detId, {target: '#tae-imgpanel', swap: 'innerHTML'});
+  showPanel('tae-frame-panel');
+
+  // Video: seek to timestamp; only reveal panel if hidden (don't reset its size)
+  var v = document.getElementById('tae-video');
+  if (v && tsMs != null) {
+    v.currentTime = tsMs / 1000;
+    var _vp = document.getElementById('tae-video-panel');
+    if (_vp && (_vp.style.display === 'none' || _vp.classList.contains('is-collapsed'))) {
+      showPanel('tae-video-panel');
     }
+  }
+
+  // Map: recentre (rebuilds map server-side, then refreshes iframe)
+  fetch('/set_map_focus?det_id=' + encodeURIComponent(detId))
+    .then(function(r) { return r.json(); })
+    .then(function(d) { if (d.ok) refreshMap(); });
+
+  // Highlight selected row
+  document.querySelectorAll('.det-row').forEach(function(r) {
+    r.classList.remove('det-row-active');
+  });
+  var row = document.getElementById('det-row-' + detId);
+  if (row) {
+    row.classList.add('det-row-active');
+    row.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  }
 }
 
-function _fmtTime(s) {
-    if (!isFinite(s)) return '0:00';
-    const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-    return m + ':' + String(sec).padStart(2, '0');
+// ══ Detection panel refresh (called after a query completes) ══════════════
+function refreshDetPanel() {
+  var el = document.getElementById('det-panel-list');
+  if (el) htmx.ajax('GET', '/detections_panel_content', {target: '#det-panel-list', swap: 'innerHTML'});
 }
 
-function _drawTimeline(curMs) {
-    const c = document.getElementById('timeline-canvas');
-    if (!c || !_vDurMs) return;
-    const ctx = c.getContext('2d');
-    c.width = c.offsetWidth; c.height = c.offsetHeight;
-    const w = c.width, h = c.height, pad = 8;
+// ══ Timeline tooltip ═══════════════════════════════════════════════════════
+var _ttEl = null;
 
-    // Background
-    ctx.fillStyle = '#1a1b2e';
-    ctx.fillRect(0, 0, w, h);
+function _initTimelineTooltip() {
+  var canvas = document.getElementById('timeline-canvas');
+  if (!canvas || canvas._ttInit) return;
+  canvas._ttInit = true;
 
-    // Track line
-    ctx.fillStyle = '#2a2c45';
-    ctx.fillRect(pad, h/2 - 2, w - pad*2, 4);
+  if (!_ttEl) {
+    _ttEl = document.createElement('div');
+    _ttEl.id = 'timeline-tooltip';
+    document.body.appendChild(_ttEl);
+  }
 
-    // Detection markers — coloured dots at detection timestamps
-    const hasTimestamps = _vDets.some(d => d.timestamp_ms !== null && d.timestamp_ms !== undefined);
-    if (!hasTimestamps && _vDets.length === 0) {
-        // Show hint in empty state
-        ctx.fillStyle = '#3a3c55';
-        ctx.font = '9px JetBrains Mono, monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('Run a query to place detection markers', w/2, h/2 + 3);
-        ctx.textAlign = 'left';
-    } else {
-        for (const d of _vDets) {
-            if (d.timestamp_ms === null || d.timestamp_ms === undefined) continue;
-            const x = pad + (d.timestamp_ms / _vDurMs) * (w - pad*2);
-            ctx.fillStyle = d.color || '#4ade80';
-            ctx.beginPath();
-            ctx.arc(x, h/2, d.confirmed ? 6 : 4, 0, Math.PI*2);
-            ctx.fill();
-            if (!d.confirmed) {
-                ctx.strokeStyle = d.color || '#4ade80';
-                ctx.lineWidth = 1.5;
-                ctx.stroke();
-            }
-        }
+  canvas.addEventListener('mousemove', function(e) {
+    var v = document.getElementById('tae-video');
+    if (!v || !v.duration || !_videoDets.length) {
+      _ttEl.style.display = 'none'; return;
     }
+    var rect   = canvas.getBoundingClientRect();
+    var pct    = (e.clientX - rect.left) / rect.width;
+    var hoverMs = pct * v.duration * 1000;
+    var tol    = v.duration * 1000 * 0.025;  // 2.5% of total duration
 
-    // Playhead — white vertical bar showing current position
-    if (_vDurMs > 0) {
-        const x = pad + (curMs / _vDurMs) * (w - pad*2);
-        ctx.fillStyle = 'rgba(255,255,255,0.85)';
-        ctx.fillRect(x - 1, 3, 2, h - 6);
-        // Triangle tick above
-        ctx.fillStyle = '#ffffff';
-        ctx.beginPath();
-        ctx.moveTo(x - 4, 2);
-        ctx.lineTo(x + 4, 2);
-        ctx.lineTo(x, 7);
-        ctx.fill();
+    var near = _videoDets.filter(function(d) {
+      return d.timestamp_ms != null && Math.abs(d.timestamp_ms - hoverMs) < tol;
+    });
+
+    if (!near.length) { _ttEl.style.display = 'none'; return; }
+
+    _ttEl.innerHTML = near.map(function(d) {
+      var ts = '';
+      if (d.timestamp_ms != null) {
+        var s = Math.floor(d.timestamp_ms / 1000);
+        ts = ' <span style="color:var(--muted)">'+Math.floor(s/60)+':'+(''+(s%60)).padStart(2,'0')+'</span>';
+      }
+      var sym = d.confirmed ? '●' : '○';
+      return '<span style="color:' + (d.color||'#4ade80') + '">' + sym + '</span> ' + d.label + ts;
+    }).join('<br>');
+
+    _ttEl.style.display = 'block';
+    _ttEl.style.left    = (e.clientX + 14) + 'px';
+    _ttEl.style.top     = (e.clientY - _ttEl.offsetHeight - 8) + 'px';
+  });
+
+  canvas.addEventListener('mouseleave', function() {
+    if (_ttEl) _ttEl.style.display = 'none';
+  });
+
+  // Also make timeline clickable to both seek AND open nearest detection
+  canvas.addEventListener('click', function(e) {
+    var v = document.getElementById('tae-video');
+    if (!v || !v.duration) return;
+    var rect   = canvas.getBoundingClientRect();
+    var pct    = (e.clientX - rect.left) / rect.width;
+    var hoverMs = pct * v.duration * 1000;
+    var tol    = v.duration * 1000 * 0.025;
+
+    var near = _videoDets.filter(function(d) {
+      return d.timestamp_ms != null && Math.abs(d.timestamp_ms - hoverMs) < tol;
+    });
+    if (near.length) {
+      var d = near[0];
+      selectDetection(d.id, d.lat, d.lon, d.timestamp_ms);
     }
+  }, true);  // capture so it fires before the existing onclick seekVideo
 }
 
-function seekVideo(e) {
-    const c = document.getElementById('timeline-canvas');
-    const v = document.getElementById('tae-video');
-    if (!c || !v || !_vDurMs) return;
-    const r = c.getBoundingClientRect();
-    const pad = 8;
-    const frac = Math.max(0, Math.min(1, (e.clientX - r.left - pad) / (c.offsetWidth - pad*2)));
-    const targetMs = frac * _vDurMs;
-    v.currentTime = targetMs / 1000;
-    _highlightClosestDet(targetMs);   // Fix 3: sync detection list
+
+// ══ Mission selector ══════════════════════════════════════════════════════
+function toggleMissionDrop(e) {
+  e.stopPropagation();
+  var drop = document.getElementById('mission-drop');
+  if (!drop) return;
+  drop.classList.toggle('open');
 }
 
-function seekToDet(ms) {
-    const v = document.getElementById('tae-video');
-    if (!v || ms === undefined || ms === null) return;
-    v.currentTime = ms / 1000;
-    v.pause();
-    _highlightClosestDet(ms);   // Fix 3: sync list
+// Close mission drop when clicking elsewhere
+document.addEventListener('click', function(e) {
+  var drop = document.getElementById('mission-drop');
+  if (drop && !drop.closest('.mission-selector').contains(e.target)) {
+    drop.classList.remove('open');
+  }
+});
+
+// ══ Settings drawer ════════════════════════════════════════════════════════
+function openDrawer(missionId) {
+  document.getElementById('mission-drop').classList.remove('open');
+  var overlay = document.getElementById('drawer-overlay');
+  var panel   = document.getElementById('drawer-panel');
+  var content = document.getElementById('drawer-content');
+  if (!overlay || !panel || !content) return;
+  overlay.classList.add('open');
+  panel.classList.add('open');
+  htmx.ajax('GET', '/missions/' + missionId + '/drawer',
+    {target: '#drawer-content', swap: 'innerHTML'});
 }
 
-// Fix 3: highlight the detection in the list closest to timestamp ms
-function _highlightClosestDet(ms) {
-    let bestId = null, bestDist = Infinity;
-    for (const d of _vDets) {
-        if (d.timestamp_ms === null || d.timestamp_ms === undefined) continue;
-        const dist = Math.abs(d.timestamp_ms - ms);
-        if (dist < bestDist) { bestDist = dist; bestId = d.id; }
-    }
-    if (bestId && bestDist < 4000) {   // within 4 seconds
-        _highlightDetRow(bestId);
-        const det = _vDets.find(d => d.id === bestId);
-        if (det && det.lat != null) _centerMapOnDet(det.lat, det.lon);  // Fix 4
-    }
+function closeDrawer() {
+  var overlay = document.getElementById('drawer-overlay');
+  var panel   = document.getElementById('drawer-panel');
+  if (overlay) overlay.classList.remove('open');
+  if (panel)   panel.classList.remove('open');
 }
 
-// Fix 3: scroll & highlight a detection row by id
-function _highlightDetRow(detId) {
-    document.querySelectorAll('.video-det-row.vdet-active')
-            .forEach(r => r.classList.remove('vdet-active'));
-    const row = document.querySelector('.video-det-row[data-id="' + detId + '"]');
-    if (row) {
-        row.classList.add('vdet-active');
-        row.scrollIntoView({block: 'nearest', behavior: 'smooth'});
-    }
+function toggleDeleteConfirm() {
+  var box = document.getElementById('del-confirm-box');
+  if (box) box.classList.toggle('open');
 }
 
-// Fix 4: tell the Leaflet map iframe to pan to lat/lon
-function _centerMapOnDet(lat, lon) {
-    const frame = document.getElementById('tae-map-frame');
-    if (frame && frame.contentWindow)
-        frame.contentWindow.postMessage({type:'center_on', lat, lon, zoom:18}, '*');
-}
-
-function _drawBboxes(curMs) {
-    const c = document.getElementById('bbox-canvas');
-    const v = document.getElementById('tae-video');
-    if (!c || !v) return;
-    c.width  = v.clientWidth;
-    c.height = v.clientHeight;
-    const ctx = c.getContext('2d');
-    ctx.clearRect(0, 0, c.width, c.height);
-    if (!v.videoWidth) return;
-    const sx = c.width  / v.videoWidth;
-    const sy = c.height / v.videoHeight;
-    const WIN = 800;   // ms window around detection timestamp
-    for (const d of _vDets) {
-        if (!d.bbox || d.timestamp_ms === undefined) continue;
-        if (Math.abs((d.timestamp_ms || 0) - curMs) > WIN) continue;
-        const [b0,b1,b2,b3] = d.bbox;
-        const x1 = ((d.tile_x||0) + b0) * sx;
-        const y1 = ((d.tile_y||0) + b1) * sy;
-        const x2 = ((d.tile_x||0) + b2) * sx;
-        const y2 = ((d.tile_y||0) + b3) * sy;
-        const alpha = 1 - Math.abs((d.timestamp_ms||0) - curMs) / WIN;
-        ctx.globalAlpha = 0.4 + 0.6 * alpha;
-        ctx.strokeStyle = d.color || '#4ade80';
-        ctx.lineWidth   = 2;
-        ctx.strokeRect(x1, y1, x2-x1, y2-y1);
-        if (d.label) {
-            ctx.fillStyle = d.color || '#4ade80';
-            ctx.font = '11px JetBrains Mono, monospace';
-            ctx.fillText(d.label.slice(0,24), x1+2, y1 > 14 ? y1-4 : y1+14);
-        }
-    }
-    ctx.globalAlpha = 1;
-}
-
-function _updateDetList() {
-    const el = document.getElementById('video-det-list');
-    if (!el) return;
-    if (!_vDets.length) { el.innerHTML = '<div style="color:var(--muted);font-size:10px;padding:8px 0">No detections yet</div>'; return; }
-    const sorted = [..._vDets].filter(d => d.timestamp_ms !== undefined)
-                              .sort((a,b) => a.timestamp_ms - b.timestamp_ms);
-    el.innerHTML = sorted.map(d => {
-        const t = _fmtTime((d.timestamp_ms||0)/1000);
-        const dot = d.confirmed ? '●' : '○';
-        return '<div class="video-det-row" data-id="' + d.id + '"'
-             + ' onclick="seekToDet(' + d.timestamp_ms + ')">' 
-             + '<span class="video-det-time">' + t + '</span>'
-             + '<span style="color:' + (d.color||'#4ade80') + ';margin-right:5px">' + dot + '</span>'
-             + '<span class="video-det-label">' + (d.label||'').slice(0,40) + '</span>'
-             + '</div>';
-    }).join('');
-}
-
+""" + "window._mapTs = () => Date.now();" + """
 """)

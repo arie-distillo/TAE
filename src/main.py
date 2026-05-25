@@ -13,6 +13,7 @@ import shutil
 import time
 from pathlib import Path
 from datetime import datetime
+from types import GeneratorType
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -307,7 +308,7 @@ app, rt = fast_app(
         _JS,
     ),
     pico=False,
-    bodykw={"style": "margin:0"},
+    bodykw={"style": "margin:0;background:#080910;overflow:hidden"},
 )
 
 
@@ -330,85 +331,92 @@ def _fmt_mission_date(created_at: str) -> str:
     return d.strftime("%b %d")
 
 
-def _navbar() -> FT:
-    missions = mission_mgr.list_active()
-    archived = mission_mgr.list_archived()
-    cur_id   = _state.get("mission_id", "")
-    cur_name = _state.get("mission_name", "Default")
+def _navbar(ingested: bool = False, frame_count: int = 0, mission=None) -> FT:
+    # Resolve mission info from state (more reliable than parameter for live display)
+    mid          = _state.get("mission_id", "")
+    active_name  = _state.get("mission_name") or (mission.name if mission else "No mission")
+    missions     = mission_mgr.list_active()
 
     # Mission dropdown items
-    items = []
+    m_items = []
     for m in missions:
-        items.append(
+        is_active = (m.id == mid)
+        m_items.append(Div(
+            Span(cls="sdot" + (" active" if is_active else ""), style="flex-shrink:0"),
             Div(
-                Span(cls=f"sdot {'active' if m.id == cur_id else ''}"),
                 Span(m.name, cls="m-item-name"),
                 Span(_fmt_mission_date(m.created_at), cls="m-item-date"),
-                cls=f"m-item {'cur' if m.id == cur_id else ''}",
-                hx_post=f"/missions/{m.id}/activate",
-                hx_swap="none",
-                **{"hx-on::after-request": "location.reload()"},
-            )
-        )
-    items.append(Div(cls="m-sep"))
-    items.append(
-        Div(
-            "＋  New mission",
-            cls="m-new",
-            hx_get="/missions/new/drawer",
-            hx_target="#settings-drawer",
-            hx_swap="innerHTML",
-            onclick="openDrawer()",
-        )
-    )
-    if archived:
-        items.append(
-            Div(f"▸  Show archived ({len(archived)})", cls="m-archived",
-                hx_get="/missions/archived",
-                hx_target="#m-dropdown",
-                hx_swap="beforeend")
-        )
-
-    return Div(
-        # ── Mission chip + dropdown ──────────────────────────────────────────
-        Div(
-            Div(
-                Span(cls="sdot active"),
-                Span(cur_name, cls="m-chip-name", id="mission-chip-name"),
-                Span("▾", cls="m-chip-chev"),
-                cls="m-chip",
-                onclick="toggleMissionDropdown()",
+                style="display:flex;flex-direction:column;min-width:0",
             ),
-            Div(*items, cls="m-dropdown", id="m-dropdown"),
-            cls="m-chip-wrap",
-        ),
+            cls="m-item" + (" m-item-active" if is_active else ""),
+            hx_post=f"/missions/{m.id}/activate",
+            hx_swap="none",
+            **{"hx-on::after-request": "location.reload()"},
+        ))
 
-        # ── Settings icon ────────────────────────────────────────────────────
+    # "Show archived" row + "New mission" row
+    m_items.append(Div(
+        Div(style="flex:1;height:1px;background:var(--border)"),
+        style="padding:4px 12px",
+    ))
+    m_items.append(Div(
+        I(cls="fas fa-archive", style="color:var(--muted);font-size:10px"),
+        Span("Show archived", cls="m-item-name"),
+        cls="m-item",
+        hx_get="/missions/archived",
+        hx_target="#mission-drop-list",
+        hx_swap="beforeend",
+    ))
+    m_items.append(Div(
+        I(cls="fas fa-plus", style="color:var(--accent);font-size:10px"),
+        Span("New mission", cls="m-item-name", style="color:var(--accent)"),
+        cls="m-item",
+        onclick="openDrawer('new')",
+    ))
+
+    mission_selector = Div(
+        # Trigger button — shows active mission name
+        Button(
+            I(cls="fas fa-map-marker-alt", style="font-size:10px;color:var(--blue)"),
+            Span(active_name, cls="m-active-name", id="active-mission-name"),
+            I(cls="fas fa-chevron-down", style="font-size:8px;margin-left:4px;color:var(--muted)"),
+            cls="mission-btn",
+            onclick="toggleMissionDrop(event)",
+        ),
+        # Settings cog for active mission
         Button(
             I(cls="fas fa-cog"),
-            cls="cfg-btn",
+            cls="mission-cog",
             title="Mission settings",
-            hx_get=f"/missions/{cur_id}/drawer",
-            hx_target="#settings-drawer",
-            hx_swap="innerHTML",
-            onclick="openDrawer()",
+            onclick=f"openDrawer('{mid}')" if mid else "openDrawer('new')",
         ),
+        # Dropdown list
+        Div(
+            Div(*m_items, id="mission-drop-list"),
+            cls="mission-drop",
+            id="mission-drop",
+        ),
+        cls="mission-selector",
+    )
 
-        Div(cls="sep"),
+    if ingested:
+        dot_cls    = "sdot active"
+        status_txt = f"Index ready · {frame_count} frames"
+    else:
+        dot_cls    = "sdot"
+        status_txt = "No index · Upload images to begin"
+
+    return Div(
         Span("TAE", cls="brand"),
+        Span("Intelligence", cls="brand-sub"),
         Div(cls="sep"),
-
-        # ── Feed: opens settings drawer ───────────────────────────────────────
+        mission_selector,
+        Div(cls="sep"),
         Button(
             I(cls="fas fa-satellite-dish", style="font-size:11px"),
             " Feed",
             cls="upload-btn",
-            id="feed-btn",
-            title="Upload video/images or connect a live stream",
-            hx_get    = "/feed_drawer",
-            hx_target = "#settings-drawer",
-            hx_swap   = "innerHTML",
-            onclick   = "openDrawer()",
+            onclick="openFeedPanel()",
         ),
         Span(
             Span(cls="spinner"),
@@ -416,12 +424,19 @@ def _navbar() -> FT:
             id="upload-ind",
             cls="htmx-indicator",
         ),
-        Span(cls="live-dot", id="live-dot-nav",
-             style="width:7px;height:7px;border-radius:50%;background:#f87171;display:none"),
-        _status_badge(),
+        Div(cls="sep"),
+        _panel_toolbar(),
+        Span(
+            Span(cls=dot_cls),
+            status_txt,
+            id="tae-status",
+            cls="status-badge",
+            hx_swap_oob="true",
+        ),
         cls="tae-nav",
     )
-
+ 
+ 
 
 def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> FT:
     """Inner content of the settings drawer — shared by edit and create modes."""
@@ -523,53 +538,269 @@ def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> F
     )
 
 
-def _chat_panel(collapsed: bool = False) -> FT:
-    body_style = "" if not collapsed else "display:none"
-    chev_cls   = "fas fa-chevron-up" if not collapsed else "fas fa-chevron-down"
-
-    return Div(
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic panel factory
+# ─────────────────────────────────────────────────────────────────────────────
+def _panel(
+    panel_id: str,
+    icon_cls: str,          # e.g. "pi-map fas fa-map-marked-alt"
+    title: str,
+    body: FT | list,
+    foot: FT | None = None,
+    *,
+    panel_icon_cls: str = "pi-map",  # colour variant
+    extra_cls: str = "",
+    has_resize: bool = True,
+    collapsed: bool = False,
+) -> FT:
+    """
+    Renders a draggable / collapsible / resizable floating panel.
+ 
+    Structure
+    ─────────
+    .tae-panel#panel_id
+      .panel-header   ← drag handle
+        .panel-icon
+        .panel-title
+        .panel-controls
+          [collapse]  [close]
+      .panel-body     ← scrollable content
+        *body
+      .panel-foot?    ← optional sticky footer (e.g. chat input row)
+      .panel-resize   ← bottom-right corner drag
+    """
+    collapsed_cls = " is-collapsed" if collapsed else ""
+    chev_cls = "fas fa-chevron-down" if collapsed else "fas fa-chevron-up"
+ 
+    header = Div(
+        Div(I(cls=icon_cls), cls=f"panel-icon {panel_icon_cls}"),
+        Span(title, cls="panel-title"),
         Div(
-            Div(
-                Span("🎯  Query Theater", cls="chat-head-label"),
-                I(cls=f"{chev_cls} chat-head-chevron"),
-                cls="chat-head",
-                hx_get="/toggle_chat",
-                hx_target="#tae-chat-panel",
-                hx_swap="outerHTML",
+            Button(
+                I(cls=chev_cls),
+                **{"data-collapse": "1"},
+                cls="panel-btn",
+                title="Collapse / expand",
             ),
-            Div(
-                _msg("TAE ready. Upload imagery to build the theater index, "
-                     "then query in natural language.", "sys"),
-                id="tae-msgs",
-                cls="chat-msgs",
-                style=body_style,
-            ),
-            Div(cls="chat-divider", style=body_style),
-            Div(
-                Form(
-                    Input(placeholder='e.g. "Find a helipad marked H"',
-                          name="message", id="tae-query-input", autocomplete="off"),
-                    Button("→", type="submit", cls="send-btn"),
-                    hx_post="/query",
-                    hx_target="#tae-msgs",
-                    hx_swap="beforeend",
-                    hx_indicator="#query-ind",
-                    **{"hx-on::after-request":
-                       "document.getElementById('tae-query-input').value='';"
-                       "scrollChat(); refreshMap();"},
-                ),
-                Span(Span(cls="spinner"), Span("Querying…", cls="pulse-txt"),
-                     id="query-ind", cls="htmx-indicator",
-                     style="padding:0 12px 8px"),
-                cls="chat-input-row",
-                style=body_style,
-            ),
-            cls="chat-box",
+            cls="panel-controls",
         ),
-        id="tae-chat-panel",
-        cls="chat-wrap",
+        cls="panel-header",
+    )
+ 
+    children = [header]
+ 
+    if isinstance(body, (list, tuple, GeneratorType)):
+        body_div = Div(*body, cls="panel-body")
+    else:
+        body_div = Div(body, cls="panel-body")
+    children.append(body_div)
+ 
+    if foot:
+        children.append(Div(foot, cls="panel-foot"))
+ 
+    if has_resize:
+        children.append(Div(cls="panel-resize"))
+ 
+    cls = f"tae-panel{collapsed_cls} {extra_cls}".strip()
+    return Div(*children, id=panel_id, cls=cls)
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Map panel  (replaces .map-wrap + .img-panel in the old layout)
+# ─────────────────────────────────────────────────────────────────────────────
+def _map_panel() -> FT:
+    body = Div(
+        Iframe(src="/map", id="tae-map-frame"),
+        cls="panel-body map-panel-body",
+    )
+    return _panel(
+        panel_id="tae-map-panel",
+        icon_cls="fas fa-map-marked-alt",
+        panel_icon_cls="pi-map",
+        title="Tactical Map",
+        body=body,
+        has_resize=True,
+    )
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Chat panel  (replaces old _chat_panel)
+# ─────────────────────────────────────────────────────────────────────────────
+def _chat_panel(collapsed: bool = False) -> FT:
+    """
+    The query-theater chat widget.
+    This is the panel that gets swapped by HTMX on /toggle_chat —
+    NOTE: with the new JS collapse the /toggle_chat route is no longer
+    needed for collapse, but is kept for back-compat with existing hx_get calls.
+    """
+    from datetime import datetime
+ 
+    def _msg(content, role="sys"):
+        ts = datetime.now().strftime("%H:%M")
+        return Div(
+            Span(ts, cls="msg-time"),
+            Div(content, cls="msg-bubble"),
+            cls=f"msg {role}",
+        )
+ 
+    msgs_area = Div(
+        _msg("TAE ready. Upload imagery to build the theater index, "
+             "then query in natural language.", "sys"),
+        id="tae-msgs",
+        cls="chat-msgs",
+    )
+ 
+    input_row = Div(
+        Div(cls="chat-divider"),
+        Div(
+            Form(
+                Input(
+                    placeholder="e.g. 'white pickup truck near building'",
+                    id="tae-query-input",
+                    name="q",
+                    autocomplete="off",
+                    **{"hx-on:keydown":
+                       "if(event.key==='Enter'){event.preventDefault();"
+                       "htmx.trigger(this.closest('form'),'submit');}"},
+                ),
+                Button("Send", cls="send-btn",
+                       hx_post="/query",
+                       hx_target="#tae-msgs",
+                       hx_swap="beforeend",
+                       hx_include="#tae-query-input",
+                       **{"hx-on::after-request": "scrollChat();"}),
+                cls="chat-input-row",
+                **{"hx-on:submit": "event.preventDefault();"},
+            ),
+        ),
+    )
+ 
+    return _panel(
+        panel_id="tae-chat-panel",
+        icon_cls="fas fa-crosshairs",
+        panel_icon_cls="pi-chat",
+        title="Chat",
+        body=msgs_area,
+        foot=input_row,
+        has_resize=True,
+        collapsed=collapsed,
+        extra_cls="",
+    )
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Video panel
+# ─────────────────────────────────────────────────────────────────────────────
+def _video_panel() -> FT:
+    body = [
+        # #video-panel is the HTMX target used by /video_panel route AND the
+        # upload-route Script() that auto-activates the panel after video upload.
+        Div(
+            Div("No video uploaded yet — click Feed to upload.",
+                cls="video-empty"),
+            id="video-panel",
+            cls="video-panel-inner",
+            hx_get="/video_panel",
+            hx_trigger="load",
+            hx_swap="innerHTML",
+        ),
+    ]
+    return _panel(
+        panel_id="tae-video-panel",
+        icon_cls="fas fa-video",
+        panel_icon_cls="pi-video",
+        title="Video",
+        body=body,
+        has_resize=True,
+    )
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Frame / detection panel  (replaces old .img-panel + _image_panel_empty)
+# ─────────────────────────────────────────────────────────────────────────────
+def _image_panel_empty():
+    """
+    Kept for HTMX targets in existing routes — returns the inner content
+    that gets swapped into #tae-frame-panel .panel-body.
+    """
+    return (
+        Div(
+            I(cls="fas fa-search-location"),
+            P("Click a map marker to inspect detected objects.", cls="empty-txt"),
+            cls="empty-state",
+        ),
+    )
+ 
+ 
+def _frame_panel(hidden: bool = True) -> FT:
+    body = Div(
+        *_image_panel_empty(),
+        id="tae-imgpanel",
+        cls="frame-panel-body",
+    )
+    style = "display:none;" if hidden else ""
+    p = _panel(
+        panel_id="tae-frame-panel",
+        icon_cls="fas fa-search-location",
+        panel_icon_cls="pi-frame",
+        title="Frame",
+        body=body,
+        has_resize=True,
+    )
+    # Inject inline style for initial hide
+    if hidden:
+        p.attrs["style"] = style
+    return p
+ 
+ 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detection panel  — independent list of all detections
+# ─────────────────────────────────────────────────────────────────────────────
+def _det_panel() -> FT:
+    body = Div(
+        Div(
+            I(cls="fas fa-bullseye"),
+            P("No detections yet — run a query.", cls="empty-txt"),
+            cls="empty-state",
+        ),
+        id="det-panel-list",
+        cls="det-panel-body",
+        hx_get="/detections_panel_content",
+        hx_trigger="load",
+        hx_swap="innerHTML",
+    )
+    return _panel(
+        panel_id="tae-det-panel",
+        icon_cls="fas fa-bullseye",
+        panel_icon_cls="pi-det",
+        title="Detections",
+        body=body,
+        has_resize=True,
     )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Toolbar shortcut pills (show/hide panels)
+# ─────────────────────────────────────────────────────────────────────────────
+def _panel_toolbar() -> FT:
+    def _pill(label, panel_id, icon):
+        return Button(
+            I(cls=f"fas fa-{icon}"),
+            f" {label}",
+            cls="nav-pill-btn",
+            onclick=f"showPanel('{panel_id}')",
+        )
+ 
+    return Div(
+        _pill("Map",    "tae-map-panel",   "map-marked-alt"),
+        _pill("Chat",   "tae-chat-panel",  "crosshairs"),
+        _pill("Video",  "tae-video-panel", "video"),
+        _pill("Frame",  "tae-frame-panel",  "search-location"),
+        _pill("Detect", "tae-det-panel",    "bullseye"),
+        cls="nav-pill",
+    )
+ 
 
 def _image_panel_empty() -> tuple:
     return (
@@ -589,28 +820,56 @@ def _image_panel_empty() -> tuple:
 # Routes — pages
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _index_page(build_map_fn, state: dict) -> tuple:
+    """
+    Call this from your index() route:
+ 
+        @rt("/")
+        def index():
+            _build_map()
+            return _index_page(_build_map, _state)
+ 
+    Parameters
+    ----------
+    build_map_fn : callable — your existing _build_map() function
+    state        : the global _state dict
+    """
+    mission = state.get("mission")
+ 
+    return (
+        Title("TAE · Tactical Awareness Engine"),
+ 
+        # Navbar with panel toolbar
+        _navbar(
+            ingested=state.get("ingested", False),
+            frame_count=state.get("frame_count", 0),
+            mission=mission,
+        ),
+ 
+        # Workspace: dot-grid canvas + floating panels
+        Div(
+            Canvas(id="bg-canvas"),
+            _map_panel(),
+            _chat_panel(),
+            _video_panel(),
+            _frame_panel(hidden=True),
+            _det_panel(),
+            cls="tae-workspace",
+        ),
+        # Settings drawer — slides in from the right
+        Div(cls="drawer-overlay", id="drawer-overlay", onclick="closeDrawer()"),
+        Div(
+            Div(id="drawer-content"),
+            cls="drawer-panel",
+            id="drawer-panel",
+        ),
+    )
+ 
+ 
 @rt("/")
 def index():
     _build_map()
-    return (
-        Title("TAE · Tactical Awareness Engine"),
-        _navbar(),
-        Div(
-            Div(
-                id="video-panel",
-                cls="video-panel" + (" open" if _state.get("video_files") else ""),
-                hx_get="/video_panel" if _state.get("video_files") else None,
-                hx_trigger="load" if _state.get("video_files") else None,
-                hx_swap="innerHTML" if _state.get("video_files") else None,
-            ),
-            Div(Iframe(src="/map", id="tae-map-frame"), cls="map-wrap"),
-            Div(*_image_panel_empty(), id="tae-imgpanel", cls="img-panel"),
-            Div(id="settings-drawer", cls="settings-drawer"),
-            cls="tae-main",
-        ),
-        _chat_panel(),
-    )
-
+    return _index_page(_build_map, _state)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1203,7 +1462,6 @@ def video_panel_content():
     except Exception:
         pass
 
-    n_dets = len(_state.get("detections", {}))
 
     return (
         Div(
@@ -1244,17 +1502,6 @@ def video_panel_content():
             ),
             cls="timeline-wrap",
         ),
-        Div(
-            Div(
-                Span(f"{n_dets} detection(s)",
-                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                           "text-transform:uppercase"),
-                style="padding:8px 0 4px",
-            ),
-            Div("", id="video-det-list",
-                style="font-size:10px;color:var(--muted)"),
-            cls="video-detlist",
-        ),
     )
 
 
@@ -1286,6 +1533,71 @@ def video_detections():
             "tile_h":       det.get("tile_h", 640),
         })
     return JSONResponse(result)
+
+
+
+@rt("/detections_panel_content")
+def detections_panel_content():
+    """HTMX: renders the detection list for the Detection panel."""
+    dets     = _state.get("detections", {})
+    frame_ts = _state.get("frame_timestamps", {})
+
+    if not dets:
+        return Div(
+            I(cls="fas fa-bullseye"),
+            P("No detections yet — run a query.", cls="empty-txt"),
+            cls="empty-state",
+        )
+
+    rows = []
+    for det_id, det in dets.items():
+        label     = det.get("label", "Unknown")[:52]
+        color     = det.get("color", "#4ade80")
+        lat       = det.get("lat", 0)
+        lon       = det.get("lon", 0)
+        confirmed = det.get("confirmed", False)
+        source    = det.get("source", "")
+        ts_ms     = frame_ts.get(source)
+        if ts_ms is None:
+            ts_ms = frame_ts.get(Path(det.get("parent_path", "")).name)
+
+        ts_str = ""
+        if ts_ms is not None:
+            s = int(ts_ms / 1000)
+            ts_str = f"{s // 60}:{s % 60:02d}"
+
+        dot = "●" if confirmed else "○"
+        onclick = (
+            f"selectDetection('{det_id}',{lat},{lon},"
+            + (str(ts_ms) if ts_ms is not None else "null")
+            + ")"
+        )
+
+        rows.append(Div(
+            Span(dot, style=f"color:{color};font-size:14px;flex-shrink:0;line-height:1"),
+            Div(
+                Div(label, cls="det-row-label"),
+                Div(ts_str or source[:24], cls="det-row-meta"),
+                style="flex:1;min-width:0",
+            ),
+            id=f"det-row-{det_id}",
+            cls="det-row",
+            onclick=onclick,
+        ))
+
+    return Div(*rows, cls="det-rows-wrap")
+
+
+@rt("/set_map_focus")
+def set_map_focus(det_id: str = ""):
+    """Recentre map on a specific detection; called by selectDetection()."""
+    from starlette.responses import JSONResponse
+    det = _state.get("detections", {}).get(det_id)
+    if det:
+        _state["map_center"] = [det["lat"], det["lon"]]
+        _state["map_zoom"]   = 18
+        _build_map()
+    return JSONResponse({"ok": bool(det)})
 
 @rt("/map")
 def serve_map():
@@ -1864,9 +2176,7 @@ def images(det_id: str):
     det = _state["detections"].get(det_id)
     if not det:
         return (
-            Div(Span("Detection View"),
-                Span("×", cls="panel-close", onclick="closeImages()"),
-                cls="panel-header"),
+
             Div(P("Detection not found.", style="color:var(--danger);padding:20px"),
                 cls="empty-state"),
         )
@@ -1879,9 +2189,7 @@ def images(det_id: str):
         cls="det-meta", style="margin:0 12px 12px",
     )
     return (
-        Div(Span(f"📍 {det['label'][:36]}"),
-            Span("×", cls="panel-close", onclick="closeImages()"),
-            cls="panel-header"),
+
         Div(fv_widget, meta_div, cls="det-card"),
     )
 
@@ -1925,13 +2233,34 @@ def frame_view(det_id: str, mode: str = "tile"):
             return P("Could not load parent frame.", style="color:var(--danger);padding:12px")
     else:
         stored = det["img_urls"][0] if det.get("img_urls") else None
+        tile_data = None
         if stored and stored.startswith("/tile_img/"):
-            key     = stored.split("/")[-1]
-            img_url = stored if key in _tile_img_cache else None
+            key = stored.split("/")[-1]
+            tile_data = _tile_img_cache.get(key)
+            img_url   = stored if tile_data else None
         else:
             img_url = None
         if not img_url:
             img_url = _tile_to_static_url(det) or ""
+            if img_url and img_url.startswith("/tile_img/"):
+                tile_data = _tile_img_cache.get(img_url.split("/")[-1])
+
+        # Annotate tile with bounding box server-side
+        if tile_data and bbox and len(bbox) == 4:
+            import numpy as np
+            arr = np.frombuffer(tile_data, np.uint8)
+            tile_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if tile_img is not None:
+                bx1, by1 = int(bbox[0]), int(bbox[1])
+                bx2, by2 = int(bbox[2]), int(bbox[3])
+                cv2.rectangle(tile_img, (bx1, by1), (bx2, by2), (0, 0, 0), 6)
+                cv2.rectangle(tile_img, (bx1, by1), (bx2, by2), (74, 222, 128), 3)
+                ok2, buf = cv2.imencode(".jpg", tile_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if ok2:
+                    cache_key = det_id + "_tile"
+                    _frame_img_cache[cache_key] = buf.tobytes()
+                    img_url = f"/frame_img/{cache_key}"
+
         other_mode, other_label = "frame", "Full frame"
 
     toggle_btn = Button(

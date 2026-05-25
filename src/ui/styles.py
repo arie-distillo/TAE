@@ -624,13 +624,30 @@ html, body {
 .intent-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--text);
+  gap: 10px;
   cursor: pointer;
-  padding: 3px 0;
+  padding: 6px 0;
+  user-select: none;
 }
-.intent-row input[type="checkbox"] { accent-color: var(--blue); }
+/* Hard-reset checkbox — overrides MonsterUI/Theme.slate global input styles */
+.intent-row input[type="checkbox"] {
+  width: 15px !important;
+  height: 15px !important;
+  min-width: 15px !important;
+  max-width: 15px !important;
+  flex-shrink: 0 !important;
+  accent-color: var(--blue);
+  cursor: pointer;
+  appearance: auto !important;
+  -webkit-appearance: checkbox !important;
+  background: transparent !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 3px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  box-shadow: none !important;
+}
+.intent-row span { font-size: 12px; color: var(--text); line-height: 1; }
 
 .arch-btn, .del-btn {
   background: var(--bg4);

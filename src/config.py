@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     )
     SAM_MAX_DIM: int = 1024
 
+    YOLO_WORLD_REPLICATE_MODEL: str = (
+        "zsxkib/yolo-world:"
+        "07aee09fc38bc4459409caa872ea416717712f4e6e875f8751a0d0d5bbea902f"
+)
+
     # ── Persistent storage root ───────────────────────────────────────────────
     DATA_DIR: str = _DEFAULT_DATA_DIR
 

@@ -54,3 +54,4 @@
 - [v] Delete mission doesn't work
 - [v] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
 - [v] video playback doesn't work
+- [] if no detections found - video doesn't play, map not centered / hull not shown

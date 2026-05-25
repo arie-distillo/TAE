@@ -48,13 +48,13 @@ from typing import Callable
 
 import numpy as np
 
+from config import Settings
+settings = Settings()
+
 logger = logging.getLogger("TAE.Tracker")
 
 # ── Replicate model ID — override in .env as REPLICATE_YOLO_WORLD_MODEL ───────
-YOLO_WORLD_MODEL = os.environ.get(
-    "REPLICATE_YOLO_WORLD_MODEL",
-    "zsxkib/yolo-world:latest",
-)
+YOLO_WORLD_MODEL = settings.YOLO_WORLD_REPLICATE_MODEL
 
 # ── SORT hyperparameters ──────────────────────────────────────────────────────
 IOU_THRESHOLD  = 0.25  # minimum IoU to associate detection → track
@@ -212,23 +212,18 @@ def _detect_one_frame(
     """
     # Guard against missing API token — fails fast with a clear message
     import os as _os
-    if not _os.environ.get("REPLICATE_API_TOKEN"):
-        logger.warning(
-            "REPLICATE_API_TOKEN not set — YOLO-World skipped for %s", frame_name
-        )
+    api_key = _os.environ.get("REPLICATE_API_KEY") or settings.REPLICATE_API_KEY
+    if not api_key:
+        logger.warning("REPLICATE_API_KEY not set — YOLO-World skipped for %s", frame_name)
         return []
 
     try:
         import replicate
-
+        client = replicate.Client(api_token=api_key)
         with open(frame_path, "rb") as fh:
-            output = replicate.run(
+            output = client.run(
                 YOLO_WORLD_MODEL,
-                input={
-                    "image":      fh,
-                    "text":       ", ".join(classes),
-                    "confidence": confidence,
-                },
+                input={"input_media": fh, "text": ", ".join(classes), "confidence": confidence},
             )
 
         # Normalise output — Replicate models vary in output format

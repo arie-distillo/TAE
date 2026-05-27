@@ -287,7 +287,12 @@ def _try_geotiff(image_path: Path) -> GeoBounds | None:
 
 
 def read_geo_bounds(image_path: Path, img_w: int, img_h: int,
-                    cli_bounds: str | None) -> GeoBounds:
+                    cli_bounds: str | None) -> "GeoBounds | None":
+    """
+    Try to resolve geo-bounds from CLI arg, GeoTIFF metadata, or world file.
+    Returns None (instead of exiting) when none is available — caller can then
+    fall back to synthetic_geo_bounds().
+    """
     if cli_bounds:
         parts = [float(x) for x in cli_bounds.split(",")]
         if len(parts) != 4:
@@ -305,10 +310,7 @@ def read_geo_bounds(image_path: Path, img_w: int, img_h: int,
     if b:
         return b
 
-    sys.exit(
-        "Cannot determine geo-bounds. Provide --bounds lat_min,lon_min,lat_max,lon_max\n"
-        "or place a .pgw / .jgw world file alongside the image."
-    )
+    return None   # caller decides what to do (synthetic bounds or error)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,16 +404,45 @@ class TrackingTarget:
 
     # ── loader ────────────────────────────────────────────────────────────────
     def load_png(self) -> None:
-        """Load the PNG; ensure 4-channel RGBA."""
+        """
+        Load the PNG as 4-channel BGRA, then auto-crop to the non-transparent
+        content bounding box.
+
+        Why: real_size_m should map to the VISIBLE animal, not the whole canvas.
+        Many downloaded PNGs have large transparent margins around the subject.
+        Without this crop, a 2 m cow set in a PNG whose canvas is 10× wider than
+        the animal would render as 0.2 m visible content — exactly 10× too small.
+        """
         raw = cv2.imread(str(self.png_path), cv2.IMREAD_UNCHANGED)
         if raw is None:
             raise FileNotFoundError(f"Cannot load PNG: {self.png_path}")
-        if raw.ndim == 2:                       # grayscale → BGRA
+        if raw.ndim == 2:
             raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGRA)
-        elif raw.shape[2] == 3:                 # BGR → BGRA, full opacity
+        elif raw.shape[2] == 3:
             raw = cv2.cvtColor(raw, cv2.COLOR_BGR2BGRA)
-        # else already BGRA
-        self._img_rgba = raw
+
+        orig_h, orig_w = raw.shape[:2]
+
+        # ── Auto-crop to non-transparent bounding box ─────────────────────────
+        alpha = raw[:, :, 3]
+        rows  = np.any(alpha > 10, axis=1)   # rows with any visible pixel
+        cols  = np.any(alpha > 10, axis=0)   # cols with any visible pixel
+
+        if rows.any() and cols.any():
+            r0, r1 = np.where(rows)[0][[0, -1]]
+            c0, c1 = np.where(cols)[0][[0, -1]]
+            cropped = raw[r0 : r1 + 1, c0 : c1 + 1]
+        else:
+            cropped = raw   # fully opaque PNG — use as-is
+
+        crop_h, crop_w = cropped.shape[:2]
+        self._img_rgba = cropped
+
+        if crop_w != orig_w or crop_h != orig_h:
+            pct = 100.0 * crop_w * crop_h / max(1, orig_w * orig_h)
+            print(f"    PNG auto-crop '{self.png_path.name}': "
+                  f"{orig_w}×{orig_h} → {crop_w}×{crop_h} "
+                  f"({pct:.0f}% of canvas was content)")
 
     # ── position ──────────────────────────────────────────────────────────────
     def geo_position_at_frame(
@@ -523,10 +554,144 @@ class TrackingTarget:
 # YAML config loader  (new)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-parameter derivation  (new)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default synthetic centre — Middle East / Mediterranean, visually neutral
+_DEFAULT_CENTER_LAT = 32.000
+_DEFAULT_CENTER_LON = 35.000
+
+
+# How many camera footprints wide/tall the synthetic world is.
+# 1.0 = bounds equal one footprint → drone immediately flies off-image.
+# 3.0 = drone crosses three footprint-widths, camera always over real content
+#       (reflected at image edges by BORDER_REFLECT_101 in crop_footprint).
+_SYNTHETIC_BOUNDS_SCALE = 3.0
+
+
+def synthetic_geo_bounds(
+    img_w: int,
+    img_h: int,
+    alt_m: float,
+    sensor_w_mm: float,
+    sensor_h_mm: float,
+    focal_mm:    float,
+    center_lat:  float = _DEFAULT_CENTER_LAT,
+    center_lon:  float = _DEFAULT_CENTER_LON,
+    scale:       float = _SYNTHETIC_BOUNDS_SCALE,
+) -> "GeoBounds":
+    """
+    Invent geo-bounds for an image that has no world file or GPS EXIF.
+
+    The bounds are set to `scale` times the camera footprint (default 3×).
+    This gives the drone a meaningful flight path — the camera traverses
+    three footprint-widths of "virtual terrain".  Wherever the crop window
+    extends beyond the actual image pixels, crop_footprint() fills using
+    BORDER_REFLECT_101 (mirror), which looks natural and avoids stripes.
+
+    All coordinates are self-consistent: SRT, pose_metadata.json and the
+    ground-truth JSON share the same synthetic grid.  Absolute position is
+    arbitrary but TAE's spatial pipeline (footprint, GSD, CLIP tiles) works.
+    """
+    fp_w_m = alt_m * (sensor_w_mm / focal_mm)
+    fp_h_m = alt_m * (sensor_h_mm / focal_mm)
+
+    # Virtual world is `scale` footprints wide/tall
+    world_w_m = fp_w_m * scale
+    world_h_m = fp_h_m * scale
+
+    half_lat = (world_h_m / 2.0) / M_PER_DEG_LAT
+    half_lon = (world_w_m / 2.0) / m_per_deg_lon(center_lat)
+
+    bounds = GeoBounds(
+        lat_min = center_lat - half_lat,
+        lon_min = center_lon - half_lon,
+        lat_max = center_lat + half_lat,
+        lon_max = center_lon + half_lon,
+    )
+    print(f"  Synthetic bounds : lat [{bounds.lat_min:.6f}, {bounds.lat_max:.6f}]"
+          f"  lon [{bounds.lon_min:.6f}, {bounds.lon_max:.6f}]")
+    print(f"  Virtual area     : {world_w_m:.0f} m × {world_h_m:.0f} m"
+          f"  ({scale:.0f}× one {fp_w_m:.0f}×{fp_h_m:.0f} m footprint,"
+          f"  reflected at image edges)")
+    return bounds
+
+
+def derive_auto_params(
+    img_w:       int,
+    img_h:       int,
+    alt_m:       float,
+    sensor_w_mm: float = 6.3,
+    sensor_h_mm: float = 4.7,
+    focal_mm:    float = 4.5,
+    targets:     list  = None,
+) -> dict:
+    """
+    Compute optimal flight + video parameters from the image and altitude.
+
+    Design targets
+    ──────────────
+    fps      : 10  (smooth, manageable file size)
+    pattern  : straight  (one clean camera pass; ideal for tracking tests)
+    overlap  : 0         (no multi-lane survey needed)
+    speed    : chosen so the camera crosses the full image footprint in ~20 s
+               → stationary object is visible for ~200 frames at 10 fps
+    For moving objects: worst-case (fastest target moving toward the drone)
+    is still visible for at least 30 frames — enough for any tracker.
+
+    Returns a dict of generate() kwargs that should be used as defaults,
+    overrideable by explicit YAML keys.
+    """
+    fp_w_m = alt_m * (sensor_w_mm / focal_mm)
+    fp_h_m = alt_m * (sensor_h_mm / focal_mm)
+    gsd    = fp_w_m / img_w                      # metres per output pixel
+
+    fps         = 10
+    cross_time  = 20.0                           # seconds to cross full footprint
+    speed_ms    = fp_w_m / cross_time            # drone speed
+
+    # If any target is fast, ensure it's still visible for ≥30 frames
+    min_frames  = 30
+    if targets:
+        max_obj_speed = max(
+            t.trajectory.speed_ms for t in targets
+            if hasattr(t, "trajectory")
+        )
+        # Worst-case relative speed (head-on)
+        rel_speed  = speed_ms + max_obj_speed
+        t_visible  = fp_w_m / rel_speed          # seconds visible
+        if t_visible * fps < min_frames:
+            # Slow drone down so the object is visible long enough
+            speed_ms = max(0.5, fp_w_m / (min_frames / fps) - max_obj_speed)
+
+    params = {
+        "fps":        fps,
+        "speed":      round(speed_ms, 2),
+        "pattern":    "straight",
+        "overlap":    0.0,
+        "gsd_cm_px":  round(gsd * 100, 2),
+        "fp_w_m":     round(fp_w_m, 1),
+        "fp_h_m":     round(fp_h_m, 1),
+    }
+
+    print(f"  Auto-params      : fps={params['fps']}  speed={params['speed']} m/s"
+          f"  pattern={params['pattern']}  overlap={params['overlap']}%")
+    print(f"  GSD              : {params['gsd_cm_px']} cm/px")
+    print(f"  Footprint        : {params['fp_w_m']} m × {params['fp_h_m']} m")
+    vis_frames = int((fp_w_m / speed_ms) * fps)
+    print(f"  Stationary obj   : visible ~{vis_frames} frames per pass")
+    return params
+
+
 def load_yaml_config(config_path: Path) -> dict:
     """
-    Load a YAML video-generation config.  Returns a dict that mirrors the
-    generate() kwargs, plus a 'tracking_targets' list and CLI-style overrides.
+    Load a YAML video-generation config.
+
+    Minimal required keys:  image, altitude, tracking_targets[].png,
+                            tracking_targets[].real_size_m,
+                            tracking_targets[].speed_ms
+    Everything else is auto-derived or has sensible defaults.
     """
     if not YAML_AVAILABLE:
         sys.exit("PyYAML is required for --config.  Install: pip install pyyaml")
@@ -535,21 +700,28 @@ def load_yaml_config(config_path: Path) -> dict:
 
     targets: list[TrackingTarget] = []
     for i, spec in enumerate(raw.get("tracking_targets", [])):
-        # ── required fields ───────────────────────────────────────────────
-        missing = [k for k in ("png", "start_frame", "end_frame") if k not in spec]
-        if missing:
-            sys.exit(f"tracking_targets[{i}] missing required fields: {missing}")
+        # ── only png is truly required ────────────────────────────────────
+        if "png" not in spec:
+            sys.exit(f"tracking_targets[{i}] missing required field: png")
 
-        traj_raw  = spec.get("trajectory", {})
+        # speed_ms: accept at top level or nested in trajectory block
+        traj_raw   = spec.get("trajectory", {})
+        speed_ms   = float(
+            spec.get("speed_ms")
+            or traj_raw.get("speed_ms")
+            or 2.0
+        )
+        direction  = (
+            spec.get("direction_deg")
+            or traj_raw.get("direction_deg")
+            or None   # None → random
+        )
         trajectory = Trajectory(
-            direction_deg = traj_raw.get("direction_deg", None),
-            speed_ms      = float(traj_raw.get("speed_ms", 3.0)),
+            direction_deg = float(direction) if direction is not None else None,
+            speed_ms      = speed_ms,
         )
 
-        # PNG path resolution order:
-        #   1. Relative to CWD (where the user ran the script from) — most intuitive
-        #   2. Relative to the config file's directory — fallback
-        #   3. As-is (absolute path, or show a clear error)
+        # PNG resolution: CWD-relative first, then config-relative
         png_raw    = Path(spec["png"])
         cwd_path   = (Path.cwd() / png_raw).resolve()
         cfg_path_r = (config_path.parent / png_raw).resolve()
@@ -557,17 +729,19 @@ def load_yaml_config(config_path: Path) -> dict:
             png_path = cwd_path
         elif cfg_path_r.exists():
             png_path = cfg_path_r
-        elif png_raw.is_absolute() and png_raw.exists():
-            png_path = png_raw
         else:
-            # Store the CWD-relative path so the error message is intuitive
-            png_path = cwd_path
+            png_path = cwd_path   # will raise a clear error at load time
+
+        # start/end frame: default to "entire video" (0 → will be set after
+        # total_frames is known; we use sys.maxsize as sentinel for "until end")
+        start_frame = int(spec["start_frame"]) if "start_frame" in spec else 0
+        end_frame   = int(spec["end_frame"])   if "end_frame"   in spec else -1  # -1 = auto
 
         target = TrackingTarget(
             id          = spec.get("id", f"target_{i}"),
             png_path    = png_path,
-            start_frame = int(spec["start_frame"]),
-            end_frame   = int(spec["end_frame"]),
+            start_frame = start_frame,
+            end_frame   = end_frame,           # clamped to total_frames-1 in generate()
             trajectory  = trajectory,
             start_lat   = float(spec["start_lat"]) if "start_lat" in spec else float("nan"),
             start_lon   = float(spec["start_lon"]) if "start_lon" in spec else float("nan"),
@@ -580,15 +754,18 @@ def load_yaml_config(config_path: Path) -> dict:
         "image":           raw.get("image"),
         "bounds":          raw.get("bounds"),
         "altitude":        raw.get("altitude", 80.0),
-        "speed":           raw.get("speed", 8.0),
-        "pattern":         raw.get("pattern", "boustrophedon"),
-        "overlap":         raw.get("overlap", 60.0),
-        "fps":             raw.get("fps", 30),
-        "width":           raw.get("width", 1920),
-        "height":          raw.get("height", 1080),
+        "center_lat":      raw.get("center_lat", _DEFAULT_CENTER_LAT),
+        "center_lon":      raw.get("center_lon", _DEFAULT_CENTER_LON),
+        # Flight params: None = auto-derive from image + altitude
+        "speed":           raw.get("speed",   None),
+        "fps":             raw.get("fps",     None),
+        "pattern":         raw.get("pattern", None),
+        "overlap":         raw.get("overlap", None),
+        "width":           raw.get("width",   1920),
+        "height":          raw.get("height",  1080),
         "sensor_w":        raw.get("sensor_w", 6.3),
         "sensor_h":        raw.get("sensor_h", 4.7),
-        "focal":           raw.get("focal", 4.5),
+        "focal":           raw.get("focal",    4.5),
         "objects":         raw.get("static_objects"),
         "extract_frames":  raw.get("extract_frames", False),
         "output":          raw.get("output", "output/sim_video"),
@@ -832,10 +1009,22 @@ def _prepare_targets(
     for t in targets:
         t.load_png()
         direction = t.resolve_direction(rng)
-        print(f"  Target '{t.id}'  frames [{t.start_frame}–{t.end_frame}]  "
-              f"start ({t.start_lat:.5f}, {t.start_lon:.5f})  "
-              f"dir {direction:.1f}°  speed {t.trajectory.speed_ms:.1f} m/s  "
-              f"png {t.png_path.name}")
+        # Compute and show the expected rendered pixel size
+        # so the user can immediately verify it looks right
+        # (GSD at 80 m DJI Mini2 ≈ 5.8 cm/px → 2 m cow = ~34 px wide)
+        if t.real_size_m and t._img_rgba is not None:
+            # Use a placeholder GSD; caller will recompute per-frame
+            # Just a sanity-check printout
+            canvas_h, canvas_w = t._img_rgba.shape[:2]
+            print(f"  Target '{t.id}'  frames [{t.start_frame}–{t.end_frame}]  "
+                  f"dir {direction:.1f}°  speed {t.trajectory.speed_ms:.1f} m/s  "
+                  f"real_size {t.real_size_m} m  "
+                  f"PNG content {canvas_w}×{canvas_h} px  "
+                  f"png {t.png_path.name}")
+        else:
+            print(f"  Target '{t.id}'  frames [{t.start_frame}–{t.end_frame}]  "
+                  f"dir {direction:.1f}°  speed {t.trajectory.speed_ms:.1f} m/s  "
+                  f"png {t.png_path.name}")
         prepared.append((t, direction))
     return prepared
 
@@ -1096,12 +1285,16 @@ def crop_footprint(
     pad_bot   = max(0, (y0 + fp_h_px) - img_h)
 
     if pad_left or pad_top or pad_right or pad_bot:
-        # Extend the image first, then crop — avoids the black-border artefact
+        # BORDER_REFLECT_101: mirrors the image at each edge.
+        # Far superior to BORDER_REPLICATE for large overshots (e.g. when the
+        # camera footprint extends past the satellite image boundary at the
+        # start/end of a straight pass): reflected terrain looks natural rather
+        # than producing the distinctive horizontal/vertical stripe artefact
+        # caused by a single edge row/column being repeated across the padding.
         padded = cv2.copyMakeBorder(
             image, pad_top, pad_bot, pad_left, pad_right,
-            cv2.BORDER_REPLICATE,
+            cv2.BORDER_REFLECT_101,
         )
-        # The crop origin shifts by the padding we added on the left/top
         nx0 = x0 + pad_left
         ny0 = y0 + pad_top
     else:
@@ -1286,6 +1479,11 @@ def generate(
         frames_dir.mkdir(exist_ok=True)
 
     rng = np.random.default_rng(0)
+
+    # ── Clamp end_frame=-1 sentinel to total_frames-1 ────────────────────────
+    for t in (tracking_targets or []):
+        if t.end_frame < 0:
+            t.end_frame = total_frames - 1
 
     # ── Prepare tracking targets + visibility estimate ─────────────────────────
     tracking_targets = tracking_targets or []
@@ -1513,9 +1711,10 @@ def main():
     def _cli(key, arg_val, default):
         if arg_val is not None:
             return arg_val
-        return cfg.get(key, default)
+        val = cfg.get(key)
+        return val if val is not None else default  # treat stored None as "not set"
 
-    image_str = _cli("image",    args.image,    None)
+    image_str = _cli("image", args.image, None)
     if not image_str:
         ap.error("--image is required (or set 'image' in --config)")
     image_path = Path(image_str)
@@ -1527,29 +1726,60 @@ def main():
         sys.exit(f"Cannot load image: {image_path}")
     img_h, img_w = probe.shape[:2]
 
+    # ── Camera model ──────────────────────────────────────────────────────────
+    sensor_w_mm = _cli("sensor_w", args.sensor_w, 6.3)
+    sensor_h_mm = _cli("sensor_h", args.sensor_h, 4.7)
+    focal_mm    = _cli("focal",    args.focal,    4.5)
+    alt_m       = _cli("altitude", args.altitude, 80.0)
+
+    # ── Geo bounds ────────────────────────────────────────────────────────────
+    # Priority: explicit --bounds / bounds: in YAML  →  world file (.pgw/.jgw)
+    #           →  synthetic bounds derived from altitude + camera model
     bounds_str = _cli("bounds", args.bounds, None)
-    bounds     = read_geo_bounds(image_path, img_w, img_h, bounds_str)
+    bounds = read_geo_bounds(image_path, img_w, img_h, bounds_str)
+    if bounds is None:
+        # No world file and no explicit bounds → synthesise
+        center_lat = float(_cli("center_lat", None, _DEFAULT_CENTER_LAT))
+        center_lon = float(_cli("center_lon", None, _DEFAULT_CENTER_LON))
+        print(f"  No world file found — using synthetic geo-bounds "
+              f"centred on ({center_lat}, {center_lon})")
+        bounds = synthetic_geo_bounds(
+            img_w, img_h, alt_m,
+            sensor_w_mm, sensor_h_mm, focal_mm,
+            center_lat, center_lon,
+        )
+
+    # ── Auto-derive flight params if not explicitly set ───────────────────────
+    auto = derive_auto_params(
+        img_w, img_h, alt_m,
+        sensor_w_mm, sensor_h_mm, focal_mm,
+        targets = tracking_targets,
+    )
+    # Explicit YAML / CLI values override auto-derived ones
+    speed_ms    = _cli("speed",   args.speed,   auto["speed"])
+    fps         = _cli("fps",     args.fps,     auto["fps"])
+    pattern     = _cli("pattern", args.pattern, auto["pattern"])
+    overlap_pct = _cli("overlap", args.overlap, auto["overlap"])
 
     objects_str = args.objects or cfg.get("objects")
     objects     = parse_objects(objects_str) if objects_str else []
-
-    out_dir = Path(_cli("output", args.output, "output/sim_video"))
+    out_dir     = Path(_cli("output", args.output, "output/sim_video"))
 
     print("\n═══ TAE Synthetic Video Generator ═══\n")
     video_path, srt_path = generate(
         image_path       = image_path,
         bounds           = bounds,
         out_dir          = out_dir,
-        alt_m            = _cli("altitude",  args.altitude,  80.0),
-        speed_ms         = _cli("speed",     args.speed,     8.0),
-        pattern          = _cli("pattern",   args.pattern,   "boustrophedon"),
-        overlap_pct      = _cli("overlap",   args.overlap,   60.0),
-        fps              = _cli("fps",       args.fps,       30),
-        out_w            = _cli("width",     args.width,     1920),
-        out_h            = _cli("height",    args.height,    1080),
-        sensor_w_mm      = _cli("sensor_w",  args.sensor_w,  6.3),
-        sensor_h_mm      = _cli("sensor_h",  args.sensor_h,  4.7),
-        focal_mm         = _cli("focal",     args.focal,     4.5),
+        alt_m            = alt_m,
+        speed_ms         = speed_ms,
+        pattern          = pattern,
+        overlap_pct      = overlap_pct,
+        fps              = fps,
+        out_w            = _cli("width",  args.width,  1920),
+        out_h            = _cli("height", args.height, 1080),
+        sensor_w_mm      = sensor_w_mm,
+        sensor_h_mm      = sensor_h_mm,
+        focal_mm         = focal_mm,
         objects          = objects,
         extract_frames   = args.extract_frames or cfg.get("extract_frames", False),
         tracking_targets = tracking_targets,

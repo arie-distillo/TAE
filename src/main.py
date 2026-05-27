@@ -36,13 +36,19 @@ from core.app_state import (
     _state, _frame_img_cache, _tile_img_cache,
     _MARKER_COLORS, _CLIP_AERIAL_CTX,
 )
-from core.pipeline import (
+from core.services import (
     _build_map, _optimal_zoom, _recenter_on_detections,
     _load_tile, _annotate_and_save, _tile_to_static_url,
-    _extract_video_frames, _execute_analysis,
-    init as _init_analysis,
+    _extract_video_frames, _save_detections, _load_detections,
+    init as _init_services, 
 )
+from ai.intent import (
+    IntentClassifier, ObjectDetectionParams, AnomalyDetectionParams,
+    ClassifiedQuery,
+)
+from ai.detection_pipeline import run_detection_pipeline, Track
 from ui.styles import _CSS, _JS
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -58,6 +64,7 @@ for _uv in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 for _wf in ("watchfiles", "watchfiles.main"):
     logging.getLogger(_wf).setLevel(logging.WARNING)
 logger = logging.getLogger("TAE-UI")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global singletons
@@ -75,6 +82,10 @@ analyst = TacticalAnalyst(
     settings.VLM_MODEL,
     settings.OPENROUTER_API_KEY,
 )
+intent_clf = IntentClassifier(
+    api_key    = settings.OPENROUTER_API_KEY,
+    model_name = getattr(settings, "INTENT_MODEL", None),
+)
 _search_lib: SearchLibrarian | None = None
 
 # Video telemetry helpers (singletons — stateless, safe to reuse)
@@ -84,14 +95,14 @@ _video_sampler = VideoSampler()
 # Live streaming manager (Phase D)
 stream_mgr = StreamManager()
 
-
-def get_search_lib() -> SearchLibrarian:
+def _main_get_search_lib():          # rename locally to be unambiguous
     global _search_lib
     if _search_lib is None:
-        logger.info("Loading CLIP model – this may take a moment…")
+        logger.info("Loading CLIP model…")
         _search_lib = SearchLibrarian(settings.CLIP_MODEL)
     return _search_lib
 
+_init_services(db, analyst, _main_get_search_lib, spatial)   # ← pass the local one
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-query state (reset on mission switch)
@@ -221,7 +232,6 @@ def _restore_state() -> None:
     try:
         paths = _state.get("mission_paths")
         if paths and _state.get("ingested"):
-            from core.pipeline import _load_detections
             dets = _load_detections(paths.maps)
             if dets:
                 _state["detections"]      = dets
@@ -1287,71 +1297,15 @@ async def track(request: Request):
 
 
 def _tracking_background(query: str, confidence: float, paths) -> None:
-    """Background thread: dense detection + SORT tracking + map rebuild."""
-    from core.tracker import run_tracking, save_tracks
-    try:
-        # Gather one row per unique parent frame, sorted by frame_idx
-        if db.table is None or db.row_count() == 0:
-            _state["track_error"] = "No frames indexed"
-            return
+    """Tracking is now integrated into run_detection_pipeline — this stub kept for
+    backward-compat with the /start_tracking route."""
+    logger.info(
+        "Tracking is handled automatically by run_detection_pipeline. "
+        "Re-run a query to detect and track objects across all frames."
+    )
+    return
 
-        # img_w_px / img_h_px are not in LanceDB — reconstruct from tile extents
-        import re as _re
-        df_all = db.table.to_pandas()[
-            ["parent_path", "lat", "lon", "alt_m", "gimbal_yaw",
-             "tile_x", "tile_y", "tile_w", "tile_h"]
-        ]
 
-        frame_ts = _state.get("frame_timestamps", {})
-        frames   = []
-        for parent_path, grp in df_all.groupby("parent_path"):
-            ref   = grp.iloc[0]
-            img_w = int((grp["tile_x"] + grp["tile_w"]).max())
-            img_h = int((grp["tile_y"] + grp["tile_h"]).max())
-            fname = Path(parent_path).name
-            m_re  = _re.search(r"_s(\d{5})", fname)
-            fidx  = int(m_re.group(1)) if m_re else 0
-            frames.append({
-                "parent_path": parent_path,
-                "lat":         float(ref["lat"]),
-                "lon":         float(ref["lon"]),
-                "alt_m":       float(ref.get("alt_m", 80.0)),
-                "gimbal_yaw":  float(ref.get("gimbal_yaw", 0.0)),
-                "img_w_px":    img_w if img_w > 0 else 1920,
-                "img_h_px":    img_h if img_h > 0 else 1080,
-                "frame_idx":   fidx,
-                "timestamp_ms": frame_ts.get(fname, fidx * 2000),
-            })
-
-        frames.sort(key=lambda r: r["frame_idx"])
-        _state["track_total"] = len(frames)
-        logger.info("Tracking %d frames for query: %s", len(frames), query)
-
-        def on_progress(done, total):
-            _state["track_progress"] = done
-
-        tracks = run_tracking(
-            frames       = frames,
-            spatial      = spatial,
-            query        = query,
-            confidence   = confidence,
-            on_progress  = on_progress,
-        )
-
-        tracks_file = paths.maps / "tracks.json"
-        save_tracks(tracks, tracks_file)
-
-        # Rebuild map with polylines
-        _build_map()
-
-        logger.info("Tracking complete: %d tracks", len(tracks))
-        _state["track_done"]   = len(tracks)
-        _state["tracking"]     = False
-
-    except Exception as e:
-        logger.error("Tracking failed: %s", e)
-        _state["track_error"] = str(e)
-        _state["tracking"]    = False
 
 
 @rt("/track_progress")
@@ -1800,7 +1754,7 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
     try:
         db.initialize_table(vector_dim=settings.CLIP_DIM)
         sim   = SimD3Environment(str(meta_file))
-        lib   = get_search_lib()
+        lib   = _main_get_search_lib()
         total = len(sim.frame_names)
         logger.info("Starting CLIP ingestion…")
 
@@ -1847,13 +1801,20 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                     _state["query_color_idx"] += 1
                     # Same parameters as a manual query — CLIP handles
                     # scanning the full index, VLM sees only the top matches.
-                    result = _execute_analysis(
-                        m.definition,
-                        color,
-                        search_limit     = 20,
-                        frames_to_return = 8,
+                    from ai.detection_pipeline import run_detection_pipeline
+                    _classified = intent_clf.classify(m.definition)
+                    _tracks = run_detection_pipeline(
+                        params           = _classified.params,
+                        all_tiles        = db.get_all_tiles(),
+                        original_query   = m.definition,
+                        analyst          = analyst,
+                        sam_segmentor    = None,
+                        api_key          = getattr(settings, "REPLICATE_API_KEY", ""),
+                        model_version    = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
+                        timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
+                        actual_alt_m     = _state.get("mean_alt_m", 100.0),
+                        color            = color,
                     )
-                    # Persist so restart replay works without a manual query
                     mission_mgr.update(mid, scene_context=m.definition)
                     _state["last_query"] = m.definition
                     _state["detections_ready"] = True
@@ -1861,29 +1822,17 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                         "..." if len(m.definition) > 40 else ""
                     )
                     auto_summary = (
-                        f"Auto-analysis: {result['n_confirmed']} object(s) "
-                        f"found for '{snip}'."
-                        if result["n_confirmed"]
-                        else f"Auto-analysis complete — no objects confirmed "
-                             f"for '{snip}'."
+                        f"Auto-analysis: {len(_tracks)} object(s) found for '{snip}'."
+                        if _tracks
+                        else f"Auto-analysis complete — no objects confirmed for '{snip}'."
                     )
                     logger.info(auto_summary)
         except Exception as ae:
             logger.error("Auto-analysis failed (ingestion was successful): %s", ae)
             auto_summary = "Auto-analysis failed — you can still query manually."
 
-        # Run YOLO-World + SORT once after ingestion — this is the
-        # ONLY place tracking is triggered. Not on every query, not on restart.
-        _trk_mid = _state.get("mission_id")
-        if _trk_mid:
-            try:
-                _trk_m = mission_mgr.get(_trk_mid)
-                _trk_q = (_trk_m.definition if _trk_m else None) or ""
-                if _trk_q:
-                    from core.pipeline import _auto_track_background
-                    _auto_track_background(_trk_q)
-            except Exception as _te:
-                logger.warning("Post-ingestion tracking failed: %s", _te)
+        # Tracking is now integrated into run_detection_pipeline (query-time).
+        # No separate post-ingestion tracking pass needed.
 
         _state["ingest_msg"] = (
             f"Indexed {tiles_ok} tiles across {total_frames} frame(s). "
@@ -1891,7 +1840,7 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
         )
         _state["ingesting"]  = False   # signal poll to deliver the message
     except Exception as e:
-        logger.error(f"Background ingestion failed: {e}")
+        logger.error(f"Background ingestion failed: {e}", exc_info=True)
         _state["ingesting"]  = False
         _state["ingest_msg"] = f"Ingestion failed: {e}"
 
@@ -2040,6 +1989,13 @@ async def upload(request: Request):
         _state["map_center"] = [_st.median(lats), _st.median(lons)]
         _state["map_zoom"]   = 16
 
+    # Extract mean AGL altitude for shape-prior scaling in the detection pipeline
+    alts = [v.get("alt_m") or v.get("z") or 0 for v in meta.values()]
+    alts = [a for a in alts if isinstance(a, (int, float)) and a > 0]
+    if alts:
+        _state["mean_alt_m"] = sum(alts) / len(alts)
+        logger.info("Mean AGL altitude: %.1f m", _state["mean_alt_m"])
+
     from starlette.background import BackgroundTasks
     _state["ingesting"]   = True
     _state["ingest_msg"]  = None
@@ -2098,56 +2054,304 @@ def upload_progress():
     return ""
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAM2 segmentor (lazy singleton)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_segmentor = None
+
+def _get_segmentor():
+    """Lazy-load SAM2Segmentor — avoids heavy model init at startup."""
+    global _segmentor
+    if _segmentor is None:
+        from ai.segmentor import SAM2Segmentor
+        _segmentor = SAM2Segmentor(
+            api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
+            model_version = getattr(settings, "SAM_REPLICATE_MODEL", ""),
+            max_dim       = getattr(settings, "SAM_MAX_DIM", 1024),
+        )
+    return _segmentor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Active mission helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_active_mission():
+    """Return the Mission object for the current mission_id, or None."""
+    mid = _state.get("mission_id")
+    if not mid:
+        return None
+    try:
+        return mission_mgr.get(mid)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anomaly detection query handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_anomaly_query(message, params, color, user_bubble, mission):
+    """
+    Handle anomaly_detection intent:
+    CLIP scene retrieval → SAM segments from SegmentStore → CLIP scoring → VLM verify.
+    """
+    try:
+        from ai.anomaly import VocabularyBuilder, score_segments
+        from core.segment_store import SegmentStore
+
+        paths = _state.get("mission_paths")
+        if not paths:
+            return user_bubble, _msg("⚠️  No active mission.", "sys")
+
+        seg_db_path = getattr(paths, "segments_db_path",
+                              getattr(paths, "segments_db", None))
+        if not seg_db_path or not Path(str(seg_db_path)).exists():
+            return (
+                user_bubble,
+                _msg(
+                    "⚠️  No segment index for this mission. "
+                    "Enable 'anomaly_detection' intent before uploading imagery "
+                    "so SAM2 segments are computed at ingest time.",
+                    "sys",
+                ),
+            )
+
+        lib   = _main_get_search_lib()
+        vocab = VocabularyBuilder(lib)
+        store = SegmentStore(str(seg_db_path))
+
+        # Retrieve candidate frames via CLIP, then score their segments
+        clip_query = f"aerial drone nadir overhead view: {message}"
+        q_vec      = lib.encode_text(clip_query)
+        candidates = db.semantic_search(q_vec, limit=20, frames_to_return=8)
+
+        if not candidates:
+            return user_bubble, _msg("No candidate frames found for anomaly search.", "sys")
+
+        scored = score_segments(
+            store       = store,
+            frame_paths = [c["parent_path"] for c in candidates],
+            vocab       = vocab,
+            query       = message,
+            top_n       = 5,
+        )
+
+        if not scored:
+            return (
+                user_bubble,
+                _msg(f"No anomalies detected for: <i>{message}</i>", "sys"),
+            )
+
+        new_det_ids: list[str] = []
+        for seg in scored:
+            # VLM verify
+            tile_img = seg.crop  # numpy array
+            if tile_img is None:
+                continue
+
+            verify = analyst.verify_detection(
+                image          = tile_img,
+                criteria       = params.vlm_verification_criteria,
+                report_fields  = params.vlm_reporting_fields,
+                original_query = message,
+            )
+            if not verify.get("confirmed"):
+                continue
+
+            det_id = uuid.uuid4().hex[:10]
+            # Geo-locate: use segment bbox centre within its parent frame
+            cand_match = next(
+                (c for c in candidates if c["parent_path"] == seg.frame_path), None
+            )
+            lat = cand_match["lat"] if cand_match else 0.0
+            lon = cand_match["lon"] if cand_match else 0.0
+
+            _state["detections"][det_id] = {
+                "lat":       lat,
+                "lon":       lon,
+                "label":     message,
+                "color":     color,
+                "confirmed": True,
+                "img_urls":  [],
+                "gsd":       "—",
+                "bbox":      seg.bbox,
+                "source":    Path(seg.frame_path).name,
+                "parent_path": seg.frame_path,
+                "tile_x":    seg.bbox[0] if seg.bbox else 0,
+                "tile_y":    seg.bbox[1] if seg.bbox else 0,
+                "tile_w":    (seg.bbox[2] - seg.bbox[0]) if seg.bbox else 640,
+                "tile_h":    (seg.bbox[3] - seg.bbox[1]) if seg.bbox else 640,
+                "vlm_report": verify.get("report", {}),
+            }
+            new_det_ids.append(det_id)
+
+        _recenter_on_detections(new_det_ids)
+        _build_map()
+
+        dot = f'<span style="color:{color};font-size:13px">&#9679;</span>'
+        if new_det_ids:
+            reply = (
+                f"{dot} {len(new_det_ids)} anomaly/anomalies confirmed. "
+                f"Query: <i>{message}</i>"
+            )
+        else:
+            reply = (
+                f"{dot} No confirmed anomalies for: <i>{message}</i>. "
+                f"CLIP found candidates but VLM did not confirm."
+            )
+        return user_bubble, _msg_html(reply)
+
+    except Exception as exc:
+        logger.error("Anomaly query failed: %s", exc, exc_info=True)
+        return user_bubble, _msg(f"⚠️  Anomaly detection error: {exc}", "sys")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes — query
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 @rt("/query", methods=["POST"])
-async def query(message: str):
+async def query(message: str):  # noqa — signature only for illustration
+    from ai.detection_pipeline import run_detection_pipeline
+ 
     if not message.strip():
         return ""
-
+ 
     user_bubble = _msg(message, "user")
-
+ 
     if not _state["ingested"] and db.row_count() == 0:
         return user_bubble, _msg("⚠️  No imagery indexed yet. Upload images first.", "sys")
-
+ 
     _state["ingested"]   = True
     _state["last_query"] = message
     mid = _state.get("mission_id")
     if mid:
         mission_mgr.update(mid, scene_context=message)
-
+ 
     color = _MARKER_COLORS[_state["query_color_idx"] % len(_MARKER_COLORS)]
     _state["query_color_idx"] += 1
-
-    result = _execute_analysis(message, color, search_limit=20, frames_to_return=8)
-
-    if not result["det_ids"]:
-        return user_bubble, _msg("No matching frames found in the index.", "sys")
-
-    raw_report = result["report"]
+ 
+    classified = intent_clf.classify(message)
+    intent     = classified.params.intent
+    logger.info(
+        "Intent: %s | conf=%.2f | %s", intent, classified.confidence, classified.reasoning
+    )
+ 
+    mission = _state.get("mission") or _get_active_mission()
+    if mission and not mission.allows(intent):
+        allowed = ", ".join(mission.allowed_intents)
+        return (
+            user_bubble,
+            _msg(
+                f"⚠️ Intent <b>{intent}</b> not enabled for this mission.<br>"
+                f"Allowed: <b>{allowed}</b>.",
+                "sys",
+            ),
+        )
+ 
+    # ── anomaly_detection ─────────────────────────────────────────────────────
+    if intent == "anomaly_detection":
+        return _handle_anomaly_query(
+            message, classified.params, color, user_bubble, mission
+        )
+ 
+    # ── object_detection — new v2 6-stage pipeline ────────────────────────────
+    params: ObjectDetectionParams = classified.params
+ 
+    all_tiles = db.get_all_tiles()
+    if not all_tiles:
+        return user_bubble, _msg("⚠️  No tiles in index. Upload imagery first.", "sys")
+ 
+    actual_alt_m = _state.get("mean_alt_m", 100.0)
+ 
+    tracks = run_detection_pipeline(
+        params           = params,
+        all_tiles        = all_tiles,
+        original_query   = message,
+        analyst          = analyst,
+        sam_segmentor    = _get_segmentor() if (mission and mission.allows("anomaly_detection")) else None,
+        api_key          = getattr(settings, "REPLICATE_API_KEY", ""),
+        model_version    = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
+        timeout_s        = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
+        actual_alt_m     = actual_alt_m,
+        color            = color,
+    )
+ 
+    new_det_ids: list[str] = []
+    for track in tracks:
+        det_id = uuid.uuid4().hex[:10]
+        best   = track.best
+ 
+        img_urls = []
+        for det in track.detections:
+            tile_candidate = {
+                "parent_path": det.parent_path,
+                "tile_x": det.tile_x, "tile_y": det.tile_y,
+                "tile_w": det.tile_w, "tile_h": det.tile_h,
+            }
+            url = _annotate_and_save(tile_candidate, det.bbox_tile, message[:20])
+            if url:
+                img_urls.append(url)
+ 
+        report_summary = ""
+        if best.vlm_report:
+            parts = [f"{k}: {v}" for k, v in best.vlm_report.items() if v]
+            report_summary = " · ".join(parts[:3])
+ 
+        _state["detections"][det_id] = {
+            "lat":           track.lat,
+            "lon":           track.lon,
+            "label":         message,
+            "color":         color,
+            "confirmed":     True,
+            "img_urls":      img_urls,
+            "is_multiangle": len(track.detections) > 1,
+            "source_count":  len(track.detections),
+            "gsd":           f"{best.tile_w / max(1, best.tile_h):.1f}",
+            "bbox":          best.bbox_tile,
+            "source":        Path(best.parent_path).name,
+            "parent_path":   best.parent_path,
+            "tile_x":        best.tile_x,
+            "tile_y":        best.tile_y,
+            "tile_w":        best.tile_w,
+            "tile_h":        best.tile_h,
+            "vlm_report":    best.vlm_report,
+            "track_id":      track.track_id,
+        }
+        new_det_ids.append(det_id)
+        n_frames = len(set(d.parent_path for d in track.detections))
+        logger.info(
+            "Track %s | %s | LAT %.6f LON %.6f | %d frame(s)",
+            track.track_id, track.label, track.lat, track.lon, n_frames,
+        )
+ 
+    _recenter_on_detections(new_det_ids)
+    _build_map()
+ 
+    paths = _state.get("mission_paths")
+    if paths:
+        _save_detections(paths.maps)
+ 
     dot_solid  = f'<span style="color:{color};font-size:13px">&#9679;</span>'
     dot_hollow = f'<span style="color:{color};font-size:13px">&#9675;</span>'
-
-    lines = []
-    if raw_report and result["n_confirmed"]:
-        for p in raw_report.split(" | "):
-            p = p.strip()
-            if ": " in p:
-                p = p.split(": ", 1)[1]
-            if p:
-                lines.append(f"{dot_solid} {p}")
-    if result["n_unconfirmed"]:
-        lines.append(
-            f"{dot_hollow} {result['n_unconfirmed']} additional frame(s) matched "
-            f"semantically but not confirmed by VLM — click hollow markers to inspect."
+ 
+    if tracks:
+        n        = len(tracks)
+        n_frames = len(set(d.parent_path for t in tracks for d in t.detections))
+        reply    = (
+            f"{dot_solid} {n} instance{'s' if n > 1 else ''} confirmed "
+            f"across {n_frames} frame(s). Query: <i>{message}</i>"
         )
-    if not lines:
-        lines = [raw_report or "No objects matching the query were found."]
-
-    return user_bubble, _msg_html("<br>".join(lines))
+    else:
+        reply = (
+            f"{dot_hollow} YOLO-World + VLM found no confirmed detections for: "
+            f"<i>{message}</i>. "
+            f"Try a more specific query or check that imagery is uploaded."
+        )
+ 
+    return user_bubble, _msg_html(reply)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2283,8 +2487,6 @@ def frame_view(det_id: str, mode: str = "tile"):
 # ─────────────────────────────────────────────────────────────────────────────
 # Boot
 # ─────────────────────────────────────────────────────────────────────────────
-# Wire injected dependencies into the analysis service layer
-_init_analysis(db, analyst, get_search_lib, spatial)
 
 # Wire stream callbacks
 def _stream_on_frames(paths, lat, lon):
@@ -2317,7 +2519,7 @@ def _stream_on_frames(paths, lat, lon):
     sim = TAESimGenerator(str(paths_obj.uploads), str(paths_obj.uploads))
     sim.pose_metadata = meta
     from core.ingestion import run_ingestion
-    tiles_ok, _ = run_ingestion(sim, spatial, get_search_lib(), db)
+    tiles_ok, _ = run_ingestion(sim, spatial, _main_get_search_lib(), db)
     _state['frame_count'] = _state.get('frame_count', 0) + len(paths)
     _state['tile_count']  = _state.get('tile_count',  0) + tiles_ok
     _state['ingested']    = True
@@ -2333,7 +2535,20 @@ def _stream_on_analyse():
         return
     color = _MARKER_COLORS[_state['query_color_idx'] % len(_MARKER_COLORS)]
     _state['query_color_idx'] += 1
-    _execute_analysis(m.definition, color, search_limit=20, frames_to_return=8)
+    from ai.detection_pipeline import run_detection_pipeline
+    _classified = intent_clf.classify(m.definition)
+    run_detection_pipeline(
+        params         = _classified.params,
+        all_tiles      = db.get_all_tiles(),
+        original_query = m.definition,
+        analyst        = analyst,
+        sam_segmentor  = None,
+        api_key        = getattr(settings, "REPLICATE_API_KEY", ""),
+        model_version  = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
+        timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
+        actual_alt_m   = _state.get("mean_alt_m", 100.0),
+        color          = color,
+    )
     logger.info('Stream auto-analysis complete')
 
 stream_mgr.init(_stream_on_frames, _stream_on_analyse)

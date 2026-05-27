@@ -1,7 +1,29 @@
-import re
-import json
+"""
+ai/vlm.py — VLM service (TacticalAnalyst)
+==========================================
+Wraps Qwen2.5-VL (via OpenRouter) or a local Ollama model.
+
+Two public methods
+------------------
+analyze_multiple_views(candidates, user_query)
+    Legacy CLIP→VLM path used by the anomaly_detection pipeline.
+    Accepts LanceDB tile records, runs the VLM on each, returns merged targets.
+
+verify_detection(image, criteria, report_fields, ...)
+    New method for Stage 4 of the object_detection pipeline (ai/detection_pipeline.py).
+    Accepts a SAM-masked crop, structured criteria from ObjectDetectionParams,
+    and returns a structured confirmation + report dict.
+    Prompt is built dynamically — no hardcoded template per query type.
+
+Renamed from: analyst.py / vlm.py
+"""
+
+from __future__ import annotations
+
 import base64
+import json
 import logging
+import re
 from pathlib import Path
 
 import cv2
@@ -13,28 +35,27 @@ from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_t
 logger = logging.getLogger("TacticalAnalyst")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Tile reconstruction
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _load_tile_cv2(candidate: dict) -> np.ndarray | None:
     """
-    Reconstructs a tile by cropping its parent frame.
-    Tiles are never stored on disk — this is the single reconstruction point
-    used by the analyst whenever it needs the actual pixel data.
+    Reconstruct a tile by cropping its parent frame.
+    Tiles are never stored on disk — this is the single reconstruction point.
     """
-    img = cv2.imread(candidate['parent_path'])
+    img = cv2.imread(candidate["parent_path"])
     if img is None:
-        logger.warning(f"Cannot read parent frame: {candidate['parent_path']}")
+        logger.warning("Cannot read parent frame: %s", candidate["parent_path"])
         return None
-    x, y = candidate['tile_x'], candidate['tile_y']
-    w, h = candidate['tile_w'], candidate['tile_h']
-    return img[y:y + h, x:x + w]
+    x, y = candidate["tile_x"], candidate["tile_y"]
+    w, h = candidate["tile_w"], candidate["tile_h"]
+    return img[y: y + h, x: x + w]
 
 
-# ---------------------------------------------------------------------------
-# Prompt templates
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt templates — analyze_multiple_views (legacy / anomaly path)
+# ─────────────────────────────────────────────────────────────────────────────
 
 _BBOX_RULES = (
     "Bounding box rules:\n"
@@ -47,94 +68,97 @@ _BBOX_RULES = (
 )
 
 
-def _build_prompt(user_query: str, filename: str, img_w: int, img_h: int) -> tuple[str, bool]:
+def _build_prompt(
+    user_query: str,
+    filename:   str,
+    img_w:      int,
+    img_h:      int,
+) -> tuple[str, bool]:
+    """Returns (prompt_text, expects_bboxes)."""
+    img_info = f"Image: {filename} ({img_w}×{img_h} pixels)"
+    prompt = (
+        f"You are analyzing UAV aerial imagery.\n"
+        f"{img_info}\n\n"
+        f"Find all instances of the following:\n"
+        f"TARGET: {user_query}\n\n"
+        "Return ONLY a valid JSON object:\n"
+        "{\n"
+        '  "report": "brief summary of findings",\n'
+        '  "targets": [\n'
+        '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax],'
+        ' "confidence": 0.0, "description": "concise label"}\n'
+        '  ]\n'
+        "}\n\n"
+        + _BBOX_RULES
+        + "No markdown, no text outside the JSON object."
+    )
+    return prompt, True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt builder — verify_detection (object_detection pipeline Stage 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_verify_prompt(
+    label_hint:    str,
+    criteria:      str,
+    report_fields: list[str],
+    original_query: str,
+    colour_hint:   str | None,
+    size_qualifier: str | None,
+    img_w: int,
+    img_h: int,
+) -> str:
     """
-    Returns (prompt, expects_bboxes).
-    Image dimensions are passed explicitly so the VLM knows the pixel space.
+    Dynamic VLM verification prompt — adapts to any query type via
+    criteria and report_fields from ObjectDetectionParams.
+    No hardcoded templates; new object classes need no code changes.
     """
-    intent = "object_search"   # TODO PATCH FOR NOW
-    img_info = f"Image: {filename} ({img_w}x{img_h} pixels)"
+    field_schema = "\n".join(f'    "{f}": "<value>"' for f in report_fields)
+    colour_line  = f"\nColour qualifier: {colour_hint}" if colour_hint else ""
+    size_line    = f"\nSize qualifier: {size_qualifier}" if size_qualifier else ""
 
-    if intent == "object_search":
-        prompt = (
-            f"You are analyzing UAV aerial imagery.\n"
-            f"{img_info}\n\n"
-            f"Find all instances of the following:\n"
-            f"TARGET: {user_query}\n\n"
-            "Return ONLY a valid JSON object:\n"
-            "{\n"
-            '  "report": "brief summary of findings",\n'
-            '  "targets": [\n'
-            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0, "description": "concise label of what was detected"}\n'
-            '  ]\n'
-            "}\n\n"
-            + _BBOX_RULES
-            + "No markdown, no text outside the JSON object."
-        )
-        return prompt, True
-
-    elif intent == "count":
-        prompt = (
-            f"You are analyzing UAV aerial imagery.\n"
-            f"{img_info}\n\n"
-            f"Count and locate: {user_query}\n\n"
-            "Return ONLY a valid JSON object:\n"
-            "{\n"
-            '  "report": "total count and summary",\n'
-            '  "count": 0,\n'
-            '  "targets": [\n'
-            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0, "description": "concise label of what was detected"}\n'
-            '  ]\n'
-            "}\n\n"
-            + _BBOX_RULES
-            + "No markdown, no text outside the JSON object."
-        )
-        return prompt, True
-
-    elif intent == "area_description":
-        prompt = (
-            f"You are analyzing UAV aerial imagery.\n"
-            f"{img_info}\n\n"
-            f"Answer the following question about this image:\n"
-            f"QUERY: {user_query}\n\n"
-            "Return ONLY a valid JSON object:\n"
-            "{\n"
-            '  "report": "detailed answer based on what you observe",\n'
-            '  "targets": []\n'
-            "}\n\n"
-            "No markdown, no text outside the JSON object."
-        )
-        return prompt, False
-
-    elif intent == "change":
-        prompt = (
-            f"You are analyzing UAV aerial imagery for anomaly detection.\n"
-            f"{img_info}\n\n"
-            f"QUERY: {user_query}\n\n"
-            "Return ONLY a valid JSON object:\n"
-            "{\n"
-            '  "report": "description of anomalies found",\n'
-            '  "targets": [\n'
-            '    {"filename": "<name>", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0, "description": "concise label of what was detected", "reason": "why flagged"}\n'
-            '  ]\n'
-            "}\n\n"
-            + _BBOX_RULES
-            + "No markdown, no text outside the JSON object."
-        )
-        return prompt, True
-
-    raise ValueError(f"Unhandled intent: {intent}")
+    return (
+        f"You are analyzing a crop from a UAV nadir (top-down) aerial image.\n"
+        f"The image shows a single candidate detection: {label_hint}.\n"
+        f"Image size: {img_w}×{img_h} pixels.\n"
+        f"Original operator query: \"{original_query}\""
+        f"{colour_line}{size_line}\n\n"
+        f"TASK: Determine whether this detection is genuine.\n\n"
+        f"VERIFICATION CRITERIA\n{criteria}\n\n"
+        f"If confirmed, populate the report fields below.\n"
+        f"If rejected, explain why briefly.\n\n"
+        "Return ONLY a valid JSON object in this exact format:\n"
+        "{\n"
+        '  "confirmed": true or false,\n'
+        '  "reason": "brief explanation if rejected, else empty string",\n'
+        '  "report": {\n'
+        f"{field_schema}\n"
+        "  }\n"
+        "}\n\n"
+        "Rules:\n"
+        "- confirmed must be a boolean (true/false), not a string.\n"
+        "- If confirmed is false, report fields may be empty strings.\n"
+        "- No markdown, no text outside the JSON object.\n"
+        "- Be strict: reject shadows, vegetation patterns, or ambiguous blobs."
+    )
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # TacticalAnalyst
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TacticalAnalyst:
-    def __init__(self, provider="openrouter", model_name=None, api_key=None):
+
+    def __init__(
+        self,
+        provider:   str        = "openrouter",
+        model_name: str | None = None,
+        api_key:    str | None = None,
+    ) -> None:
         self.provider = provider.lower()
-        self.api_key = api_key
-        logger.info(f"Analyst initialized. Provider: {self.provider}")
+        self.api_key  = api_key
+        logger.info("Analyst initialized. Provider: %s", self.provider)
 
         if self.provider == "openrouter":
             self.model_name = model_name or "qwen/qwen-2.5-vl-72b-instruct"
@@ -143,62 +167,60 @@ class TacticalAnalyst:
                 api_key=self.api_key,
                 default_headers={
                     "HTTP-Referer": "https://github.com/arie/TAE",
-                    "X-Title": "TAE"
-                }
+                    "X-Title": "TAE",
+                },
             )
         else:
             self.model_name = model_name or "moondream"
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     # Public interface
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
 
-    def analyze_multiple_views(self, candidates: list[dict], user_query: str) -> dict:
+    def analyze_multiple_views(
+        self,
+        candidates: list[dict],
+        user_query: str,
+    ) -> dict:
         """
-        Analyzes each candidate tile independently and merges results.
+        Legacy CLIP→VLM path — used by anomaly_detection pipeline.
 
-        Accepts candidate dicts (from LanceDB) rather than file paths because
-        tiles are not stored on disk — each tile is reconstructed on demand
-        from its parent frame using the stored pixel offsets.
-
-        Only tiles with confirmed detections appear in the final report.
-        Tiles where the VLM found nothing are counted but not reported.
+        Analyses each candidate tile independently and merges results.
+        Tiles are reconstructed on demand from parent frames; no disk I/O for tiles.
         """
         logger.info(
-            f"Query: {user_query} | "
-            f"Tiles: {[Path(c['image_path']).name for c in candidates]}"
+            "Query: %s | Tiles: %s",
+            user_query,
+            [Path(c["image_path"]).name for c in candidates],
         )
 
-        merged_targets = []
-        hit_reports    = []
-        miss_count     = 0
+        merged_targets: list[dict] = []
+        hit_reports:    list[str]  = []
+        miss_count = 0
 
         for cand in candidates:
-            filename = Path(cand['image_path']).name
-
-            # Reconstruct tile from parent frame — no file I/O for tiles
+            filename = Path(cand["image_path"]).name
             tile_img = _load_tile_cv2(cand)
             if tile_img is None:
-                logger.warning(f"Skipping {filename} — could not load parent frame")
+                logger.warning("Skipping %s — could not load parent frame", filename)
                 continue
 
             img_h, img_w = tile_img.shape[:2]
             prompt, expects_bboxes = _build_prompt(user_query, filename, img_w, img_h)
 
             try:
-                result = self._call_vlm_with_validation(
+                result  = self._call_vlm_with_validation(
                     tile_img, filename, prompt, expects_bboxes, img_w, img_h
                 )
-                targets = result.get('targets', [])
+                targets = result.get("targets", [])
                 if targets:
                     hit_reports.append(f"{filename}: {result.get('report', '')}")
                     merged_targets.extend(targets)
                 else:
                     miss_count += 1
-                    logger.info(f"No detection in {filename} (VLM confirmed absent)")
-
+                    logger.info("No detection in %s (VLM confirmed absent)", filename)
             except Exception as e:
-                logger.error(f"VLM failed for {filename} after retries: {e}")
+                logger.error("VLM failed for %s after retries: %s", filename, e)
 
         summary = (
             f"{len(hit_reports)} tiles with detections, "
@@ -209,126 +231,80 @@ class TacticalAnalyst:
             if hit_reports
             else f"No detections found. {summary}"
         )
+        return {"report": report, "targets": merged_targets, "summary": summary}
 
-        return {
-            "report":  report,
-            "targets": merged_targets,
-            "summary": summary,
+    def verify_detection(
+        self,
+        image:          np.ndarray,
+        criteria:       str,
+        report_fields:  list[str],
+        original_query: str,
+        colour_hint:    str | None = None,
+        size_qualifier: str | None = None,
+        label_hint:     str        = "detected object",
+    ) -> dict:
+        """
+        Stage 4 of the object_detection pipeline.
+
+        Accepts the SAM-masked crop (background is neutral grey), structured
+        criteria and report_fields from ObjectDetectionParams.
+
+        Returns
+        -------
+        {
+            "confirmed": bool,
+            "reason":    str,   # why rejected (empty if confirmed)
+            "report":    dict,  # report_fields populated by VLM
         }
-
-    # ------------------------------------------------------------------
-    # Validation and normalization
-    # ------------------------------------------------------------------
-
-    def _normalize_targets(self, targets: list, img_w: int, img_h: int) -> list:
+        Never raises — returns {"confirmed": False, "reason": "error: ..."} on failure.
         """
-        Safety net: converts 0-1000 normalized coords to pixels if the VLM
-        ignored the explicit pixel dimensions in the prompt.
-        """
-        normalized = []
-        for t in targets:
-            bbox = t.get('bbox', [])
-            if len(bbox) != 4:
-                continue
-            xmin, ymin, xmax, ymax = [float(v) for v in bbox]
+        if image is None or image.size == 0:
+            return {"confirmed": False, "reason": "empty image", "report": {}}
 
-            if max(xmin, ymin, xmax, ymax) <= 1000 and max(img_w, img_h) > 1000:
-                xmin = round(xmin * img_w / 1000)
-                ymin = round(ymin * img_h / 1000)
-                xmax = round(xmax * img_w / 1000)
-                ymax = round(ymax * img_h / 1000)
-                logger.info(
-                    f"Converted 0-1000 to pixel bbox: "
-                    f"[{int(xmin)},{int(ymin)},{int(xmax)},{int(ymax)}]"
-                )
+        h, w   = image.shape[:2]
+        prompt = _build_verify_prompt(
+            label_hint     = label_hint,
+            criteria       = criteria,
+            report_fields  = report_fields,
+            original_query = original_query,
+            colour_hint    = colour_hint,
+            size_qualifier = size_qualifier,
+            img_w          = w,
+            img_h          = h,
+        )
 
-            normalized.append({**t, 'bbox': [int(xmin), int(ymin), int(xmax), int(ymax)]})
-        return normalized
-
-
-    def _clamp_targets(self, targets: list, img_w: int, img_h: int) -> list:
-        """
-        Clamps bbox coordinates to tile dimensions.
-
-        Handles the common case where the VLM returns a bbox that slightly
-        overshoots the tile edge (e.g. xmax=644 on a 640px tile) because it
-        estimates the object extends to "approximately the boundary".
-        A 4px overshoot carries no useful information and should not trigger
-        a full retry — clamping preserves the detection intact.
-
-        Genuinely bad bboxes (inverted axes, wrong scale) pass through unchanged
-        and are caught by the subsequent _validate_targets() call.
-        """
-        clamped = []
-        for t in targets:
-            bbox = t.get('bbox', [])
-            if len(bbox) != 4:
-                clamped.append(t)
-                continue
-            xmin, ymin, xmax, ymax = bbox
-            xmin_c = max(0, min(int(xmin), img_w))
-            ymin_c = max(0, min(int(ymin), img_h))
-            xmax_c = max(0, min(int(xmax), img_w))
-            ymax_c = max(0, min(int(ymax), img_h))
-            if (xmin_c, ymin_c, xmax_c, ymax_c) != (xmin, ymin, xmax, ymax):
-                logger.info(
-                    f"Clamped bbox [{xmin},{ymin},{xmax},{ymax}] → "
-                    f"[{xmin_c},{ymin_c},{xmax_c},{ymax_c}] "
-                    f"(tile {img_w}×{img_h})"
-                )
-            clamped.append({**t, 'bbox': [xmin_c, ymin_c, xmax_c, ymax_c]})
-        return clamped
-    
-
-    def _validate_targets(self, targets: list, img_w: int, img_h: int) -> bool:
-        """
-        Validates bboxes in pixel space.
-        Empty list is valid — means object not present in this tile.
-        """
-        for t in targets:
-            bbox = t.get('bbox', [])
-            if len(bbox) != 4:
-                logger.warning(f"Bad bbox length: {bbox}")
-                return False
-            xmin, ymin, xmax, ymax = bbox
-            if not (xmax > xmin and ymax > ymin):
-                logger.warning(f"Inverted bbox: {bbox}")
-                return False
-            if xmin < 0 or ymin < 0 or xmax > img_w or ymax > img_h:
-                logger.warning(f"Bbox out of bounds {img_w}x{img_h}: {bbox}")
-                return False
-            if (xmax - xmin) > 0.95 * img_w and (ymax - ymin) > 0.95 * img_h:
-                logger.warning(f"Full-tile bbox (likely hallucination): {bbox}")
-                return False
-        return True
-
-    def _filter_low_confidence_targets(
-        self, targets: list, threshold: float = 0.4
-    ) -> list:
-        """
-        Drops targets below the confidence threshold.
-        Models that omit the confidence field default to 1.0 (always kept).
-        """
-        filtered = []
-        for t in targets:
-            conf = float(t.get('confidence', 1.0))
-            if conf >= threshold:
-                filtered.append(t)
+        filename = f"crop_{label_hint[:20]}.jpg"
+        try:
+            if self.provider == "openrouter":
+                raw = self._analyze_openrouter(image, filename, prompt)
             else:
-                logger.info(
-                    f"Dropped low-confidence target in {t.get('filename')} "
-                    f"(conf={conf:.2f}, bbox={t.get('bbox')})"
-                )
-        return filtered
+                raw = self._analyze_ollama(image, filename, prompt)
+        except Exception as exc:
+            logger.warning("VLM call failed in verify_detection: %s", exc)
+            return {"confirmed": False, "reason": f"error: {exc}", "report": {}}
 
-    # ------------------------------------------------------------------
+        try:
+            clean  = re.sub(r"^```json\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+            result = json.loads(clean)
+            return {
+                "confirmed": bool(result.get("confirmed", False)),
+                "reason":    result.get("reason", ""),
+                "report":    result.get("report", {}),
+            }
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning(
+                "Failed to parse VLM verify response: %s\nRaw: %s", exc, raw[:200]
+            )
+            return {"confirmed": False, "reason": f"parse error: {exc}", "report": {}}
+
+    # ──────────────────────────────────────────────────────────────────────────
     # VLM call with retry
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_fixed(2),
-        retry=retry_if_exception_type(ValueError)
+        retry=retry_if_exception_type(ValueError),
     )
     def _call_vlm_with_validation(
         self,
@@ -344,66 +320,130 @@ class TacticalAnalyst:
         else:
             res_text = self._analyze_ollama(tile_img, filename, prompt)
 
-        logger.debug(f"Raw VLM response: {res_text}")
-        clean = re.sub(r'^```json\s*|\s*```$', '', res_text.strip(), flags=re.MULTILINE)
+        logger.debug("Raw VLM response: %s", res_text)
+        clean  = re.sub(r"^```json\s*|\s*```$", "", res_text.strip(), flags=re.MULTILINE)
         result = json.loads(clean)
 
-        if expects_bboxes and result.get('targets'):
-            logger.debug(f"VLM raw bbox: {result['targets']}")
-            result['targets'] = self._normalize_targets(result['targets'], img_w, img_h)
-            result['targets'] = self._clamp_targets(result['targets'], img_w, img_h)
-            result['targets'] = self._filter_low_confidence_targets(result['targets'])
-            logger.debug(f"VLM fixed bbox: {result['targets']}")
-
-            if not self._validate_targets(result['targets'], img_w, img_h):
+        if expects_bboxes and result.get("targets"):
+            result["targets"] = self._normalize_targets(result["targets"], img_w, img_h)
+            result["targets"] = self._clamp_targets(result["targets"], img_w, img_h)
+            result["targets"] = self._filter_low_confidence_targets(result["targets"])
+            if not self._validate_targets(result["targets"], img_w, img_h):
                 raise ValueError(f"Invalid bboxes after normalization: {result['targets']}")
 
         return result
 
-    # ------------------------------------------------------------------
-    # Provider backends — encode numpy tile directly, no disk I/O
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
+    # Provider backends
+    # ──────────────────────────────────────────────────────────────────────────
 
     def _serialise_tile_for_api(self, tile_img: np.ndarray, filename: str) -> str:
-        """Encodes a numpy array as a base64 JPEG string."""
-        _, buf = cv2.imencode('.jpg', tile_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        encoded = base64.b64encode(buf.tobytes()).decode('utf-8')
-        size_kb = len(buf) / 1024
-        return encoded
+        """Encode a numpy array as a base64 JPEG string."""
+        ok, buf = cv2.imencode(".jpg", tile_img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            raise ValueError(f"Failed to encode tile {filename}")
+        return base64.standard_b64encode(buf.tobytes()).decode("utf-8")
 
     def _analyze_openrouter(
-        self, tile_img: np.ndarray, filename: str, prompt: str
+        self,
+        tile_img: np.ndarray,
+        filename: str,
+        prompt:   str,
     ) -> str:
-        img_b64 = self._serialise_tile_for_api(tile_img, filename)
-
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[{
+        b64_image = self._serialise_tile_for_api(tile_img, filename)
+        response  = self.client.chat.completions.create(
+            model    = self.model_name,
+            messages = [{
                 "role": "user",
                 "content": [
+                    {
+                        "type":      "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                    },
                     {"type": "text", "text": prompt},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                ]
+                ],
             }],
-            response_format={"type": "json_object"}
+            max_tokens  = 1024,
+            temperature = 0.1,
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content or ""
 
     def _analyze_ollama(
-        self, tile_img: np.ndarray, filename: str, prompt: str
+        self,
+        tile_img: np.ndarray,
+        filename: str,
+        prompt:   str,
     ) -> str:
-        img_b64 = self._serialise_tile_for_api(tile_img, filename)
-
-        response = ollama.chat(
-            model=self.model_name,
-            format='json',
-            messages=[{
-                'role':    'user',
-                'content': prompt,
-                'images':  [img_b64]
-            }]
+        b64_image = self._serialise_tile_for_api(tile_img, filename)
+        response  = ollama.chat(
+            model    = self.model_name,
+            messages = [{
+                "role":    "user",
+                "content": prompt,
+                "images":  [b64_image],
+            }],
         )
-        return response['message']['content']
-    
-    
+        return response["message"]["content"]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Bbox validation helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _normalize_targets(
+        self, targets: list, img_w: int, img_h: int
+    ) -> list:
+        """Convert 0-1000 normalized coords to pixels if the VLM used that scale."""
+        normalized = []
+        for t in targets:
+            b = t.get("bbox")
+            if not b or len(b) != 4:
+                continue
+            if all(0.0 <= v <= 1.0 for v in b):
+                b = [b[0]*img_w, b[1]*img_h, b[2]*img_w, b[3]*img_h]
+            elif max(b) <= 1000 and any(v > 1.0 for v in b):
+                b = [b[0]/1000*img_w, b[1]/1000*img_h,
+                     b[2]/1000*img_w, b[3]/1000*img_h]
+            t = dict(t); t["bbox"] = [int(round(v)) for v in b]
+            normalized.append(t)
+        return normalized
+
+    def _clamp_targets(
+        self, targets: list, img_w: int, img_h: int
+    ) -> list:
+        clamped = []
+        for t in targets:
+            b = t.get("bbox")
+            if not b or len(b) != 4:
+                continue
+            b = [
+                max(0, min(int(b[0]), img_w - 1)),
+                max(0, min(int(b[1]), img_h - 1)),
+                max(0, min(int(b[2]), img_w)),
+                max(0, min(int(b[3]), img_h)),
+            ]
+            if b[2] > b[0] and b[3] > b[1]:
+                t = dict(t); t["bbox"] = b
+                clamped.append(t)
+        return clamped
+
+    def _validate_targets(
+        self, targets: list, img_w: int, img_h: int
+    ) -> bool:
+        for t in targets:
+            b = t.get("bbox", [])
+            if len(b) != 4:
+                return False
+            x1, y1, x2, y2 = b
+            if x1 >= x2 or y1 >= y2:
+                return False
+            if x2 > img_w * 1.05 or y2 > img_h * 1.05:
+                return False
+        return True
+
+    def _filter_low_confidence_targets(
+        self, targets: list, threshold: float = 0.10
+    ) -> list:
+        return [
+            t for t in targets
+            if float(t.get("confidence", 1.0)) >= threshold
+        ]

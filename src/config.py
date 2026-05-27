@@ -74,10 +74,17 @@ class Settings(BaseSettings):
     )
     SAM_MAX_DIM: int = 1024
 
-    YOLO_WORLD_REPLICATE_MODEL: str = (
-        "zsxkib/yolo-world:"
-        "07aee09fc38bc4459409caa872ea416717712f4e6e875f8751a0d0d5bbea902f"
-)
+    DETECTOR_REPLICATE_MODEL: str = (
+        "adirik/grounding-dino:"
+        "efd10a8ddc57ea28773327e881ce95e20cc1d734c589f7dd01d2036921ed78aa"
+    )
+    DETECTOR_TIMEOUT_S: int = 180   # max seconds to wait for all predictions to complete
+
+    # Approximately 22 metres at mid-latitudes (0.0002° × 111,000 m/° ≈ 22 m). 
+    # Two detections from different frames that are within 22 metres of each other in geo-coordinates get assigned to the same track. 
+    # At typical survey altitudes (80–150 m AGL) with overlapping tiles, the same physical object will appear in adjacent frames within a few metres, so 22 m gives comfortable headroom without merging genuinely separate objects. 
+    # Halve it to 0.0001 (~11 m) for dense urban surveys with closely spaced objects. 
+    TRACKER_GEO_PROXIMITY_DEG: float = 0.0002
 
     # ── Persistent storage root ───────────────────────────────────────────────
     DATA_DIR: str = _DEFAULT_DATA_DIR

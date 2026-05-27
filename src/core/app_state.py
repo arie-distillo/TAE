@@ -44,6 +44,7 @@ _state: dict = {
     "ingest_progress": "",
     "ingesting":       False,
     "ingest_msg":      None,
+    "mean_alt_m":      100.0,   # updated after each upload from telemetry metadata
 
     # video playback
     "video_files":      [],   # [filename, ...] in upload order

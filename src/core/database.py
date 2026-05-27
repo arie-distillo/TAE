@@ -1,7 +1,9 @@
+import logging
 import lancedb
 import pyarrow as pa
 from config import settings
 
+logger = logging.getLogger("TAE.VectorDB")
 
 class TacticalDatabase:
     """
@@ -147,3 +149,14 @@ class TacticalDatabase:
         if self.table is None:
             return 0
         return self.table.count_rows()
+    
+
+    def get_all_tiles(self) -> list[dict]:
+        """Return all tile records as dicts — used by detection_pipeline Stage 1."""
+        if self.table is None:
+            return []
+        try:
+            return self.table.to_pandas().to_dict(orient="records")
+        except Exception as e:
+            logger.error("get_all_tiles failed: %s", e)
+            return []

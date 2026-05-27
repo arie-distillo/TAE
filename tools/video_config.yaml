@@ -1,130 +1,52 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# TAE Synthetic Video Config  —  video_config.yaml
+# TAE Synthetic Video Config  —  minimal edition
 #
-# Usage:
-#   python generate_synthetic_video.py --config video_config.yaml
+# Usage (from project root):
+#   python tools/generate_synthetic_video.py --config tools/video_config.yaml
 #
-# All CLI flags (--altitude, --fps, etc.) still work and override this file.
+# Required:   image, altitude, tracking_targets[].png + real_size_m + speed_ms
+# Everything else is auto-derived from altitude + camera model.
 # ─────────────────────────────────────────────────────────────────────────────
 
+image:    data/assets/terrain_1.jpg     # any JPEG/PNG; .pgw world file auto-detected
+altitude: 80                        # AGL metres  (the only flight parameter you must set)
 
-# ── Satellite / aerial base image ─────────────────────────────────────────────
-image: data/raw/Lbn/lbn.png
-# Geo bounds: omit if a .pgw world file sits alongside the image, or GeoTIFF.
-# bounds: "31.230,34.560,31.250,34.590"    # lat_min,lon_min,lat_max,lon_max
+# ── Synthetic geo-centre (ignored if the image has a .pgw world file) ─────────
+# The tool invents self-consistent coordinates so TAE's spatial pipeline works.
+# Absolute position is arbitrary — leave as-is for pure tracker testing.
+# center_lat: 32.0    ← default
+# center_lon: 35.0    ← default
 
+# ── Camera (DJI Mini 2 defaults — change only if using a different drone) ─────
+# sensor_w: 6.3
+# sensor_h: 4.7
+# focal:    4.5
 
-# ── Flight simulation ─────────────────────────────────────────────────────────
-altitude:  150          # AGL metres
-speed:     8.0         # drone speed m/s
-pattern:   straight   # boustrophedon | straight
-overlap:   30          # lane overlap %
+# ── Auto-derived (leave commented unless you want to override) ─────────────────
+# speed:   5.6        # m/s — auto: cross full footprint in 20 s
+# fps:     10         # auto
+# pattern: straight   # auto: one clean pass, ideal for tracking tests
+# overlap: 0          # auto
 
-
-# ── Output video ──────────────────────────────────────────────────────────────
-fps:    2
-width:  1920
-height: 1080
-output: output/tracking_test
-
-
-# ── Camera (DJI Mini 2 defaults) ─────────────────────────────────────────────
-sensor_w: 6.3    # sensor width mm
-sensor_h: 4.7    # sensor height mm
-focal:    4.5    # focal length mm
-
-
-# ── Static objects baked into terrain ─────────────────────────────────────────
-# Format: "lat,lon,color[,radius_m];..."
-# static_objects: "31.240,34.570,red,3;31.235,34.580,blue,2"
-
-
-# ── Frame extraction (for TAE ingest) ─────────────────────────────────────────
+# ── Output ────────────────────────────────────────────────────────────────────
+output:         output/tracking_test
 extract_frames: true
 
 
-# ── Tracking targets ───────────────────────────────────────────────────────────
-# Each entry plants a PNG object that moves through geo-space over a window of
-# frames.  The object appears in the video wherever the camera footprint
-# overlaps its current geo-position — a natural tracking test subject.
-#
-# Sizing priority:
-#   real_size_m  →  geo-correct sizing using GSD (recommended)
-#   scale        →  fallback: fraction of the video short-edge
-#
-# trajectory.direction_deg:
-#   number → fixed bearing (degrees CW from North, 0=N 90=E 180=S 270=W)
-#   null   → random direction, seeded deterministically per target
+# ── Tracking targets ──────────────────────────────────────────────────────────
+# Required per target:  png, real_size_m, speed_ms
+# Optional:             id, direction_deg, start_frame, end_frame,
+#                       start_lat, start_lon  (all auto if omitted)
 #
 tracking_targets:
 
-  # ── Vehicle moving NE across the survey area ──────────────────────────────
-  - id: cow
-    png: data/assets/Cow_from_above.png       # PNG with alpha channel (transparent background)
-    real_size_m: 2.0              # car body ≈ 4.5 m wide → GSD-correct pixel size
-    start_frame: 100               # appears at frame 60 (t=2 s at 30fps)
-    end_frame:   120              # disappears at frame 450 (t=15 s)
-    trajectory:
-      type:          linear
-      direction_deg: 47           # roughly NE
-      speed_ms:      0.1          # 
+  - id:          cow
+    png:         data/assets/cow_1.png
+    real_size_m: 2.0        # physical size → geo-correct pixel footprint via GSD
+    speed_ms:    0.5        # object speed in m/s
 
-  # ── Pedestrian wandering, random direction ────────────────────────────────
-  - id: horse
-    png: data/assets/Horse_from_above.png
-    real_size_m: 1.5              # shoulder width ≈ 0.5 m
-    start_frame: 200
-    end_frame:   220
-    trajectory:
-      type:          linear
-      direction_deg: null         # random bearing, seeded from target index
-      speed_ms:      1.4          # ≈ 5 km/h walking speed
-
-  # ── Fast-moving object (motorcycle-sized), fixed direction ────────────────
-  #- id: motorbike_1
-  #  png: assets/motorbike_top.png
-  #  real_size_m: 2.0
-  #  start_frame: 200
-  #  end_frame:   400
-  #  start_lat:  31.2330
-  #  start_lon:  34.5700
-  #  trajectory:
-  #    type:          linear
-  #    direction_deg: 270          # due West
-  #    speed_ms:      15.0         # ≈ 54 km/h
-
-  # ── Example using scale instead of real_size_m ───────────────────────────
-  # - id: unknown_object
-  #   png: assets/blob.png
-  #   scale: 0.03                 # 3% of the video short-edge (1080px → ~32px)
-  #   start_frame: 0
-  #   end_frame:   900
-  #   start_lat:  31.2360
-  #   start_lon:  34.5660
-  #   trajectory:
-  #     type:          linear
-  #     direction_deg: 135        # SE
-  #     speed_ms:      5.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Ground-truth output
-# ─────────────────────────────────────────────────────────────────────────────
-# tracking_ground_truth.json is always written if any target is visible.
-# Schema:
-# {
-#   "fps": 30,
-#   "total_frames": N,
-#   "video_w": 1920, "video_h": 1080,
-#   "targets": {
-#     "vehicle_1": {
-#       "start_frame": 60, "end_frame": 450,
-#       "start_lat": 31.232, "start_lon": 34.565,
-#       "speed_ms": 8.3, "real_size_m": 4.5,
-#       "frames": {
-#         "72": {"active":true,"visible":true,"lat":...,"lon":...,"pixel_cx":...,"pixel_cy":...,"obj_w_px":...,"obj_h_px":...},
-#         ...
-#       }
-#     }
-#   }
-# }
+  - id:          horse
+    png:         data/assets/horse.png
+    real_size_m: 1.8
+    speed_ms:    1.4
+    direction_deg: 270      # optional: fix bearing (West); omit for random

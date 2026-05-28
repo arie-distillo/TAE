@@ -342,8 +342,13 @@ def sam_refine_stage(candidates, priors, actual_alt_m, sam_segmentor):
     from ai.intent import scale_shape_priors
     scaled        = scale_shape_priors(priors, actual_alt_m)
     sam_available = sam_segmentor is not None and hasattr(sam_segmentor, "predict_box")
+    
     if not sam_available:
-        logger.info("SAM unavailable — bbox crops used directly")
+        if sam_segmentor is None:
+            reason = "segmentor is None — check REPLICATE_API_KEY and SAM_REPLICATE_MODEL in config"
+        else:
+            reason = "predict_box method missing — segmentor.py needs update"
+        logger.info("SAM unavailable (%s) — bbox crops used directly", reason)
 
     refined = []
     for det in candidates:
@@ -394,35 +399,68 @@ def sam_refine_stage(candidates, priors, actual_alt_m, sam_segmentor):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def vlm_verify_stage(candidates, params, original_query, analyst):
-    confirmed = []
-    for det in candidates:
-        if det.masked_crop is None:
-            continue
-        try:
-            result = analyst.verify_detection(
-                image          = det.masked_crop,
-                criteria       = params.vlm_verification_criteria,
-                report_fields  = params.vlm_reporting_fields,
-                original_query = original_query,
-                colour_hint    = params.colour_hint,
-                size_qualifier = params.size_qualifier,
-                label_hint     = det.label,
-            )
-            if result.get("confirmed"):
-                det.confirmed  = True
-                det.vlm_report = result.get("report", {})
-                confirmed.append(det)
-                logger.info("VLM confirmed %s in %s",
-                            det.label, Path(det.parent_path).name)
-            else:
-                logger.info("VLM rejected %s in %s: %s",
-                            det.label, Path(det.parent_path).name,
-                            result.get("reason", ""))
-        except Exception as exc:
-            logger.warning("VLM failed for %s: %s", det.det_id, exc)
-    logger.info("VLM: %d → %d confirmed", len(candidates), len(confirmed))
-    return confirmed
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from collections import defaultdict
 
+    # Group candidates by (parent_path, tile_x, tile_y) — same tile
+    tile_groups: dict[tuple, list[Detection]] = defaultdict(list)
+    for det in candidates:
+        key = (det.parent_path, det.tile_x, det.tile_y)
+        tile_groups[key].append(det)
+
+    logger.info("VLM batch: %d candidates across %d tiles",
+                len(candidates), len(tile_groups))
+
+    def _verify_tile(tile_key, tile_dets):
+        parent, tx, ty = tile_key
+        tile_rec = {
+            "parent_path": parent,
+            "tile_x": tx, "tile_y": ty,
+            "tile_w": tile_dets[0].tile_w,
+            "tile_h": tile_dets[0].tile_h,
+        }
+        tile_img = _load_tile_img(tile_rec)
+        if tile_img is None:
+            return []
+
+        batch_input = [
+            {"label": d.label, "bbox": d.bbox_tile}
+            for d in tile_dets
+        ]
+        results = analyst.verify_detections_batch(
+            tile_img       = tile_img,
+            detections     = batch_input,
+            criteria       = params.vlm_verification_criteria,
+            report_fields  = params.vlm_reporting_fields,
+            original_query = original_query,
+            colour_hint    = params.colour_hint,
+            size_qualifier = params.size_qualifier,
+        )
+        confirmed = []
+        for det, result in zip(tile_dets, results):
+            if result.get("confirmed"):
+                det.confirmed = True
+                det.vlm_report = result.get("report", {})
+                # Prefer VLM's own label over GDINO's; fall back to GDINO label
+                vlm_label = result.get("detected_label", "").strip()
+                if vlm_label:
+                    det.label = vlm_label
+                confirmed.append(det)
+                logger.info("VLM confirmed %s in %s tile(%d,%d)",
+                            det.label, Path(parent).name, tx, ty)
+        return confirmed
+
+    confirmed = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(_verify_tile, key, dets): key
+            for key, dets in tile_groups.items()
+        }
+        for future in as_completed(futures):
+            confirmed.extend(future.result())
+
+    logger.info("VLM: %d candidates → %d confirmed", len(candidates), len(confirmed))
+    return confirmed
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 5 — Geo-location

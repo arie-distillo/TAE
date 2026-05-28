@@ -232,7 +232,7 @@ def _restore_state() -> None:
     try:
         paths = _state.get("mission_paths")
         if paths and _state.get("ingested"):
-            dets = _load_detections(paths.maps)
+            dets = _load_detections(paths.detections)
             if dets:
                 _state["detections"]      = dets
                 _state["detections_ready"] = True
@@ -1818,6 +1818,46 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                     mission_mgr.update(mid, scene_context=m.definition)
                     _state["last_query"] = m.definition
                     _state["detections_ready"] = True
+
+                    # Persist tracks → _state["detections"], rebuild map
+                    _new_det_ids = []
+                    for _track in _tracks:
+                        _det_id = uuid.uuid4().hex[:10]
+                        _best   = _track.best
+                        _img_urls = []
+                        for _det in _track.detections:
+                            _u = _annotate_and_save(
+                                {"parent_path": _det.parent_path,
+                                "tile_x": _det.tile_x, "tile_y": _det.tile_y,
+                                "tile_w": _det.tile_w, "tile_h": _det.tile_h},
+                                _det.bbox_tile, m.definition[:20]
+                            )
+                            if _u:
+                                _img_urls.append(_u)
+                        _state["detections"][_det_id] = {
+                            "lat": _track.lat, "lon": _track.lon,
+                            "label": _best.label, "color": color,
+                            "confirmed": True, "img_urls": _img_urls,
+                            "is_multiangle": len(_track.detections) > 1,
+                            "source_count": len(_track.detections),
+                            "bbox": _best.bbox_tile,
+                            "source": Path(_best.parent_path).name,
+                            "parent_path": _best.parent_path,
+                            "tile_x": _best.tile_x, "tile_y": _best.tile_y,
+                            "tile_w": _best.tile_w, "tile_h": _best.tile_h,
+                            "vlm_report": _best.vlm_report,
+                            "track_id": _track.track_id,
+                            "gsd":          "—",
+                        }
+                        _new_det_ids.append(_det_id)
+
+                    if _new_det_ids:
+                        _recenter_on_detections(_new_det_ids)
+                        _build_map()
+                        _paths = _state.get("mission_paths")
+                        if _paths:
+                            _save_detections(_paths.detections)
+
                     snip = m.definition[:40] + (
                         "..." if len(m.definition) > 40 else ""
                     )
@@ -2042,18 +2082,21 @@ def upload_progress():
         )
     msg = _state.pop("ingest_msg", None)
     if msg:
+        refresh_script = Script("""
+            refreshMap();
+            htmx.ajax('GET', '/detections_panel_content',
+                {target: '#detections-panel-content', swap: 'innerHTML'});
+            htmx.ajax('GET', '/video_panel',
+                {target: '#video-panel', swap: 'innerHTML'});
+        """)
         video_act = Script(
             "const vp=document.getElementById('video-panel');"
             "if(vp && !vp.classList.contains('open')){"
             "  vp.classList.add('open');"
-            "  htmx.ajax('GET','/video_panel',"
-            "    {target:'#video-panel',swap:'innerHTML'});"
             "}"
         ) if _state.get("video_files") else ""
-        return _msg(msg, "sys"), _status_badge(), Script("refreshMap();"), video_act
+        return _msg(msg, "sys"), _status_badge(), refresh_script, video_act
     return ""
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SAM2 segmentor (lazy singleton)
@@ -2271,7 +2314,7 @@ async def query(message: str):  # noqa — signature only for illustration
         all_tiles        = all_tiles,
         original_query   = message,
         analyst          = analyst,
-        sam_segmentor    = _get_segmentor() if (mission and mission.allows("anomaly_detection")) else None,
+        sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None,
         api_key          = getattr(settings, "REPLICATE_API_KEY", ""),
         model_version    = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
         timeout_s        = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
@@ -2291,7 +2334,7 @@ async def query(message: str):  # noqa — signature only for illustration
                 "tile_x": det.tile_x, "tile_y": det.tile_y,
                 "tile_w": det.tile_w, "tile_h": det.tile_h,
             }
-            url = _annotate_and_save(tile_candidate, det.bbox_tile, message[:20])
+            url = _annotate_and_save(tile_candidate, det.bbox_tile, best.label)
             if url:
                 img_urls.append(url)
  
@@ -2303,13 +2346,13 @@ async def query(message: str):  # noqa — signature only for illustration
         _state["detections"][det_id] = {
             "lat":           track.lat,
             "lon":           track.lon,
-            "label":         message,
+            "label":         best.label,
             "color":         color,
             "confirmed":     True,
             "img_urls":      img_urls,
             "is_multiangle": len(track.detections) > 1,
             "source_count":  len(track.detections),
-            "gsd":           f"{best.tile_w / max(1, best.tile_h):.1f}",
+            "gsd":           "-",
             "bbox":          best.bbox_tile,
             "source":        Path(best.parent_path).name,
             "parent_path":   best.parent_path,
@@ -2332,7 +2375,7 @@ async def query(message: str):  # noqa — signature only for illustration
  
     paths = _state.get("mission_paths")
     if paths:
-        _save_detections(paths.maps)
+        _save_detections(paths.detections)
  
     dot_solid  = f'<span style="color:{color};font-size:13px">&#9679;</span>'
     dot_hollow = f'<span style="color:{color};font-size:13px">&#9675;</span>'
@@ -2389,7 +2432,7 @@ def images(det_id: str):
         Div(det["label"][:60], cls="label"),
         f"LAT {det['lat']:.6f}  ·  LON {det['lon']:.6f}",
         Br(),
-        f"GSD {det['gsd']} cm/px  ·  Source: {det['source']}",
+        f"GSD {det.get('gsd', '—')} cm/px  ·  Source: {det['source']}",
         cls="det-meta", style="margin:0 12px 12px",
     )
     return (

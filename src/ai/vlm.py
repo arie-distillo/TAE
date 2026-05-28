@@ -143,6 +143,37 @@ def _build_verify_prompt(
         "- Be strict: reject shadows, vegetation patterns, or ambiguous blobs."
     )
 
+def _build_batch_verify_prompt(
+    label_hints:    list[str],    # ["house", "road", "building", ...]
+    bboxes:         list[list],   # [[x1,y1,x2,y2], ...]  tile-local px
+    criteria:       str,
+    report_fields:  list[str],
+    original_query: str,
+    img_w: int, img_h: int,
+) -> str:
+    candidates_desc = "\n".join(
+        f"  {i}: label='{label_hints[i]}' bbox={bboxes[i]}"
+        for i in range(len(bboxes))
+    )
+    field_schema = ", ".join(f'"{f}"' for f in report_fields)
+    return (
+        f"You are analyzing a UAV nadir (top-down) aerial tile.\n"
+        f"Image size: {img_w}×{img_h} pixels. 0,0 is top-left.\n"
+        f"Original query: \"{original_query}\"\n\n"
+        f"VERIFICATION CRITERIA\n{criteria}\n\n"
+        f"The following {len(bboxes)} candidate detection(s) are marked on this tile:\n"
+        f"{candidates_desc}\n\n"
+        f"For EACH candidate, decide: confirmed or rejected.\n"
+        f"Return ONLY valid JSON — a list with one entry per candidate, in order:\n"
+        f"[\n"
+        f"  {{\"index\": 0, \"confirmed\": true/false, "
+        f"\"detected_label\": \"the most accurate class name for what you see\", "
+        f"\"reason\": \"...\", "
+        f"\"report\": {{{field_schema}: \"...\"}}}},\n"
+        f"  ...\n"
+        f"]\n"
+        f"No markdown, no text outside the JSON array."
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TacticalAnalyst
@@ -297,6 +328,74 @@ class TacticalAnalyst:
             )
             return {"confirmed": False, "reason": f"parse error: {exc}", "report": {}}
 
+    def verify_detections_batch(
+        self,
+        tile_img:       np.ndarray,      # full tile BGR array
+        detections:     list[dict],      # [{"label": str, "bbox": [x1,y1,x2,y2]}, ...]
+        criteria:       str,
+        report_fields:  list[str],
+        original_query: str,
+        colour_hint:    str | None = None,
+        size_qualifier: str | None = None,
+    ) -> list[dict]:
+        """
+        Validate ALL detections on a tile in a single VLM call.
+        Returns a list parallel to `detections`:
+        [{"confirmed": bool, "reason": str, "report": dict}, ...]
+        """
+        if not detections or tile_img is None:
+            return [{"confirmed": False, "reason": "empty", "report": {}} 
+                    for _ in detections]
+
+        h, w = tile_img.shape[:2]
+
+        # Draw ALL bboxes on tile so VLM can see them
+        annotated = tile_img.copy()
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (74, 222, 128), 2)
+            cv2.putText(annotated, str(i), (x1, max(y1 - 4, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (74, 222, 128), 1)
+
+        prompt = _build_batch_verify_prompt(
+            label_hints    = [d["label"] for d in detections],
+            bboxes         = [d["bbox"]  for d in detections],
+            criteria       = criteria,
+            report_fields  = report_fields,
+            original_query = original_query,
+            img_w = w, img_h = h,
+        )
+
+        try:
+            if self.provider == "openrouter":
+                raw = self._analyze_openrouter(annotated, "tile_batch.jpg", prompt)
+            else:
+                raw = self._analyze_ollama(annotated, "tile_batch.jpg", prompt)
+        except Exception as exc:
+            logger.warning("Batch VLM failed: %s", exc)
+            return [{"confirmed": False, "reason": f"error: {exc}", "report": {}}
+                    for _ in detections]
+
+        try:
+            clean   = re.sub(r"^```json\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+            results = json.loads(clean)
+            # Normalise: ensure one entry per detection, keyed by index
+            out = [{"confirmed": False, "reason": "missing", "report": {}}] * len(detections)
+            for r in results:
+                idx = int(r.get("index", -1))
+                if 0 <= idx < len(detections):
+                    out[idx] = {
+                        "confirmed": bool(r.get("confirmed", False)),
+                        "detected_label": r.get("detected_label", "").strip(),
+                        "reason":    r.get("reason", ""),
+                        "report":    r.get("report", {}),
+                    }
+            return out
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Batch VLM parse error: %s\nRaw: %s", exc, raw[:300])
+            return [{"confirmed": False, "reason": f"parse error: {exc}", "report": {}}
+                    for _ in detections]
+
     # ──────────────────────────────────────────────────────────────────────────
     # VLM call with retry
     # ──────────────────────────────────────────────────────────────────────────
@@ -365,6 +464,12 @@ class TacticalAnalyst:
             }],
             max_tokens  = 1024,
             temperature = 0.1,
+            extra_body = {
+                "provider": {
+                    "order": ["DeepInfra", "Fireworks", "Together"],
+                    "allow_fallbacks": True,
+                }
+            },
         )
         return response.choices[0].message.content or ""
 

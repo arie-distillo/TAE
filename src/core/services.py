@@ -332,8 +332,22 @@ def _annotate_and_save(
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
     if not ok:
         return None
+    
     key = uuid.uuid4().hex[:16]
-    _tile_img_cache[key] = buf.tobytes()
+    img_bytes = buf.tobytes()
+    _tile_img_cache[key] = img_bytes
+
+    # Save to disk for debugging/analysis
+    try:
+        paths = _state.get("mission_paths")
+        if paths:
+            det_dir = Path(paths.uploads).parent / "detections"
+            det_dir.mkdir(exist_ok=True)
+            safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label[:20])
+            (det_dir / f"{safe_label}_{key[:8]}.jpg").write_bytes(img_bytes)
+    except Exception:
+        pass
+
     return f"/tile_img/{key}"
 
 
@@ -375,13 +389,13 @@ def _extract_video_frames(
 # Detection persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _save_detections(maps_path) -> None:
+def _save_detections(detections_path) -> None:
     """
     Persist _state["detections"] to detections.json.
     img_urls excluded — they are in-memory cache keys that don't survive restart.
     """
     try:
-        dets_file = Path(maps_path) / "detections.json"
+        dets_file = Path(detections_path) / "detections.json"
         data = {
             det_id: {k: v for k, v in det.items() if k != "img_urls"}
             for det_id, det in _state["detections"].items()
@@ -392,10 +406,10 @@ def _save_detections(maps_path) -> None:
         logger.warning("Could not save detections: %s", e)
 
 
-def _load_detections(maps_path) -> dict:
+def _load_detections(detections_path) -> dict:
     """Load detections from detections.json. Returns {} if absent."""
     try:
-        dets_file = Path(maps_path) / "detections.json"
+        dets_file = Path(detections_path) / "detections.json"
         if not dets_file.exists():
             return {}
         data = json.loads(dets_file.read_text(encoding="utf-8"))

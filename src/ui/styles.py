@@ -976,9 +976,13 @@ document.addEventListener('DOMContentLoaded', function() {
 window.addEventListener('message', function(e) {
   if (!e.data || e.data.type !== 'show_images') return;
   htmx.ajax('GET', '/images/' + e.data.id, {target: '#tae-imgpanel', swap: 'innerHTML'});
-  showPanel('tae-frame-panel');
+  // Only reveal panel if currently hidden — never resize an already-visible panel
+  var fp = document.getElementById('tae-frame-panel');
+  if (fp && (fp.style.display === 'none' || fp.classList.contains('collapsed'))) {
+    showPanel('tae-frame-panel');
+  }
 });
-
+             
 // Ctrl+P = toggle coverage polygon
 document.addEventListener('keydown', function(e) {
   if (e.ctrlKey && e.key === 'p') {

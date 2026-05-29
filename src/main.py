@@ -1808,7 +1808,10 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                         all_tiles        = db.get_all_tiles(),
                         original_query   = m.definition,
                         analyst          = analyst,
-                        sam_segmentor    = None,
+                        # SAM segementation is currently disabled in the pipeline due to SAM center-point prompting on nadir aerial imagery doesn't work reliably. 
+                        # Re-enable when you find a Replicate model that accepts bounding box prompts directly.
+                        # To enable: sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None
+                        sam_segmentor    = None, 
                         api_key          = getattr(settings, "REPLICATE_API_KEY", ""),
                         model_version    = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
                         timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
@@ -1830,7 +1833,7 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                                 {"parent_path": _det.parent_path,
                                 "tile_x": _det.tile_x, "tile_y": _det.tile_y,
                                 "tile_w": _det.tile_w, "tile_h": _det.tile_h},
-                                _det.bbox_tile, m.definition[:20]
+                                _det.bbox_tile, _det.label
                             )
                             if _u:
                                 _img_urls.append(_u)
@@ -2314,7 +2317,10 @@ async def query(message: str):  # noqa — signature only for illustration
         all_tiles        = all_tiles,
         original_query   = message,
         analyst          = analyst,
-        sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None,
+        # SAM segementation is currently disabled in the pipeline due to SAM center-point prompting on nadir aerial imagery doesn't work reliably. 
+        # Re-enable when you find a Replicate model that accepts bounding box prompts directly.
+        # To enable: sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None
+        sam_segmentor    = None, 
         api_key          = getattr(settings, "REPLICATE_API_KEY", ""),
         model_version    = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
         timeout_s        = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
@@ -2585,7 +2591,10 @@ def _stream_on_analyse():
         all_tiles      = db.get_all_tiles(),
         original_query = m.definition,
         analyst        = analyst,
-        sam_segmentor  = None,
+        # SAM segementation is currently disabled in the pipeline due to SAM center-point prompting on nadir aerial imagery doesn't work reliably. 
+        # Re-enable when you find a Replicate model that accepts bounding box prompts directly.
+        # To enable: sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None
+        sam_segmentor    = None,                  # 
         api_key        = getattr(settings, "REPLICATE_API_KEY", ""),
         model_version  = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
         timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),

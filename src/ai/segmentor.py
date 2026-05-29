@@ -32,7 +32,8 @@ import logging
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
+import tempfile, os, io
+from PIL import Image
 import cv2
 import numpy as np
 
@@ -130,99 +131,59 @@ class SAM2Segmentor:
     # Box-prompted mode (object_detection pipeline — Stage 3)
     # ──────────────────────────────────────────────────────────────────────────
 
-    def predict_box(
-        self,
-        tile_bgr: np.ndarray,
-        bbox: list[int],
-    ) -> np.ndarray | None:
+    def predict_box(self, tile_img: np.ndarray, bbox: list[int]) -> np.ndarray | None:
         """
-        Run SAM2 with a single bounding-box prompt on a tile image.
-
-        Returns a boolean mask in tile-local pixel coordinates, or None on failure.
-        This is ~50× cheaper than auto-segmentation (1 prompt vs 256).
-
-        Parameters
-        ----------
-        tile_bgr : BGR numpy array (the tile, not the full frame)
-        bbox     : [x1, y1, x2, y2] in tile-local pixel coordinates
+        Box-prompted SAM via center-point approximation.
+        The meta/sam-2 model accepts point prompts but not bounding boxes directly.
+        We derive the center point from the bbox and request 1 mask.
         """
         if self._client is None:
             return None
 
-        h, w = tile_bgr.shape[:2]
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
 
-        # Optional resize for API efficiency
-        scale = 1.0
-        img   = tile_bgr
-        if self._max_dim > 0 and max(h, w) > self._max_dim:
-            scale = self._max_dim / max(h, w)
-            img   = cv2.resize(tile_bgr, (int(w * scale), int(h * scale)),
-                               interpolation=cv2.INTER_AREA)
+        h, w = tile_img.shape[:2]
 
-        inf_h, inf_w = img.shape[:2]
-        data_uri = _encode_bgr_to_data_uri(img)
+        # Encode tile as JPEG and upload
+        ok, buf = cv2.imencode(".jpg", tile_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            return None
 
-        # Scale bbox to inference resolution
-        sx = inf_w / w; sy = inf_h / h
-        s_bbox = [
-            int(bbox[0] * sx), int(bbox[1] * sy),
-            int(bbox[2] * sx), int(bbox[3] * sy),
-        ]
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        try:
+            tmp.write(buf.tobytes())
+            tmp.close()
 
-        points, labels = _bbox_to_point_prompt(s_bbox, inf_w, inf_h)
+            with open(tmp.name, "rb") as fh:
+                output = self._client.run(
+                    self._model,
+                    input={
+                        "image":        fh,
+                        "input_points": json.dumps([[cx, cy]]),
+                        "input_labels": json.dumps([1]),
+                        "mask_limit":   1,
+                    },
+                )
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
-        logger.debug(
-            f"SAM2 box-prompt | {inf_w}×{inf_h}px | "
-            f"bbox={s_bbox} | {len(points)} point(s)"
-        )
+        # Output: {"combined_mask": FileOutput, "individual_masks": [FileOutput, ...]}
+        masks = output.get("individual_masks") or []
+        if not masks:
+            return None
 
         try:
-            output = self._client.run(
-                self._model,
-                input={
-                    "image":          data_uri,
-                    "input_points":   json.dumps(points),
-                    "input_labels":   json.dumps(labels),
-                    "multimask_output":         False,
-                    "pred_iou_thresh":          0.75,
-                    "stability_score_thresh":   0.80,
-                },
-            )
-        except Exception:
-            import traceback
-            logger.warning(f"SAM2 box-prompt API failed:\n{traceback.format_exc()}")
+            mask_bytes = masks[0].read()
+            pil_mask   = Image.open(io.BytesIO(mask_bytes)).convert("L").resize((w, h))
+            return np.array(pil_mask) > 127   # boolean numpy mask
+        except Exception as exc:
+            logger.debug("SAM mask decode failed: %s", exc)
             return None
-
-        if not output:
-            return None
-
-        # Take the first mask returned
-        mask_src = output[0] if isinstance(output, list) else output
-        mask_inf = self._load_mask(mask_src)
-        if mask_inf is None:
-            return None
-
-        # Scale mask back to original tile resolution
-        if scale != 1.0:
-            mask_resized = cv2.resize(
-                mask_inf.astype(np.uint8),
-                (w, h),
-                interpolation=cv2.INTER_NEAREST,
-            ).astype(bool)
-        else:
-            mask_resized = mask_inf
-
-        # Clamp to bbox region (SAM should stay inside, but defensive)
-        x1, y1, x2, y2 = bbox
-        bounded = np.zeros((h, w), dtype=bool)
-        bounded[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = \
-            mask_resized[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-
-        if bounded.sum() == 0:
-            logger.debug("SAM2 box-prompt returned empty mask after bounding")
-            return None
-
-        return bounded
 
     # ──────────────────────────────────────────────────────────────────────────
     # Auto-segmentation mode (anomaly_detection pipeline — ingestion stage)

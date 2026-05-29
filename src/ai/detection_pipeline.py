@@ -36,6 +36,9 @@ import numpy as np
 
 logger = logging.getLogger("TAE.Tracker")
 
+from core.app_state import _state
+from config import Settings
+settings = Settings()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -320,27 +323,61 @@ def cross_tile_nms(raw, iou_threshold=0.50):
 
 def _fill_ratio(mask, bbox):
     x1, y1, x2, y2 = bbox
-    return float(mask.sum()) / max(1, (x2 - x1) * (y2 - y1))
+    bbox_area = max(1, (x2 - x1) * (y2 - y1))
+    return float(mask[y1:y2, x1:x2].sum()) / bbox_area
 
 
 def _shape_ok(mask, bbox, priors):
-    from ai.intent import scale_shape_priors
-    area = int(mask.sum())
-    if area < priors.min_area_px or area > priors.max_area_px:
-        return False
-    fill = _fill_ratio(mask, bbox)
-    if fill < priors.min_fill or fill > priors.max_fill:
-        return False
+    """
+    With center-point SAM, masks are smaller than GDINO bboxes.
+    The only reliable check: is the mask actually inside the bbox?
+    (Rules out background masks that cover most of the tile.)
+    """
+    h, w = mask.shape
     x1, y1, x2, y2 = bbox
-    asp = max(1, y2 - y1) / max(1, x2 - x1)
-    if asp < priors.min_aspect or asp > priors.max_aspect:
+    x1 = max(0, min(x1, w)); x2 = max(x1+1, min(x2, w))
+    y1 = max(0, min(y1, h)); y2 = max(y1+1, min(y2, h))
+
+    mask_total  = int(mask.sum())
+    if mask_total == 0:
         return False
+
+    # Containment: what fraction of the SAM mask lies inside the GDINO bbox?
+    overlap = int(mask[y1:y2, x1:x2].sum())
+    containment = overlap / mask_total
+
+    # Background masks extend all over the tile → low containment in any single bbox
+    if containment < 0.15:
+        logger.info("Shape reject CONTAINMENT: %.2f (mask outside bbox)", containment)
+        return False
+
     return True
 
 
 def sam_refine_stage(candidates, priors, actual_alt_m, sam_segmentor):
+
+    # If no SAM segmentor available, skip refinement and shape filtering steps
+    if sam_segmentor is None:
+        # Fast path: just cut bbox crops, no API calls
+        for det in candidates:
+            tile_img = _load_tile_img({
+                "parent_path": det.parent_path,
+                "tile_x": det.tile_x, "tile_y": det.tile_y,
+                "tile_w": det.tile_w, "tile_h": det.tile_h,
+            })
+            if tile_img is not None:
+                x1, y1, x2, y2 = [max(0, v) for v in det.bbox_tile]
+                det.masked_crop = tile_img[y1:y2, x1:x2].copy()
+        return candidates   # no filtering without SAM
+
     from ai.intent import scale_shape_priors
     scaled        = scale_shape_priors(priors, actual_alt_m)
+    logger.info("Scaled ShapePriors at %.0fm: area=[%d,%d] fill=[%.2f,%.2f] aspect=[%.2f,%.2f]",
+            actual_alt_m,
+            scaled.min_area_px, scaled.max_area_px,
+            scaled.min_fill, scaled.max_fill,
+            scaled.min_aspect, scaled.max_aspect)
+    
     sam_available = sam_segmentor is not None and hasattr(sam_segmentor, "predict_box")
     
     if not sam_available:
@@ -448,6 +485,21 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
                 confirmed.append(det)
                 logger.info("VLM confirmed %s in %s tile(%d,%d)",
                             det.label, Path(parent).name, tx, ty)
+            else:
+                reason = result.get("reason", "")
+                logger.info("VLM rejected %s in %s tile(%d,%d): %s",
+                            det.label, Path(parent).name, tx, ty, reason)
+                # Save rejected crop for debugging
+                try:
+                    paths = _state.get("mission_paths")
+                    if paths and det.masked_crop is not None:
+                        rej_dir = Path(paths.detections) / "rejected"
+                        rej_dir.mkdir(parents=True, exist_ok=True)
+                        safe = det.label.replace(" ", "_")[:20]
+                        fname = f"{safe}_{det.det_id[:8]}.jpg"
+                        cv2.imwrite(str(rej_dir / fname), det.masked_crop)
+                except Exception:
+                    pass
         return confirmed
 
     confirmed = []
@@ -606,9 +658,15 @@ def run_detection_pipeline(
         return []
 
     # Stage 2
-    candidates = cross_tile_nms(raw)
+    candidates = cross_tile_nms(raw)    
+    candidates = [
+        d for d in candidates
+        if (d.bbox_tile[2] - d.bbox_tile[0]) >= settings.DETECTION_MIN_BBOX_PX
+        and (d.bbox_tile[3] - d.bbox_tile[1]) >= settings.DETECTION_MIN_BBOX_PX
+    ]
+    logger.info("Min-size filter: kept %d candidates", len(candidates))
     if not candidates:
-        return []
+        return []    
 
     # Stage 3
     candidates = sam_refine_stage(candidates, params.shape_priors, actual_alt_m, sam_segmentor)

@@ -39,6 +39,9 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger("IntentClassifier")
 
+import config
+settings = config.Settings()
+
 
 # ---------------------------------------------------------------------------
 # Shape priors — altitude-normalised
@@ -85,17 +88,6 @@ def scale_shape_priors(priors: ShapePriors, actual_alt_m: float) -> ShapePriors:
         max_aspect     = priors.max_aspect,
         expected_count = priors.expected_count,
     )
-
-
-# ---------------------------------------------------------------------------
-# Difficulty → YOLO confidence mapping
-# ---------------------------------------------------------------------------
-
-YOLO_CONFIDENCE: dict[str, float] = {
-    "easy":   0.15,   # large, visually distinctive objects (buildings, vehicles)
-    "medium": 0.07,   # medium objects with moderate camouflage (cows in grass)
-    "hard":   0.03,   # small or highly camouflaged (people, stones, prone animals)
-}
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +181,7 @@ class ObjectDetectionParams(BaseModel):
 
     @property
     def yolo_confidence(self) -> float:
-        return YOLO_CONFIDENCE[self.expected_difficulty]
+        return settings.DETECTION_CONFIDENCE[self.expected_difficulty]
 
 
 class AnomalyDetectionParams(BaseModel):
@@ -310,7 +302,7 @@ anomaly_detection
 
 STEP 2 — For object_detection, extract ALL fields:
 
-yolo_classes
+object_classes
   Specific, visually-grounded class names for YOLO-World.
   NEVER use collective nouns like "animals" or "vehicles".
   Expand them to specific species/types the model can detect.

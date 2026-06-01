@@ -1342,7 +1342,7 @@ def write_srt(
         lat, lon, bearing = interpolate_position(waypoints, t_s)
 
         # Slight altitude variation (±1 m) for realism
-        alt_var = alt_m + rng.uniform(-1.0, 1.0)
+        alt_var = alt_m     # altitude jitter removed (used to be alt_m + rng.uniform(-1.0, 1.0))
 
         start_tc = ms_to_tc(t_ms)
         end_tc   = ms_to_tc(t_ms + frame_ms)
@@ -1356,7 +1356,8 @@ def write_srt(
             f"[latitude : {lat:.6f}] [longitude : {lon:.6f}] "
             f"[rel_alt: {alt_var:.3f} abs_alt: {alt_var:.3f}] "
             f"[altitude : {alt_var:.2f}] "
-            f"[gb_yaw : {bearing:.1f}] [gb_pitch : -90.0] [gb_roll : 0.0]"
+            f"[gb_yaw : 0.0] [gb_pitch : -90.0] [gb_roll : 0.0] "
+            f"[flightYaw : {bearing:.2f}]"
             f"</font>"
         )
         lines.append(block)

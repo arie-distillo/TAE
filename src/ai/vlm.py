@@ -30,7 +30,8 @@ import cv2
 import numpy as np
 import ollama
 from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, wait_exponential, retry_if_exception
+
 
 logger = logging.getLogger("TacticalAnalyst")
 
@@ -178,7 +179,12 @@ def _build_batch_verify_prompt(
 # ─────────────────────────────────────────────────────────────────────────────
 # TacticalAnalyst
 # ─────────────────────────────────────────────────────────────────────────────
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry on 429 (rate-limit) and 403 (provider error) but not on 400/401."""
+    msg = str(exc)
+    return "429" in msg or "403" in msg
 
+    
 class TacticalAnalyst:
 
     def __init__(
@@ -442,6 +448,7 @@ class TacticalAnalyst:
         if not ok:
             raise ValueError(f"Failed to encode tile {filename}")
         return base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+    
 
     def _analyze_openrouter(
         self,
@@ -450,28 +457,39 @@ class TacticalAnalyst:
         prompt:   str,
     ) -> str:
         b64_image = self._serialise_tile_for_api(tile_img, filename)
-        response  = self.client.chat.completions.create(
-            model    = self.model_name,
-            messages = [{
-                "role": "user",
-                "content": [
-                    {
-                        "type":      "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-            max_tokens  = 1024,
-            temperature = 0.1,
-            extra_body = {
-                "provider": {
-                    "order": ["DeepInfra", "Fireworks", "Together"],
-                    "allow_fallbacks": True,
-                }
-            },
+
+        @retry(
+            retry=retry_if_exception(_is_retryable),
+            wait=wait_exponential(multiplier=1, min=2, max=30),
+            stop=stop_after_attempt(4),
+            reraise=True,
         )
-        return response.choices[0].message.content or ""
+        def _call() -> str:
+            response = self.client.chat.completions.create(
+                model    = self.model_name,
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type":      "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+                max_tokens  = 1024,
+                temperature = 0.1,
+                extra_body = {
+                    "provider": {
+                        "order": ["DeepInfra", "Fireworks", "Together"],
+                        "allow_fallbacks": True,
+                    }
+                },
+            )
+            return response.choices[0].message.content or ""
+
+        return _call()
+
 
     def _analyze_ollama(
         self,

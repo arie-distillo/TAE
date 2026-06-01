@@ -99,9 +99,10 @@ def _parse_block(content: str, frame_idx: int, start_ms: int) -> "SRTFrame | Non
     if lat is None or lon is None:
         return None
 
-    pitch_m = _PITCH_RE.search(text)
-    yaw_m   = _YAW_RE.search(text)
-    roll_m  = _ROLL_RE.search(text)
+    pitch_m      = _PITCH_RE.search(text)
+    yaw_m        = _YAW_RE.search(text)
+    roll_m       = _ROLL_RE.search(text)
+    absolute_yaw = float(yaw_m.group(1)) if yaw_m else 0.0
 
     return SRTFrame(
         frame_idx    = frame_idx,
@@ -110,7 +111,7 @@ def _parse_block(content: str, frame_idx: int, start_ms: int) -> "SRTFrame | Non
         lon          = lon,
         alt_m        = alt or 0.0,
         gimbal_pitch = float(pitch_m.group(1)) if pitch_m else -90.0,
-        gimbal_yaw   = float(yaw_m.group(1))   if yaw_m   else 0.0,
+        gimbal_yaw   = absolute_yaw,
         gimbal_roll  = float(roll_m.group(1))  if roll_m  else 0.0,
     )
 
@@ -431,7 +432,6 @@ class VideoSampler:
                     mean_diff = cv2.absdiff(gray, prev_gray).mean()
                     if mean_diff < 1.5:   # empirically: < 1.5 ≈ < 1% scene change
                         fi      += 1
-                        next_ms += interval_ms
                         continue
                 prev_gray = gray
 

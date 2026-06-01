@@ -55,3 +55,7 @@
 - [v] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
 - [v] video playback doesn't work
 
+### Geospatial
+- [] Replace degree-based distance with haversine in track_stage (see Claude)
+- [] Need to have retry on detector (Grounding DINO via Replicate) calls - fix for _run_detector_on_tile in ai/detection_pipeline.py  (see Claude)
+

@@ -53,12 +53,12 @@ class SpatialEngine:
 
         hw, hh = ground_w / 2, ground_h / 2
 
-        # Corners in local NED frame [north_m, east_m] before rotation
+        # Corners in local NED frame
         corners_ned = np.array([
-            [-hh, -hw],  # NW
-            [-hh,  hw],  # NE
-            [ hh,  hw],  # SE
-            [ hh, -hw],  # SW
+            [ hh, -hw],  # NW: +north, -east  ← top-left   of image = north-west ✓
+            [ hh,  hw],  # NE: +north, +east  ← top-right  of image = north-east ✓
+            [-hh,  hw],  # SE: -north, +east  ← bottom-right        = south-east ✓
+            [-hh, -hw],  # SW: -north, -east  ← bottom-left         = south-west ✓
         ])
 
         yaw_rad = np.radians(gimbal_yaw_deg)

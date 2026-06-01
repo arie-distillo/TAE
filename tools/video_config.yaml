@@ -9,7 +9,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 image:    data/assets/terrain_1.jpg     # any JPEG/PNG; .pgw world file auto-detected
-altitude: 80                        # AGL metres  (the only flight parameter you must set)
+altitude: 150                        # AGL metres  (the only flight parameter you must set)
 
 # ── Synthetic geo-centre (ignored if the image has a .pgw world file) ─────────
 # The tool invents self-consistent coordinates so TAE's spatial pipeline works.
@@ -23,10 +23,10 @@ altitude: 80                        # AGL metres  (the only flight parameter you
 # focal:    4.5
 
 # ── Auto-derived (leave commented unless you want to override) ─────────────────
-# speed:   5.6        # m/s — auto: cross full footprint in 20 s
-# fps:     10         # auto
-# pattern: straight   # auto: one clean pass, ideal for tracking tests
-# overlap: 0          # auto
+speed:   2.0        # m/s — auto: cross full footprint in 20 s
+fps:     10         # auto
+pattern: straight   # auto: one clean pass, ideal for tracking tests
+overlap: 0          # auto
 
 # ── Output ────────────────────────────────────────────────────────────────────
 output:         output/tracking_test
@@ -40,13 +40,13 @@ extract_frames: true
 #
 tracking_targets:
 
-  - id:          cow
-    png:         data/assets/cow_1.png
-    real_size_m: 2.0        # physical size → geo-correct pixel footprint via GSD
-    speed_ms:    0.5        # object speed in m/s
+  - id:          yellow_car
+    png:         data/assets/car_side_1.png
+    real_size_m: 4.0        # physical size → geo-correct pixel footprint via GSD
+    speed_ms:    6.0       # object speed in m/s
 
-  - id:          horse
-    png:         data/assets/horse.png
-    real_size_m: 1.8
-    speed_ms:    1.4
+  - id:          red_car
+    png:         data/assets/car_side_2.png
+    real_size_m: 6.0
+    speed_ms:    6.0
     direction_deg: 270      # optional: fix bearing (West); omit for random

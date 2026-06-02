@@ -2054,12 +2054,9 @@ async def upload(request: Request):
     # The panel div is already in the DOM but was rendered without "open"
     # (because video_files was empty at page load time).
     video_activation = Script(
-        "const vp=document.getElementById('video-panel');"
-        "if(vp && !vp.classList.contains('open')){"
-        "  vp.classList.add('open');"
-        "  htmx.ajax('GET','/video_panel',"
-        "    {target:'#video-panel',swap:'innerHTML'});"
-        "}"
+        "showPanel('tae-video-panel');"
+        "htmx.ajax('GET','/video_panel',"
+        "  {target:'#video-panel',swap:'innerHTML'});"
     ) if _state.get("video_files") else ""
 
     return (
@@ -2081,30 +2078,41 @@ def upload_progress():
     if _state.get("ingesting"):
         progress = _state.get("ingest_progress", "")
         label    = f"Indexing {progress}…" if progress else "Indexing…"
-        return Div(
-            Span(label, cls="pulse-txt"),
-            hx_get="/upload_progress",
-            hx_trigger="every 2s",
-            hx_swap="outerHTML",
+        return (
+            Div(
+                Span(label, cls="pulse-txt"),
+                hx_get="/upload_progress",
+                hx_trigger="every 2s",
+                hx_swap="outerHTML",
+            ),
+            Script("if(typeof refreshMap==='function') refreshMap();"),
         )
-    msg = _state.pop("ingest_msg", None)
+
+    # ── Ingestion finished (ingesting=False) ──────────────────────────────
+    # Video panel load is UNCONDITIONAL — fires regardless of whether
+    # ingest_msg is available (decoupled from the one-shot message delivery).
+    video_act = Script(
+        "showPanel('tae-video-panel');"
+        "htmx.ajax('GET','/video_panel',"
+        "  {target:'#video-panel',swap:'innerHTML'});"
+    ) if _state.get("video_files") else ""
+
+    msg = _state.pop("ingest_msg", None)   # one-shot: deliver message once
     if msg:
-        refresh_script = Script("""
-            refreshMap();
-            htmx.ajax('GET', '/detections_panel_content',
-                {target: '#detections-panel-content', swap: 'innerHTML'});
-            if (typeof onVideoMeta === 'function') onVideoMeta();
-        """)
-        video_act = Script(
-            "const vp=document.getElementById('video-panel');"
-            "if(vp){"
-            "  if(!vp.classList.contains('open')) vp.classList.add('open');"
-            "  htmx.ajax('GET','/video_panel',"
-            "    {target:'#video-panel',swap:'innerHTML'});"
-            "}"
-        ) if _state.get("video_files") else ""
-        return _msg(msg, "sys"), _status_badge(), refresh_script, video_act
-    return ""
+        return (
+            _msg(msg, "sys"),
+            _status_badge(),
+            Script("""
+                refreshMap();
+                htmx.ajax('GET', '/detections_panel_content',
+                    {target: '#detections-panel-content', swap: 'innerHTML'});
+                if (typeof onVideoMeta === 'function') onVideoMeta();
+            """),
+            video_act,
+        )
+
+    # msg already consumed by a previous poll tick — still load the video panel
+    return video_act
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SAM2 segmentor (lazy singleton)

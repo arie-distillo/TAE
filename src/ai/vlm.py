@@ -481,7 +481,7 @@ class TacticalAnalyst:
                 temperature = 0.1,
                 extra_body = {
                     "provider": {
-                        "order": ["DeepInfra", "Fireworks", "Together"],
+                        "order": ["Together", "NovitaAI", "Nebius Token Factory"],
                         "allow_fallbacks": True,
                     }
                 },

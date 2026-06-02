@@ -54,7 +54,7 @@
 - [v] Delete mission doesn't work
 - [v] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
 - [v] video playback doesn't work
-- [] polyline missing - last message in Claude `Synthetic drone video generation and streaming simulation`
+- [x] polyline missing - last message in Claude `Synthetic drone video generation and streaming simulation`
 - [] trace - last message in Claude `Drone video detection and mapping issues`
 - [] video panel stall after ingestion / processing
 

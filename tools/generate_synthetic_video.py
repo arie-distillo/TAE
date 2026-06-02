@@ -1466,8 +1466,23 @@ def generate(
     video_path = out_dir / "drone_video.mp4"
     srt_path   = out_dir / "drone_video.SRT"
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(video_path), fourcc, fps, (out_w, out_h))
+    # Try H.264 first — required for browser playback (Chrome/Firefox reject mp4v).
+    # Fall back to mp4v only if H.264 is unavailable on this platform.
+    _h264_candidates = ["avc1", "H264", "X264"]
+    writer = None
+    fourcc = None
+    for _codec in _h264_candidates:
+        _fc = cv2.VideoWriter_fourcc(*_codec)
+        _wr = cv2.VideoWriter(str(video_path), _fc, fps, (out_w, out_h))
+        if _wr.isOpened():
+            fourcc, writer = _fc, _wr
+            print(f"  Video codec      : {_codec} (H.264 — browser-compatible)")
+            break
+        _wr.release()
+    if writer is None:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_path), fourcc, fps, (out_w, out_h))
+        print("  Video codec      : mp4v (H.264 unavailable — video may not play in browser)")
     if not writer.isOpened():
         sys.exit(f"Cannot open video writer for: {video_path}")
 
@@ -1613,6 +1628,36 @@ def generate(
                   f"lat={lat:.5f} lon={lon:.5f}")
 
     writer.release()
+
+    # ── Transcode to H.264 for browser compatibility ──────────────────────────
+    # OpenCV on Windows encodes as MPEG-4 Part 2 (mp4v) which Chrome/Firefox
+    # cannot play.  Re-encode with ffmpeg (which TAE's VideoSampler already
+    # requires) to produce a browser-compatible H.264 MP4 in-place.
+    import shutil as _shutil, subprocess as _sp
+    _ffmpeg = _shutil.which("ffmpeg")
+    if _ffmpeg:
+        _tmp = video_path.with_name(video_path.stem + "_h264.mp4")
+        _r = _sp.run(
+            [_ffmpeg, "-i", str(video_path),
+             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+             "-movflags", "+faststart",          # web-optimised: metadata at front
+             "-y", str(_tmp)],
+            capture_output=True,
+        )
+        if _r.returncode == 0 and _tmp.exists() and _tmp.stat().st_size > 0:
+            video_path.unlink()
+            _tmp.rename(video_path)
+            print(f"  Transcoded to H.264 via ffmpeg ✓  "
+                  f"({video_path.stat().st_size // 1024} KB)")
+        else:
+            _tmp.unlink(missing_ok=True)
+            print(f"  WARNING: ffmpeg transcode failed — mp4v kept "
+                  f"(video may not play in browser)\n"
+                  f"  ffmpeg stderr: {_r.stderr.decode(errors='ignore')[-200:]}")
+    else:
+        print("  WARNING: ffmpeg not found — mp4v kept "
+              "(video may not play in browser)")
+
     print(f"\n  Video → {video_path}  ({video_path.stat().st_size // 1024} KB)")
 
     # ── SRT ───────────────────────────────────────────────────────────────────

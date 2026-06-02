@@ -33,12 +33,23 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import math
 
 logger = logging.getLogger("TAE.Tracker")
 
 from core.app_state import _state
 from config import Settings
 settings = Settings()
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+ 
+_STATIC_GATE_M   =   5.0   # base gate for stationary objects (m)
+_MAX_COLD_SPEED  =  30.0   # m/s — max speed assumed before velocity is known
+                            # (≈108 km/h covers any ground vehicle)
+_VEL_ALPHA       =   0.6   # EMA weight for velocity update (0=inertia, 1=instant)
+_M_PER_DEG_LAT   = 111_320.0
+ 
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -84,14 +95,19 @@ class Track:
 
     @property
     def lat(self):
-        lats = [d.lat for d in self.detections if d.lat]
-        return sum(lats) / len(lats) if lats else 0.0
+        # Latest observed latitude (most recent detection in temporal order).
+        return self.detections[-1].lat if self.detections else 0.0
 
     @property
     def lon(self):
-        lons = [d.lon for d in self.detections if d.lon]
-        return sum(lons) / len(lons) if lons else 0.0
+        # Latest observed longitude (most recent detection in temporal order).
+        return self.detections[-1].lon if self.detections else 0.0
 
+    @property
+    def trajectory(self) -> list[tuple[float, float]]:
+        # Ordered (lat, lon) pairs — used by _save_tracks() for polylines.
+        return [(d.lat, d.lon) for d in self.detections]
+    
     @property
     def best(self):
         return max(self.detections, key=lambda d: d.confidence)
@@ -111,9 +127,12 @@ def _load_tile_img(tile):
     x, y, w, h = tile["tile_x"], tile["tile_y"], tile["tile_w"], tile["tile_h"]
     return img[y: y + h, x: x + w]
 
+ 
+def _m_per_deg_lon(lat: float) -> float:
+    return 111_320.0 * math.cos(math.radians(lat))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 — YOLO-World
+# Stage 1 — Detector
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_detector_output(output, tile):
@@ -276,16 +295,20 @@ def run_detector_stage(tiles, classes, confidence, api_key, model_version, timeo
     return raw
 
 
-
 def _iou(a, b):
     ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
     ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
     if ix2 <= ix1 or iy2 <= iy1:
         return 0.0
-    inter  = (ix2 - ix1) * (iy2 - iy1)
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / max(1, area_a + area_b - inter)
+    inter       = (ix2 - ix1) * (iy2 - iy1)
+    area_a      = (a[2] - a[0]) * (a[3] - a[1])
+    area_b      = (b[2] - b[0]) * (b[3] - b[1])
+    standard    = inter / max(1, area_a + area_b - inter)
+    # Containment: if the SMALLER box is almost entirely inside the LARGER
+    # box they represent the same object on an overlapping tile boundary.
+    # Standard IoU misses this when one box is much smaller than the other.
+    containment = inter / max(1, min(area_a, area_b))
+    return max(standard, containment)
 
 
 def _nms_frame(dets, iou_threshold):
@@ -559,40 +582,208 @@ def geolocate_stage(confirmed):
 # Stage 6 — Tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
-_GEO_PROX_DEG = 0.0002   # ~22 m
-
-
-def track_stage(confirmed, color="#4ade80"):
-    by_label = defaultdict(list)
-    for d in confirmed:
-        by_label[d.label.lower()].append(d)
-
-    tracks = []
+@dataclass
+class _TrackState:
+    """
+    Internal mutable state for one live track.
+    Converted to the public Track at the end of track_stage().
+    """
+    track_id : str
+    label    : str
+    color    : str
+    dets     : list        # Detection objects in time order
+    last_lat : float
+    last_lon : float
+    last_ts  : float       # milliseconds
+ 
+    # Velocity in degrees/second (updated via EMA after each association)
+    vel_lat  : float = 0.0
+    vel_lon  : float = 0.0
+ 
+    # ── Prediction ────────────────────────────────────────────────────────────
+    def predict(self, ts_ms: float) -> tuple[float, float]:
+        """Constant-velocity position prediction at timestamp ts_ms."""
+        dt = (ts_ms - self.last_ts) / 1000.0
+        return (
+            self.last_lat + self.vel_lat * dt,
+            self.last_lon + self.vel_lon * dt,
+        )
+ 
+    # ── Adaptive association gate ──────────────────────────────────────────────
+    def gate_m(self, dt_s: float) -> float:
+        """
+        Returns the maximum acceptable distance (metres) between the predicted
+        position and a candidate detection.
+ 
+        Cold-start (< 2 hits): use MAX_COLD_SPEED to cover the first interval
+            regardless of direction, since velocity is unknown.
+        Warm (≥ 2 hits): scale the gate with the estimated speed + 50% margin.
+        """
+        if len(self.dets) < 2:
+            return _STATIC_GATE_M + _MAX_COLD_SPEED * abs(dt_s)
+        speed = math.hypot(
+            self.vel_lat * _M_PER_DEG_LAT,
+            self.vel_lon * _m_per_deg_lon(self.last_lat),
+        )  # m/s
+        return _STATIC_GATE_M + speed * abs(dt_s) * 1.5
+ 
+    # ── Update after a successful association ──────────────────────────────────
+    def update(self, det, ts_ms: float) -> None:
+        dt = (ts_ms - self.last_ts) / 1000.0
+        if dt > 0:
+            new_vl = (det.lat - self.last_lat) / dt
+            new_vn = (det.lon - self.last_lon) / dt
+            # Exponential moving average — dampens outlier jumps
+            self.vel_lat = _VEL_ALPHA * new_vl + (1 - _VEL_ALPHA) * self.vel_lat
+            self.vel_lon = _VEL_ALPHA * new_vn + (1 - _VEL_ALPHA) * self.vel_lon
+        self.last_lat = det.lat
+        self.last_lon = det.lon
+        self.last_ts  = ts_ms
+        self.dets.append(det)
+ 
+    # ── Estimated ground speed ─────────────────────────────────────────────────
+    @property
+    def speed_ms(self) -> float:
+        return math.hypot(
+            self.vel_lat * _M_PER_DEG_LAT,
+            self.vel_lon * _m_per_deg_lon(self.last_lat),
+        )
+ 
+ 
+def _frame_ts_ms(det) -> float:
+    """
+    Look up the sampled-frame timestamp for a detection.
+ 
+    main.py stores {filename: timestamp_ms} in _state["frame_timestamps"]
+    when video frames are extracted.  For still images with no timestamp we
+    fall back to a large sentinel that preserves the file-sort order.
+    """
+    # Import here to avoid circular imports at module load time
+    from core.app_state import _state
+    name = Path(det.parent_path).name
+    ts   = _state.get("frame_timestamps", {}).get(name)
+    if ts is not None:
+        return float(ts)
+    # Still image without a video timestamp — use filename sort order as proxy.
+    # All stills get ts = 0; they are grouped by parent_path anyway.
+    return 0.0
+ 
+ 
+def track_stage(confirmed: list, color: str = "#4ade80") -> list:
+    """
+    Velocity-aware multi-object tracker (replaces the old static geo-NMS).
+ 
+    Algorithm
+    ---------
+    1. Attach a timestamp to every detection from _state["frame_timestamps"].
+    2. Within each label group, sort detections by timestamp.
+    3. For each detection (in time order), score it against every open track:
+         predicted_pos = last_pos + velocity × Δt
+         score         = haversine(predicted_pos, det_pos)
+         gate          = STATIC_GATE + speed × Δt × 1.5   (warm)
+                       = STATIC_GATE + MAX_COLD_SPEED × Δt  (cold-start)
+       Associate to the closest track within its gate (greedy nearest-neighbour).
+    4. Unmatched detections start new tracks.
+    5. After all detections are processed, convert _TrackState → Track.
+ 
+    Why this works for moving vehicles
+    -----------------------------------
+    A 6 m/s car moves 60 m between 10-second samples.  On the first match
+    (cold-start, velocity unknown) the gate is 5 + 30×10 = 305 m — wide enough
+    to catch the car.  After the first match the velocity estimate is ~6 m/s;
+    subsequent gates are 5 + 6×10×1.5 = 95 m, naturally tightening around the
+    expected displacement and rejecting false positives.
+ 
+    For stationary cars the estimated velocity → 0 so the gate collapses to
+    the original 5 m threshold — no regression for the parked-vehicle case.
+    """
+    if not confirmed:
+        return []
+ 
+    # Import here to avoid circular-import issues at module level
+    from core.geo import haversine_m
+ 
+    # Attach timestamps; detections from the same frame share the same ts
+    for det in confirmed:
+        det._ts_ms = _frame_ts_ms(det)
+ 
+    by_label: dict[str, list] = defaultdict(list)
+    for det in confirmed:
+        by_label[det.label.lower()].append(det)
+ 
+    all_tracks: list = []
+ 
     for label, dets in by_label.items():
-        dets = sorted(dets, key=lambda d: d.parent_path)
-        open_tracks = []
+        # Process in temporal order so velocity estimates are causal
+        dets.sort(key=lambda d: (d._ts_ms, d.parent_path))
+ 
+        open_tracks: list[_TrackState] = []
+ 
         for det in dets:
-            best, best_d = None, _GEO_PROX_DEG
-            for t in open_tracks:
-                last = t.detections[-1]
-                if last.parent_path == det.parent_path:
+            ts = det._ts_ms
+ 
+            best_st   : _TrackState | None = None
+            best_dist : float              = float("inf")
+ 
+            for st in open_tracks:
+                # Skip if this detection comes from the same frame as the
+                # track's last hit (same physical instant → different object)
+                if any(h.parent_path == det.parent_path for h in st.dets):
                     continue
-                d = ((last.lat - det.lat) ** 2 + (last.lon - det.lon) ** 2) ** 0.5
-                if d < best_d:
-                    best_d, best = d, t
-            if best:
-                best.detections.append(det)
-                det.track_id = best.track_id
+ 
+                dt_s      = (ts - st.last_ts) / 1000.0
+                pred_lat, pred_lon = st.predict(ts)
+                dist      = haversine_m(pred_lat, pred_lon, det.lat, det.lon)
+                gate      = st.gate_m(dt_s)
+ 
+                if dist < gate and dist < best_dist:
+                    best_dist = dist
+                    best_st   = st
+ 
+            if best_st is not None:
+                best_st.update(det, ts)
+                det.track_id = best_st.track_id
             else:
-                t = Track(track_id=uuid.uuid4().hex[:8], detections=[det],
-                          label=label, color=color)
-                det.track_id = t.track_id
-                open_tracks.append(t)
-        tracks.extend(open_tracks)
-
-    logger.info("Tracking: %d confirmed → %d track(s)", len(confirmed), len(tracks))
-    return tracks
-
+                new_st = _TrackState(
+                    track_id = uuid.uuid4().hex[:8],
+                    label    = label,
+                    color    = color,
+                    dets     = [det],
+                    last_lat = det.lat,
+                    last_lon = det.lon,
+                    last_ts  = ts,
+                )
+                det.track_id = new_st.track_id
+                open_tracks.append(new_st)
+ 
+        # Convert _TrackState → public Track dataclass (API unchanged)
+        for st in open_tracks:
+            # Import the Track class from the same module
+            t = Track(
+                track_id   = st.track_id,
+                detections = st.dets,
+                label      = label,
+                color      = color,
+            )
+            # Attach velocity metadata for logging / future use
+            t._speed_ms = st.speed_ms
+            all_tracks.append(t)
+ 
+    logger.info(
+        "Tracking: %d confirmed → %d track(s)",
+        len(confirmed), len(all_tracks),
+    )
+    for t in all_tracks:
+        n = len(t.detections)
+        spd = getattr(t, "_speed_ms", 0.0)
+        logger.info(
+            "  Track %s | %s | %d frame(s) | %.1f m/s",
+            t.track_id, t.label, n, spd,
+        )
+ 
+    return all_tracks
+ 
+ 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Orchestrator

@@ -37,7 +37,7 @@ from core.app_state import (
     _MARKER_COLORS, _CLIP_AERIAL_CTX,
 )
 from core.services import (
-    _build_map, _optimal_zoom, _recenter_on_detections,
+    _build_map, _optimal_zoom, _recenter_on_detections, _save_tracks,
     _load_tile, _annotate_and_save, _tile_to_static_url,
     _extract_video_frames, _save_detections, _load_detections,
     init as _init_services, 
@@ -1563,8 +1563,11 @@ def serve_map():
     map_file = paths.maps / "map.html"
     if not map_file.exists():
         _build_map()
-    return FileResponse(str(map_file), media_type="text/html")
-
+    return FileResponse(
+        str(map_file),
+        media_type = "text/html",
+        headers    = {"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 @rt("/tile_img/{key}")
 def serve_tile_img(key: str):
@@ -1856,6 +1859,7 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
 
                     if _new_det_ids:
                         _recenter_on_detections(_new_det_ids)
+                        _save_tracks(_tracks, color)  # ← writes tracks.json for PolyLines
                         _build_map()
                         _paths = _state.get("mission_paths")
                         if _paths:
@@ -2089,13 +2093,14 @@ def upload_progress():
             refreshMap();
             htmx.ajax('GET', '/detections_panel_content',
                 {target: '#detections-panel-content', swap: 'innerHTML'});
-            htmx.ajax('GET', '/video_panel',
-                {target: '#video-panel', swap: 'innerHTML'});
+            if (typeof onVideoMeta === 'function') onVideoMeta();
         """)
         video_act = Script(
             "const vp=document.getElementById('video-panel');"
-            "if(vp && !vp.classList.contains('open')){"
-            "  vp.classList.add('open');"
+            "if(vp){"
+            "  if(!vp.classList.contains('open')) vp.classList.add('open');"
+            "  htmx.ajax('GET','/video_panel',"
+            "    {target:'#video-panel',swap:'innerHTML'});"
             "}"
         ) if _state.get("video_files") else ""
         return _msg(msg, "sys"), _status_badge(), refresh_script, video_act
@@ -2231,6 +2236,9 @@ def _handle_anomaly_query(message, params, color, user_bubble, mission):
                 "tile_w":    (seg.bbox[2] - seg.bbox[0]) if seg.bbox else 640,
                 "tile_h":    (seg.bbox[3] - seg.bbox[1]) if seg.bbox else 640,
                 "vlm_report": verify.get("report", {}),
+                "trajectory": [{"lat": d.lat, "lon": d.lon} for d in track.detections],
+                "is_moving":  getattr(track, "_speed_ms", 0.0) > 1.0,
+                "speed_ms":   round(getattr(track, "_speed_ms", 0.0), 2),
             }
             new_det_ids.append(det_id)
 
@@ -2368,6 +2376,9 @@ async def query(message: str):  # noqa — signature only for illustration
             "tile_h":        best.tile_h,
             "vlm_report":    best.vlm_report,
             "track_id":      track.track_id,
+            "trajectory":    [{"lat": d.lat, "lon": d.lon} for d in track.detections],
+            "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
+            "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
         }
         new_det_ids.append(det_id)
         n_frames = len(set(d.parent_path for d in track.detections))
@@ -2377,6 +2388,7 @@ async def query(message: str):  # noqa — signature only for illustration
         )
  
     _recenter_on_detections(new_det_ids)
+    _save_tracks(tracks, color)          # ← writes tracks.json for PolyLines
     _build_map()
  
     paths = _state.get("mission_paths")
@@ -2485,21 +2497,27 @@ def frame_view(det_id: str, mode: str = "tile"):
         else:
             return P("Could not load parent frame.", style="color:var(--danger);padding:12px")
     else:
+        already_annotated = False
         stored = det["img_urls"][0] if det.get("img_urls") else None
         tile_data = None
         if stored and stored.startswith("/tile_img/"):
             key = stored.split("/")[-1]
             tile_data = _tile_img_cache.get(key)
-            img_url   = stored if tile_data else None
+            if tile_data:
+                img_url = stored
+                already_annotated = True   # img_urls tiles are pre-annotated
+            else:
+                img_url = None
         else:
             img_url = None
         if not img_url:
             img_url = _tile_to_static_url(det) or ""
             if img_url and img_url.startswith("/tile_img/"):
                 tile_data = _tile_img_cache.get(img_url.split("/")[-1])
+            # tile from _tile_to_static_url is unannotated → needs annotation
 
-        # Annotate tile with bounding box server-side
-        if tile_data and bbox and len(bbox) == 4:
+        # Annotate only if the tile was NOT already annotated by _annotate_and_save
+        if not already_annotated and tile_data and bbox and len(bbox) == 4:
             import numpy as np
             arr = np.frombuffer(tile_data, np.uint8)
             tile_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)

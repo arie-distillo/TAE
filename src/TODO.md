@@ -45,7 +45,7 @@
 - [v] show time / frame when pointed on a marker on a map, bypass inetrmediate pop-up
 - [v] frames with detection on a timeline
 - [v] video panel vs. chat panel vs. image panel - inconsistency
-- [] have panels resizeable (and movable?). By default a large video panel takes a central place
+- [x] have panels resizeable (and movable?). By default a large video panel takes a central place
 
 ### Deployment
 - [] Runpod
@@ -54,8 +54,10 @@
 - [v] Delete mission doesn't work
 - [v] Mission directories under DATA_DIR should be named after mission name, not mission id. The latter only as a fallback if name not defined
 - [v] video playback doesn't work
+- [] polyline missing - last message in Claude `Synthetic drone video generation and streaming simulation`
+- [] trace - last message in Claude `Drone video detection and mapping issues`
+- [] video panel stall after ingestion / processing
 
 ### Geospatial
-- [] Replace degree-based distance with haversine in track_stage (see Claude)
-- [] Need to have retry on detector (Grounding DINO via Replicate) calls - fix for _run_detector_on_tile in ai/detection_pipeline.py  (see Claude)
+- [x] Need to have retry on detector (Grounding DINO via Replicate) calls - fix for _run_detector_on_tile in ai/detection_pipeline.py  (see Claude)
 

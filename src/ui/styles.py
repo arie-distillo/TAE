@@ -1070,6 +1070,14 @@ function onVideoMeta() {
     _drawTimeline();
     _initTimelineTooltip();
     refreshDetPanel();
+    // If no detections yet (server still restoring state), retry once after 3s
+    if (!data.length) {
+      setTimeout(function() {
+        fetch('/video_detections').then(function(r){return r.json();}).then(function(d){
+          if (d.length) { _videoDets = d; _drawTimeline(); refreshDetPanel(); }
+        });
+      }, 3000);
+    }
   });
 }
 

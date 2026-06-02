@@ -27,6 +27,7 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import Callable
+import time
 
 import cv2
 import folium
@@ -247,7 +248,7 @@ def _build_map() -> None:
     # ── Track polylines ───────────────────────────────────────────────────────
     try:
         if paths:
-            tracks_file = paths.maps / "tracks.json"
+            tracks_file = paths.detections / "tracks.json"
             if tracks_file.exists():
                 tracks = json.loads(tracks_file.read_text(encoding="utf-8"))
                 for trk in tracks:
@@ -288,8 +289,8 @@ def _build_map() -> None:
 
     map_file = paths.maps / "map.html"
     m.save(str(map_file))
-    logger.debug("Map saved → %s", map_file)
-
+    _state["map_version"] = int(time.time() * 1000)
+    logger.info("Map saved to %s (version %s)", map_file, _state["map_version"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image / tile helpers
@@ -405,6 +406,79 @@ def _save_detections(detections_path) -> None:
     except Exception as e:
         logger.warning("Could not save detections: %s", e)
 
+
+def _save_tracks(tracks: list, color: str) -> None:
+    """
+    Persist multi-frame track trajectories to paths.detections/tracks.json.
+ 
+    _build_map() (services.py) reads this file and renders each trajectory
+    as a Folium PolyLine with start/end circle markers.
+ 
+    Only tracks with ≥ 2 detections are written; single-frame (parked,
+    seen once) objects are already shown as dot markers.
+ 
+    The file is append-safe across multiple queries in the same session:
+    tracks from earlier queries are preserved and new ones are merged by
+    track_id.
+    """
+    paths = _state.get("mission_paths")
+    if not paths:
+        return
+ 
+    frame_ts: dict = _state.get("frame_timestamps", {})
+ 
+    new_entries: list[dict] = []
+    for track in tracks:
+        if len(track.detections) < 2:
+            continue
+ 
+        # Sort chronologically using stored video timestamps
+        dets_sorted = sorted(
+            track.detections,
+            key=lambda d: frame_ts.get(Path(d.parent_path).name, 0),
+        )
+ 
+        trajectory = [
+            {
+                "lat":    d.lat,
+                "lon":    d.lon,
+                "source": Path(d.parent_path).name,
+                "ts_ms":  frame_ts.get(Path(d.parent_path).name, 0),
+            }
+            for d in dets_sorted
+        ]
+ 
+        new_entries.append({
+            "id":         track.track_id,
+            "label":      track.label,
+            "color":      color,
+            "trajectory": trajectory,
+            "speed_ms":   round(getattr(track, "_speed_ms", 0.0), 2),
+        })
+ 
+    if not new_entries:
+        return
+ 
+    tracks_file = paths.detections / "tracks.json"
+    existing: list[dict] = []
+    if tracks_file.exists():
+        try:
+            existing = json.loads(tracks_file.read_text(encoding="utf-8"))
+        except Exception:
+            existing = []
+ 
+    existing_ids = {t["id"] for t in existing}
+    added = 0
+    for entry in new_entries:
+        if entry["id"] not in existing_ids:
+            existing.append(entry)
+            added += 1
+ 
+    tracks_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    logger.info(
+        "_save_tracks: %d new multi-frame track(s) → %s",
+        added, tracks_file,
+    )
 
 def _load_detections(detections_path) -> dict:
     """Load detections from detections.json. Returns {} if absent."""

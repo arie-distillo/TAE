@@ -30,7 +30,7 @@ from core.database import TacticalDatabase
 from ai.clip import SearchLibrarian
 from ai.vlm import TacticalAnalyst
 from tools.ingest_telemetry import TAESimGenerator
-from core.video import SRTParser, VideoSampler, AdaptiveSampler, EmbeddedTelemetryParser
+from core.video import SRTParser, VideoSampler, AdaptiveSampler, EmbeddedTelemetryParser, DJIProtobufParser
 from core.streaming import StreamManager
 from core.app_state import (
     _state, _frame_img_cache, _tile_img_cache,
@@ -89,9 +89,10 @@ intent_clf = IntentClassifier(
 _search_lib: SearchLibrarian | None = None
 
 # Video telemetry helpers (singletons — stateless, safe to reuse)
-_srt_parser    = SRTParser()
-_video_sampler = VideoSampler()
-_embedded_parser = EmbeddedTelemetryParser()
+_srt_parser      = SRTParser()
+_video_sampler   = VideoSampler()
+_proto_parser    = DJIProtobufParser()       # per-frame protobuf; no exiftool needed
+_embedded_parser = EmbeddedTelemetryParser() # exiftool fallback (single fix only)
 
 # Live streaming manager (Phase D)
 stream_mgr = StreamManager()
@@ -668,7 +669,7 @@ def _chat_panel(collapsed: bool = False) -> FT:
                 Input(
                     placeholder="e.g. 'white pickup truck near building'",
                     id="tae-query-input",
-                    name="q",
+                    name="message",
                     autocomplete="off",
                     **{"hx-on:keydown":
                        "if(event.key==='Enter'){event.preventDefault();"
@@ -1955,19 +1956,29 @@ async def upload(request: Request):
             except Exception as e:
                 logger.warning(f"SRT parse failed for {srt_path}: {e}")
         else:
-            # No SRT sidecar — try the embedded djmd stream via exiftool
-            srt_frames = _embedded_parser.parse(video_path)
+            # No SRT sidecar — try direct protobuf decode of the djmd stream first
+            # (per-frame, no exiftool), then fall back to exiftool single-fix.
+            srt_frames = _proto_parser.parse(video_path)
             if srt_frames:
                 logger.info(
-                    f"Embedded telemetry loaded for '{video_path.name}': "
+                    f"djmd protobuf telemetry loaded for '{video_path.name}': "
                     f"{len(srt_frames)} frames"
                 )
             else:
-                logger.warning(
-                    f"No telemetry for '{video_path.name}' — "
-                    f"no .SRT sidecar and no embedded djmd stream found."
-                )
-            
+                # Proto parser failed (non-wm265e proto or extraction error);
+                # exiftool gives at least a single GPS fix for all frames.
+                srt_frames = _embedded_parser.parse(video_path)
+                if srt_frames:
+                    logger.info(
+                        f"Embedded telemetry (exiftool) loaded for '{video_path.name}': "
+                        f"{len(srt_frames)} frame(s)"
+                    )
+                else:
+                    logger.warning(
+                        f"No telemetry for '{video_path.name}' — "
+                        f"no .SRT, no djmd stream, no exiftool data."
+                    )
+
         try:
             frame_pairs = _video_sampler.sample_file(
                 video_path         = video_path,

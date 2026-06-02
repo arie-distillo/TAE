@@ -5,18 +5,25 @@ The critical difference between still images and drone video
 -----------------------------------------------------------
 Still images  : XMP metadata embedded in every JPEG → _extract_dji_data() works.
 Video frames  : ffmpeg-extracted JPEGs carry NO XMP metadata.
-                Telemetry must come from the DJI .SRT sidecar file that the
-                drone generates alongside every .MP4.
+                Telemetry must come from either:
+                  (a) the DJI .SRT sidecar file the drone generates alongside
+                      every .MP4  (preferred — always try this first), or
+                  (b) the binary 'djmd' data stream embedded directly in the
+                      .MP4 container (parsed via exiftool -ee).
 
 This module provides:
-  SRTParser      – parse 3 DJI SRT format variants into SRTFrame records
-  AdaptiveSampler – compute the optimal frame sampling interval from flight geometry
-  VideoSampler   – extract JPEG frames from a video, paired with interpolated telemetry
+  SRTFrame               – telemetry dataclass shared by all telemetry sources
+  SRTParser              – parse 3 DJI SRT format variants into SRTFrame records
+  EmbeddedTelemetryParser– extract telemetry from the djmd stream via exiftool
+  AdaptiveSampler        – compute the optimal frame sampling interval
+  VideoSampler           – extract JPEG frames paired with interpolated telemetry
 """
 
+import json
 import logging
 import math
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -219,6 +226,170 @@ class SRTParser:
             "img_w_px":     img_w,
             "img_h_px":     img_h,
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedded telemetry parser  (via exiftool -ee)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _exif_float(rec: dict, *keys: str) -> "float | None":
+    """
+    Try each tag name in *keys* against the exiftool JSON record and return
+    the first value that can be coerced to float, or None if none succeed.
+    """
+    for key in keys:
+        v = rec.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+class EmbeddedTelemetryParser:
+    """
+    Extract DJI flight telemetry from the proprietary 'djmd' binary data stream
+    embedded in .MP4 files produced by DJI drones (Mavic 3, Air 3, Mini 4 Pro, …).
+
+    Why exiftool?
+    -------------
+    The djmd stream is protobuf-encoded with an unpublished schema.  ExifTool's
+    DJI module has reverse-engineered this format and is the only reliable public
+    decoder.  Home-rolled protobuf parsers are brittle because field IDs, scaling
+    factors, and coordinate encoding differ across firmware versions.
+
+    Usage priority
+    --------------
+    Always prefer an .SRT sidecar when one is available — it is a plain-text
+    format that is trivially parseable and guaranteed to be complete.  Use this
+    class as a fallback when the video has been transferred without its sidecar.
+
+    Falls back gracefully (returns []) when:
+      • exiftool is not installed
+      • the file has no embedded telemetry track
+      • exiftool cannot decode the stream (rare firmware variant)
+    """
+
+    # Tag names exiftool uses for DJI embedded-stream samples.
+    # Multiple candidates handle the variation across drone models / exiftool versions.
+    _LAT_KEYS   = ("GPSLatitude",)
+    _LON_KEYS   = ("GPSLongitude",)
+    _ALT_KEYS   = ("RelativeAltitude", "AbsoluteAltitude", "GPSAltitude")
+    _PITCH_KEYS = ("GimbalPitch",)
+    _YAW_KEYS   = ("GimbalYaw",)
+    _ROLL_KEYS  = ("GimbalRoll",)
+    _TIME_KEYS  = ("SampleTime",)
+
+    # ── Availability check ────────────────────────────────────────────────────
+
+    def is_available(self) -> bool:
+        """Return True if exiftool is installed and callable."""
+        try:
+            subprocess.run(
+                ["exiftool", "-ver"],
+                capture_output=True,
+                timeout=5,
+            )
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    # ── Main parse entry point ────────────────────────────────────────────────
+
+    def parse(self, video_path: Path) -> list[SRTFrame]:
+        """
+        Shell out to ``exiftool -ee -j -n`` and convert per-sample records to
+        SRTFrame objects.
+
+        exiftool -ee (ExtractEmbedded) reads the binary djmd track and emits
+        one JSON object per telemetry sample (≈ one per source video frame).
+        The -n flag returns numeric values without unit strings so floats parse
+        cleanly.  Records without a GPSLatitude/GPSLongitude pair are skipped
+        (the first record in the array is always the top-level file metadata).
+
+        Parameters
+        ----------
+        video_path : Path to the .MP4 (or other DJI video container).
+
+        Returns
+        -------
+        list[SRTFrame] — one entry per telemetry sample, sorted by timestamp.
+        Empty list on any failure.
+        """
+        cmd = ["exiftool", "-ee", "-j", "-n", str(video_path)]
+
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,   # large 4K files at high bitrate can be slow
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "exiftool not found — install it to parse embedded DJI telemetry. "
+                "Debian/Ubuntu: sudo apt-get install libimage-exiftool-perl"
+            )
+            return []
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"exiftool timed out after 120 s on '{video_path.name}'"
+            )
+            return []
+
+        if res.returncode != 0:
+            logger.warning(
+                f"exiftool exited {res.returncode} for '{video_path.name}': "
+                f"{res.stderr.strip()[:200]}"
+            )
+            return []
+
+        try:
+            records: list[dict] = json.loads(res.stdout)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                f"exiftool produced malformed JSON for '{video_path.name}': {exc}"
+            )
+            return []
+
+        frames: list[SRTFrame] = []
+        for rec in records:
+            lat = _exif_float(rec, *self._LAT_KEYS)
+            lon = _exif_float(rec, *self._LON_KEYS)
+            if lat is None or lon is None:
+                continue    # top-level file record or sample without GPS fix
+
+            timestamp_ms = int(
+                (_exif_float(rec, *self._TIME_KEYS) or 0.0) * 1000
+            )
+            alt_m        = _exif_float(rec, *self._ALT_KEYS)   or 0.0
+            gimbal_pitch = _exif_float(rec, *self._PITCH_KEYS) or -90.0
+            gimbal_yaw   = _exif_float(rec, *self._YAW_KEYS)   or 0.0
+            gimbal_roll  = _exif_float(rec, *self._ROLL_KEYS)  or 0.0
+
+            frames.append(SRTFrame(
+                frame_idx    = len(frames),
+                timestamp_ms = timestamp_ms,
+                lat          = lat,
+                lon          = lon,
+                alt_m        = alt_m,
+                gimbal_pitch = gimbal_pitch,
+                gimbal_yaw   = gimbal_yaw,
+                gimbal_roll  = gimbal_roll,
+            ))
+
+        if frames:
+            logger.info(
+                f"Embedded telemetry: {len(frames)} frames from "
+                f"'{video_path.name}' (exiftool parsed {len(records)} records)"
+            )
+        else:
+            logger.info(
+                f"No embedded telemetry in '{video_path.name}' "
+                f"(exiftool returned {len(records)} record(s), none with GPS)"
+            )
+        return frames
 
 
 # ─────────────────────────────────────────────────────────────────────────────

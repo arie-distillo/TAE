@@ -56,7 +56,8 @@
 - [v] video playback doesn't work
 - [x] polyline missing - last message in Claude `Synthetic drone video generation and streaming simulation`
 - [] trace - last message in Claude `Drone video detection and mapping issues`
-- [] video panel stall after ingestion / processing
+- [x] video panel stall after ingestion / processing
+- [] update the anomaly path to be in sync with all the changes in object detection path
 
 ### Geospatial
 - [x] Need to have retry on detector (Grounding DINO via Replicate) calls - fix for _run_detector_on_tile in ai/detection_pipeline.py  (see Claude)

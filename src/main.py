@@ -30,7 +30,7 @@ from core.database import TacticalDatabase
 from ai.clip import SearchLibrarian
 from ai.vlm import TacticalAnalyst
 from tools.ingest_telemetry import TAESimGenerator
-from core.video import SRTParser, VideoSampler, AdaptiveSampler
+from core.video import SRTParser, VideoSampler, AdaptiveSampler, EmbeddedTelemetryParser
 from core.streaming import StreamManager
 from core.app_state import (
     _state, _frame_img_cache, _tile_img_cache,
@@ -91,6 +91,7 @@ _search_lib: SearchLibrarian | None = None
 # Video telemetry helpers (singletons — stateless, safe to reuse)
 _srt_parser    = SRTParser()
 _video_sampler = VideoSampler()
+_embedded_parser = EmbeddedTelemetryParser()
 
 # Live streaming manager (Phase D)
 stream_mgr = StreamManager()
@@ -1954,11 +1955,19 @@ async def upload(request: Request):
             except Exception as e:
                 logger.warning(f"SRT parse failed for {srt_path}: {e}")
         else:
-            logger.warning(
-                f"No .SRT sidecar found for '{video_path.name}' — "
-                f"video frames will have no telemetry."
-            )
-
+            # No SRT sidecar — try the embedded djmd stream via exiftool
+            srt_frames = _embedded_parser.parse(video_path)
+            if srt_frames:
+                logger.info(
+                    f"Embedded telemetry loaded for '{video_path.name}': "
+                    f"{len(srt_frames)} frames"
+                )
+            else:
+                logger.warning(
+                    f"No telemetry for '{video_path.name}' — "
+                    f"no .SRT sidecar and no embedded djmd stream found."
+                )
+            
         try:
             frame_pairs = _video_sampler.sample_file(
                 video_path         = video_path,

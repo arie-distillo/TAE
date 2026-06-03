@@ -770,6 +770,10 @@ def load_yaml_config(config_path: Path) -> dict:
         "extract_frames":  raw.get("extract_frames", False),
         "output":          raw.get("output", "output/sim_video"),
         "tracking_targets": targets,
+        # Telemetry format: "srt" (default) or "embedded" (dvtm_wm265e.proto djmd track)
+        "telemetry_format": raw.get("telemetry_format", "srt"),
+        "clip_to_targets":   raw.get("clip_to_targets",   False),
+        "clip_padding_sec":  raw.get("clip_padding_sec",  2.0),
     }
 
 
@@ -1314,6 +1318,447 @@ def add_jitter(frame: np.ndarray, max_px: int = 2) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# dvtm_wm265e.proto encoder  (embedded djmd telemetry)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Field paths are taken directly from ExifTool's DJI tag documentation
+# (exiftool.org/TagNames/DJI.html).  The tag ID encodes the protobuf field
+# path literally: dvtm_wm265e_3-3-4-1 → root[3][3][4][1].
+#
+# Encoding rules verified against a real DJI Mavic 3 Enterprise frame:
+#   GPS coordinates : float64 (wire_type=1), stored in radians
+#   Altitudes       : float32 (wire_type=5), stored in metres
+#   Gimbal / drone  : sint32 zigzag (wire_type=0), stored in deci-degrees
+#   FrameNumber     : uint32 varint (wire_type=0)
+
+
+def _pb_varint(n: int) -> bytes:
+    """Encode non-negative integer as a protobuf base-128 varint."""
+    if n == 0:
+        return b"\x00"
+    buf = []
+    while n:
+        buf.append((n & 0x7F) | (0x80 if n > 0x7F else 0))
+        n >>= 7
+    return bytes(buf)
+
+def _pb_tag(field: int, wire: int) -> bytes:
+    return _pb_varint((field << 3) | wire)
+
+def _pb_ldelim(field: int, data: bytes) -> bytes:
+    """Length-delimited field (wire_type 2): sub-messages, strings, bytes."""
+    return _pb_tag(field, 2) + _pb_varint(len(data)) + data
+
+def _pb_vf(field: int, value: int) -> bytes:
+    """Varint field (wire_type 0)."""
+    return _pb_tag(field, 0) + _pb_varint(value)
+
+def _pb_sint32(field: int, value: int) -> bytes:
+    """Sint32 zigzag field (wire_type 0)."""
+    z = (value << 1) ^ (value >> 31)
+    return _pb_vf(field, z & 0xFFFFFFFF)
+
+def _pb_double(field: int, value: float) -> bytes:
+    """Double (float64) field (wire_type 1)."""
+    return _pb_tag(field, 1) + _struct.pack("<d", value)
+
+def _pb_float(field: int, value: float) -> bytes:
+    """Float (float32) field (wire_type 5)."""
+    return _pb_tag(field, 5) + _struct.pack("<f", value)
+
+def _pb_str(field: int, s: str) -> bytes:
+    return _pb_ldelim(field, s.encode("utf-8"))
+
+
+def encode_wm265e_frame(
+    frame_num:    int,
+    lat:          float,    # decimal degrees
+    lon:          float,    # decimal degrees
+    rel_alt_m:    float,    # AGL metres   → RelativeAltitude
+    abs_alt_m:    float,    # ASL metres   → AbsoluteAltitude
+    gimbal_pitch: float,    # degrees (-90 = nadir)
+    gimbal_yaw:   float,    # degrees clockwise from North
+    gimbal_roll:  float,    # degrees
+    drone_yaw:    float,    # degrees (flight heading)
+    drone_pitch:  float,    # degrees
+    drone_roll:   float,    # degrees
+    iso:          int   = 100,
+    shutter:      float = 1.0 / 1000.0,
+    digital_zoom: float = 1.0,
+    serial:       str   = "SIM0000000000000001",
+    model:        str   = "DJI DJIMavic3 Enterprise",
+) -> bytes:
+    """
+    Encode one telemetry sample as a dvtm_wm265e.proto binary packet.
+
+    The encoded bytes are placed directly into the djmd MP4 data track;
+    DJIProtobufParser reads them back using the exact same field paths.
+
+    Field layout (exiftool.org/TagNames/DJI.html):
+      [1][1][5]    SerialNumber  (string)
+      [1][1][10]   Model         (string)
+      [3][1][1]    FrameNumber   (uint32 varint)
+      [3][2][2][1] ISO           (uint32 varint)
+      [3][2][3][1] ShutterSpeed  (uint32 varint, nanoseconds)
+      [3][2][6][1] DigitalZoom   (float32)
+      [3][3][3]    DroneInfo     → yaw[1] pitch[2] roll[3] (sint32, deci-deg)
+      [3][3][4][1] GPSInfo       → lat[2] lon[3] (float64, radians)
+      [3][3][4][2] AbsoluteAltitude (float32, metres)
+      [3][3][5][1] RelativeAltitude (float32, metres)
+      [3][4][3]    GimbalInfo    → pitch[1] roll[2] yaw[3] (sint32, deci-deg)
+    """
+    # ── [1][1] model info ─────────────────────────────────────────────────────
+    f1 = _pb_ldelim(1,
+         _pb_ldelim(1,
+              _pb_str(5,  serial)
+            + _pb_str(10, model)
+         )
+    )
+
+    # ── [3][1] frame number ───────────────────────────────────────────────────
+    f3_1 = _pb_ldelim(1, _pb_vf(1, frame_num))
+
+    # ── [3][2] camera settings ────────────────────────────────────────────────
+    f3_2 = _pb_ldelim(2,
+           _pb_ldelim(2, _pb_vf(1, iso))
+         + _pb_ldelim(3, _pb_vf(1, max(1, round(shutter * 1_000_000_000))))
+         + _pb_ldelim(6, _pb_float(1, digital_zoom))
+    )
+
+    # ── [3][3] attitude + GPS ─────────────────────────────────────────────────
+    drone_info = (
+          _pb_sint32(1, round(drone_yaw   * 10))
+        + _pb_sint32(2, round(drone_pitch * 10))
+        + _pb_sint32(3, round(drone_roll  * 10))
+    )
+    gps_info = (
+          _pb_double(2, math.radians(lat))
+        + _pb_double(3, math.radians(lon))
+    )
+    f3_3 = _pb_ldelim(3,
+           _pb_ldelim(3, drone_info)                             # DroneInfo
+         + _pb_ldelim(4,                                         # GPS sub-block
+                _pb_ldelim(1, gps_info)                         #   GPSInfo
+              + _pb_float(2,  abs_alt_m)                        #   AbsoluteAltitude
+           )
+         + _pb_ldelim(5, _pb_float(1, rel_alt_m))               # RelativeAltitude
+    )
+
+    # ── [3][4] gimbal ─────────────────────────────────────────────────────────
+    gimbal_info = (
+          _pb_sint32(1, round(gimbal_pitch * 10))
+        + _pb_sint32(2, round(gimbal_roll  * 10))
+        + _pb_sint32(3, round(gimbal_yaw   * 10))
+    )
+    f3_4 = _pb_ldelim(4, _pb_ldelim(3, gimbal_info))
+
+    # ── [3] per-frame data block ──────────────────────────────────────────────
+    f3 = _pb_ldelim(3, f3_1 + f3_2 + f3_3 + f3_4)
+
+    return f1 + f3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MP4 box manipulation  (djmd track injection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mp4_box(type_: str, data: bytes) -> bytes:
+    """Build an MP4 box: [4-byte size][4-byte type][data]."""
+    size = 8 + len(data)
+    return _struct.pack(">I4s", size, type_.encode("ascii")) + data
+
+def _mp4_full(type_: str, version: int, flags: int, data: bytes) -> bytes:
+    """Build a FullBox: standard box with [1-byte version][3-byte flags] prefix."""
+    vf = _struct.pack(">I", (version << 24) | (flags & 0x00FFFFFF))
+    return _mp4_box(type_, vf + data)
+
+def _mp4_adj_stco(buf: bytearray, start: int, end: int, delta: int) -> None:
+    """
+    Add delta to every 32-bit chunk offset inside every stco box found
+    recursively within buf[start:end].  Operates in-place.
+    Container boxes (moov/trak/mdia/minf/stbl/udta) are recursed into.
+    """
+    pos = start
+    while pos < end:
+        if pos + 8 > end:
+            break
+        size = _struct.unpack_from(">I", buf, pos)[0]
+        if size < 8 or pos + size > end:
+            break
+        btype = bytes(buf[pos+4:pos+8])
+
+        if btype == b"stco":
+            # FullBox: 4 bytes version+flags, 4 bytes entry_count
+            count = _struct.unpack_from(">I", buf, pos + 12)[0]
+            for i in range(count):
+                off = pos + 16 + i * 4
+                if off + 4 <= end:
+                    old = _struct.unpack_from(">I", buf, off)[0]
+                    _struct.pack_into(">I", buf, off, old + delta)
+
+        elif btype in (b"moov", b"trak", b"mdia", b"minf",
+                       b"stbl", b"udta", b"meta"):
+            _mp4_adj_stco(buf, pos + 8, pos + size, delta)
+
+        pos += size
+
+def _mp4_patch_mvhd_next_track(moov: bytearray, new_id: int) -> None:
+    """Set next_track_id in the mvhd box (direct child of moov) to new_id."""
+    pos = 0
+    while pos < len(moov):
+        if pos + 8 > len(moov):
+            break
+        size  = _struct.unpack_from(">I", moov, pos)[0]
+        btype = bytes(moov[pos+4:pos+8])
+        if btype == b"mvhd":
+            ver = moov[pos + 8]
+            nid_off = pos + 8 + (96 if ver == 0 else 112)
+            _struct.pack_into(">I", moov, nid_off, new_id)
+            return
+        pos += size
+
+
+def _build_djmd_trak(
+    packets:         list[bytes],
+    fps:             float,
+    movie_timescale: int,
+    track_id:        int,
+    movie_duration:  int,
+    djmd_data_start: int,
+) -> bytes:
+    """
+    Build a complete trak box for the djmd data track.
+
+    packets          one bytes object per video frame (already encoded)
+    fps              source video frame rate
+    movie_timescale  from mvhd (DJI uses 30000)
+    track_id         next available track id (from mvhd.next_track_id)
+    movie_duration   in movie timescale ticks (from mvhd)
+    djmd_data_start  absolute file offset where concatenated packet bytes begin
+    """
+    n               = len(packets)
+    media_timescale = movie_timescale
+    # Round to nearest integer tick.  For 30 fps + ts=30000 → 1000.
+    # For 29.97 fps + ts=30000 → 1001.
+    sample_duration = max(1, round(media_timescale / fps))
+    media_duration  = sample_duration * n
+    sizes           = [len(p) for p in packets]
+
+    # ── tkhd ─────────────────────────────────────────────────────────────────
+    # flags: 0x01=enabled 0x02=in-movie 0x04=in-preview 0x08=in-poster
+    tkhd = _mp4_full("tkhd", 0, 0x0F, b"".join([
+        _struct.pack(">II", 0, 0),           # creation, modification
+        _struct.pack(">I",  track_id),
+        _struct.pack(">I",  0),              # reserved
+        _struct.pack(">I",  movie_duration),
+        b"\x00" * 8,                         # reserved
+        _struct.pack(">hh", 0, 0),           # layer, alternate_group
+        _struct.pack(">hh", 0, 0),           # volume (0=silent), reserved
+        _struct.pack(">IIIIIIIII",           # identity matrix
+            0x00010000, 0, 0,
+            0, 0x00010000, 0,
+            0, 0, 0x40000000),
+        _struct.pack(">II", 0, 0),           # width, height (0 for data tracks)
+    ]))
+
+    # ── mdhd ─────────────────────────────────────────────────────────────────
+    mdhd = _mp4_full("mdhd", 0, 0, b"".join([
+        _struct.pack(">II", 0, 0),           # creation, modification
+        _struct.pack(">I",  media_timescale),
+        _struct.pack(">I",  media_duration),
+        _struct.pack(">HH", 0x55C4, 0),      # language=und, pre_defined=0
+    ]))
+
+    # ── hdlr ─────────────────────────────────────────────────────────────────
+    hdlr = _mp4_full("hdlr", 0, 0, b"".join([
+        _struct.pack(">I", 0),               # pre_defined
+        b"meta",                             # handler_type (matches DJI)
+        b"\x00" * 12,                        # reserved
+        b"DJI meta\x00",                     # null-terminated handler name
+    ]))
+
+    # ── stsd: djmd sample entry ───────────────────────────────────────────────
+    # Generic sample entry: 6 bytes reserved + 2-byte data_reference_index
+    djmd_entry = _mp4_box("djmd",
+        b"\x00" * 6 + _struct.pack(">H", 1)
+    )
+    stsd = _mp4_full("stsd", 0, 0,
+        _struct.pack(">I", 1) + djmd_entry   # entry_count = 1
+    )
+
+    # ── stts: all samples have the same duration ──────────────────────────────
+    stts = _mp4_full("stts", 0, 0,
+        _struct.pack(">I", 1)                       # entry_count = 1
+      + _struct.pack(">II", n, sample_duration)     # count, delta
+    )
+
+    # ── stsc: 1 sample per chunk ──────────────────────────────────────────────
+    stsc = _mp4_full("stsc", 0, 0,
+        _struct.pack(">I",    1)                    # entry_count = 1
+      + _struct.pack(">III", 1, 1, 1)               # first_chunk, samp/chunk, desc_idx
+    )
+
+    # ── stsz: variable sample sizes ───────────────────────────────────────────
+    stsz = _mp4_full("stsz", 0, 0,
+        _struct.pack(">II", 0, n)                   # sample_size=0 (variable), count
+      + b"".join(_struct.pack(">I", s) for s in sizes)
+    )
+
+    # ── stco: one chunk per sample, absolute file offsets ────────────────────
+    offsets = []
+    cur = djmd_data_start
+    for s in sizes:
+        offsets.append(cur)
+        cur += s
+    stco = _mp4_full("stco", 0, 0,
+        _struct.pack(">I", n)
+      + b"".join(_struct.pack(">I", o) for o in offsets)
+    )
+
+    # ── nmhd: null media header (used for data/timed-metadata tracks) ─────────
+    nmhd = _mp4_full("nmhd", 0, 0, b"")
+
+    # ── dref: self-contained URL reference ────────────────────────────────────
+    url  = _mp4_full("url ", 0, 1, b"")  # flags=1 = data is self-contained
+    dref = _mp4_full("dref", 0, 0, _struct.pack(">I", 1) + url)
+    dinf = _mp4_box("dinf", dref)
+
+    stbl = _mp4_box("stbl", stsd + stts + stsc + stsz + stco)
+    minf = _mp4_box("minf", nmhd + dinf + stbl)
+    mdia = _mp4_box("mdia", mdhd + hdlr + minf)
+    return  _mp4_box("trak", tkhd + mdia)
+
+
+def inject_djmd_track(mp4_path: Path, packets: list[bytes], fps: float) -> None:
+    """
+    Add a dvtm_wm265e.proto djmd timed-metadata track to an existing H.264 MP4.
+
+    Algorithm
+    ---------
+    1. Read the existing MP4 into memory.
+    2. Parse top-level boxes: ftyp, moov, mdat.
+    3. Extract movie timescale / duration / next_track_id from mvhd.
+    4. Build the djmd trak box with a placeholder offset; note its size.
+    5. Adjust existing video stco offsets by +len(djmd_trak) (moov will grow).
+    6. Compute the exact file offset where djmd packets will live (end of the
+       extended mdat) and rebuild the djmd trak with correct stco values.
+    7. Write: ftyp + new_moov + extended_mdat(original_video_data + djmd_bytes).
+
+    Assumptions
+    -----------
+    • The input was produced by ffmpeg with -movflags +faststart so the layout
+      is ftyp → moov → mdat.  (This is always true for our transcode step.)
+    • File size < 4 GB (stco uses 32-bit offsets).
+    """
+    raw = mp4_path.read_bytes()
+
+    # ── Parse top-level boxes ─────────────────────────────────────────────────
+    top: dict[str, tuple[int, int]] = {}  # type → (offset, total_size)
+    pos = 0
+    while pos + 8 <= len(raw):
+        size  = _struct.unpack_from(">I", raw, pos)[0]
+        btype = raw[pos+4:pos+8].decode("ascii", errors="replace")
+        if size == 0:
+            size = len(raw) - pos
+        elif size == 1:
+            if pos + 16 > len(raw):
+                break
+            size = int(_struct.unpack_from(">Q", raw, pos+8)[0])
+        if size < 8:
+            break
+        top[btype] = (pos, size)
+        pos += size
+
+    if "moov" not in top:
+        print("  WARNING: inject_djmd_track: no moov box — djmd track skipped")
+        return
+    if "mdat" not in top:
+        print("  WARNING: inject_djmd_track: no mdat box — djmd track skipped")
+        return
+
+    moov_off, moov_size = top["moov"]
+    mdat_off, mdat_size = top["mdat"]
+
+    # Require faststart layout (moov before mdat) for the stco delta logic.
+    if moov_off > mdat_off:
+        print("  WARNING: inject_djmd_track: moov is after mdat "
+              "(no -movflags+faststart?) — djmd track skipped")
+        return
+
+    ftyp_off,  ftyp_size  = top.get("ftyp",  (0, 0))
+    ftyp_bytes = raw[ftyp_off : ftyp_off + ftyp_size] if ftyp_size else b""
+
+    moov_inner = bytearray(raw[moov_off + 8 : moov_off + moov_size])
+    mdat_inner = raw[mdat_off + 8 : mdat_off + mdat_size]   # video data only
+
+    # ── Read mvhd ─────────────────────────────────────────────────────────────
+    mvhd_rel = moov_inner.find(b"mvhd")
+    if mvhd_rel < 4:
+        print("  WARNING: inject_djmd_track: mvhd not found — djmd track skipped")
+        return
+    mvhd_rel -= 4  # rewind to box size field
+    mi = moov_inner[mvhd_rel + 8:]  # inner bytes of mvhd
+    if mi[0] == 0:  # version 0
+        movie_timescale = _struct.unpack_from(">I", mi, 12)[0]
+        movie_duration  = _struct.unpack_from(">I", mi, 16)[0]
+        next_track_id   = _struct.unpack_from(">I", mi, 96)[0]
+    else:            # version 1
+        movie_timescale = _struct.unpack_from(">I", mi, 20)[0]
+        movie_duration  = int(_struct.unpack_from(">Q", mi, 24)[0])
+        next_track_id   = _struct.unpack_from(">I", mi, 112)[0]
+
+    # ── Build djmd trak (pass 1: placeholder offset to get its size) ──────────
+    djmd_trak_probe = _build_djmd_trak(
+        packets, fps, movie_timescale, next_track_id,
+        movie_duration, djmd_data_start=0xDEADBEEF,
+    )
+    trak_size = len(djmd_trak_probe)
+
+    # ── Compute output layout geometry ────────────────────────────────────────
+    # Output: [ftyp: F bytes][moov: new_moov_size bytes][mdat: 8 + video + djmd]
+    # Any boxes between the original ftyp/moov/mdat (e.g. a 'free' box that
+    # ffmpeg's faststart rewriter sometimes inserts) are dropped in reassembly.
+    # The correct stco delta is therefore NOT simply trak_size — it must account
+    # for whatever bytes the old mdat was offset from where ftyp+moov ended.
+    F             = len(ftyp_bytes)
+    new_moov_size = 8 + len(moov_inner) + trak_size
+
+    # ── Adjust existing video stco offsets ────────────────────────────────────
+    # delta = (new mdat data start) − (old mdat data start)
+    #       = (F + new_moov_size + 8) − (mdat_off + 8)
+    #       = F + new_moov_size − mdat_off
+    # Equals trak_size only when moov immediately follows ftyp and mdat
+    # immediately follows moov — not guaranteed with ffmpeg +faststart.
+    stco_delta = F + new_moov_size - mdat_off
+    _mp4_adj_stco(moov_inner, 0, len(moov_inner), stco_delta)
+
+    # ── Patch mvhd.next_track_id ──────────────────────────────────────────────
+    _mp4_patch_mvhd_next_track(moov_inner, next_track_id + 1)
+
+    # ── Compute where djmd packet bytes will actually live ────────────────────
+    djmd_data_start = F + new_moov_size + 8 + len(mdat_inner)
+
+    # ── Build djmd trak (pass 2: correct offsets) ─────────────────────────────
+    djmd_trak = _build_djmd_trak(
+        packets, fps, movie_timescale, next_track_id,
+        movie_duration, djmd_data_start=djmd_data_start,
+    )
+    assert len(djmd_trak) == trak_size, "djmd trak size changed between passes"
+
+    # ── Assemble output file ──────────────────────────────────────────────────
+    new_moov = _mp4_box("moov", bytes(moov_inner) + djmd_trak)
+    new_mdat = _mp4_box("mdat", mdat_inner + b"".join(packets))
+
+    mp4_path.write_bytes(ftyp_bytes + new_moov + new_mdat)
+
+    djmd_kb = sum(len(p) for p in packets) // 1024
+    print(f"  djmd → {mp4_path.name}  "
+          f"({len(packets)} packets, {djmd_kb} KB, "
+          f"dvtm_wm265e.proto / Mavic3 Enterprise format)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SRT writer
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1325,30 +1770,32 @@ def ms_to_tc(ms: int) -> str:
 
 
 def write_srt(
-    path:      Path,
-    waypoints: list[Waypoint],
-    alt_m:     float,
-    fps:       float,
+    path:         Path,
+    waypoints:    list[Waypoint],
+    alt_m:        float,
+    fps:          float,
     total_frames: int,
+    start_frame:  int = 0,     # first absolute frame of the clip (0 = full video)
 ) -> None:
     """Write a DJI Format-B SRT file (with gb_pitch/gb_yaw/gb_roll fields)."""
     lines = []
     frame_ms = int(1000 / fps)
     rng = np.random.default_rng(42)   # deterministic noise
 
-    for fi in range(total_frames):
+    for rel_fi in range(total_frames):
+        fi     = rel_fi + start_frame          # absolute frame → waypoint lookup
         t_s    = fi / fps
-        t_ms   = int(t_s * 1000)
+        t_ms   = int(rel_fi * 1000 / fps)      # 0-based timestamps in the output SRT
         lat, lon, bearing = interpolate_position(waypoints, t_s)
 
         # Slight altitude variation (±1 m) for realism
-        alt_var = alt_m     # altitude jitter removed (used to be alt_m + rng.uniform(-1.0, 1.0))
+        alt_var = alt_m
 
         start_tc = ms_to_tc(t_ms)
         end_tc   = ms_to_tc(t_ms + frame_ms)
 
         block = (
-            f"{fi + 1}\n"
+            f"{rel_fi + 1}\n"
             f"{start_tc} --> {end_tc}\n"
             f'<font size="28">FrameCnt : {fi}, DiffTime : {frame_ms}ms\n'
             f"[iso : 100] [shutter : 1/1000] [fnum : 280] [ev : 0] "
@@ -1386,12 +1833,27 @@ def generate(
     focal_mm:         float = 4.5,
     objects:          list[dict] | None = None,
     extract_frames:   bool  = False,
-    tracking_targets: list[TrackingTarget] | None = None,
-) -> tuple[Path, Path]:
+    tracking_targets:  list[TrackingTarget] | None = None,
+    telemetry_format:  str   = "srt",
+    clip_to_targets:   bool  = False,
+    clip_padding_sec:  float = 2.0,
+) -> tuple[Path, Path | None]:
     """
-    Generate the synthetic video and SRT file.
+    Generate the synthetic video and telemetry.
 
-    Returns (video_path, srt_path).
+    telemetry_format:
+      "srt"      – write a DJI Format-B .SRT sidecar (default, always compatible)
+      "embedded" – embed a dvtm_wm265e.proto djmd data track inside the .MP4
+                   (no .SRT produced; tests TAE's DJIProtobufParser path)
+
+    clip_to_targets:
+      When True and tracking_targets are configured, the output video and SRT are
+      trimmed to only the frames where at least one target is visible, plus
+      clip_padding_sec of padding on each side.  All timestamps in the SRT start
+      from 0 (relative to the clip start), so TAE's VideoSampler reads them
+      correctly without any extra configuration.
+
+    Returns (video_path, srt_path).  srt_path is None when telemetry_format=="embedded".
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1496,6 +1958,9 @@ def generate(
 
     rng = np.random.default_rng(0)
 
+    # Collect per-frame telemetry packets for the embedded path
+    djmd_packets: list[bytes] = []
+
     # ── Clamp end_frame=-1 sentinel to total_frames-1 ────────────────────────
     for t in (tracking_targets or []):
         if t.end_frame < 0:
@@ -1549,12 +2014,35 @@ def generate(
         for t, direction, _windows in vis_results:
             prepared_targets.append((t, direction))
 
-    print(f"\nRendering {total_frames} video frames…")
+    # ── Clip window (optional) ────────────────────────────────────────────────
+    clip_start_frame = 0
+    clip_end_frame   = total_frames - 1
+
+    if clip_to_targets and vis_results:
+        all_visible: list[int] = []
+        for _t, _d, windows in vis_results:
+            for w_start, w_end in windows:
+                all_visible.extend(range(w_start, w_end + 1))
+
+        if all_visible:
+            pad = max(0, int(clip_padding_sec * fps))
+            clip_start_frame = max(0,               min(all_visible) - pad)
+            clip_end_frame   = min(total_frames - 1, max(all_visible) + pad)
+            clip_frames_n    = clip_end_frame - clip_start_frame + 1
+            print(f"\n  Clip         : frames {clip_start_frame}–{clip_end_frame}"
+                  f"  ({clip_frames_n} frames = {clip_frames_n / fps:.1f} s,"
+                  f"  padding ±{clip_padding_sec:.1f} s)")
+        else:
+            print("\n  ⚠  clip_to_targets=True but no visible windows found — "
+                  "rendering full video")
+
+    clip_frames_n = clip_end_frame - clip_start_frame + 1
+    print(f"\nRendering {clip_frames_n} video frames…")
 
     sample_idx  = 0
-    all_gt:  list[dict] = []   # ground-truth records for every frame
+    all_gt:  list[dict] = []
 
-    frame_iter = range(total_frames)
+    frame_iter = range(clip_start_frame, clip_end_frame + 1)
     if TQDM_AVAILABLE:
         frame_iter = _tqdm(
             frame_iter,
@@ -1600,6 +2088,22 @@ def generate(
                 all_gt.extend(gt_records)
 
         writer.write(frame)
+
+        # ── Per-frame djmd packet (embedded telemetry path) ───────────────────
+        if telemetry_format == "embedded":
+            djmd_packets.append(encode_wm265e_frame(
+                frame_num    = fi + 1,
+                lat          = lat,
+                lon          = lon,
+                rel_alt_m    = alt_m,
+                abs_alt_m    = alt_m + 65.0,  # synthetic ASL offset (65 m above AGL datum)
+                gimbal_pitch = -90.0,          # nadir — standard mapping configuration
+                gimbal_yaw   = bearing,
+                gimbal_roll  = 0.0,
+                drone_yaw    = bearing,
+                drone_pitch  = 0.0,
+                drone_roll   = 0.0,
+            ))
 
         # Optional frame extraction — save with embedded DJI XMP so TAE's
         # _extract_dji_data can read lat/lon/altitude/gimbal from the JPEG.
@@ -1660,8 +2164,24 @@ def generate(
 
     print(f"\n  Video → {video_path}  ({video_path.stat().st_size // 1024} KB)")
 
-    # ── SRT ───────────────────────────────────────────────────────────────────
-    write_srt(srt_path, waypoints, alt_m, fps, total_frames)
+    # ── Telemetry output ──────────────────────────────────────────────────────
+    srt_path = out_dir / "drone_video.SRT"
+
+    if telemetry_format == "embedded":
+        # Inject the dvtm_wm265e.proto djmd track directly into the MP4.
+        # Must happen AFTER the ffmpeg transcode so the final H.264 file is ready.
+        if djmd_packets:
+            inject_djmd_track(video_path, djmd_packets, float(fps))
+        else:
+            print("  WARNING: no djmd packets collected — "
+                  "falling back to SRT (rendering loop may have been empty)")
+            write_srt(srt_path, waypoints, alt_m, fps, clip_frames_n,
+                      start_frame=clip_start_frame)
+        srt_path = None  # signal to caller that no sidecar was produced
+    else:
+        # ── SRT ───────────────────────────────────────────────────────────────
+        write_srt(srt_path, waypoints, alt_m, fps, clip_frames_n,
+                  start_frame=clip_start_frame)
 
     # ── pose_metadata.json ────────────────────────────────────────────────────
     if extract_frames and meta_entries:
@@ -1741,6 +2261,13 @@ def main():
                          'Colors: red,blue,green,yellow,white,orange')
     ap.add_argument("--extract-frames", action="store_true",
                     help="Also extract sample JPEG frames + pose_metadata.json")
+    ap.add_argument("--telemetry-format", choices=["srt", "embedded"], default=None,
+                    help="Telemetry output: 'srt' = DJI sidecar (default), "
+                         "'embedded' = dvtm_wm265e.proto djmd track inside the .MP4")
+    ap.add_argument("--clip-to-targets", action="store_true", default=None,
+                    help="Trim output to visibility window of tracking targets + padding")
+    ap.add_argument("--clip-padding", type=float, default=None,
+                    help="Padding in seconds on each side of clip window [2.0]")
     ap.add_argument("--output",   default=None,
                     help="Output directory [output/sim_video]")
     args = ap.parse_args()
@@ -1812,6 +2339,7 @@ def main():
     out_dir     = Path(_cli("output", args.output, "output/sim_video"))
 
     print("\n═══ TAE Synthetic Video Generator ═══\n")
+    telemetry_format = _cli("telemetry_format", args.telemetry_format, "srt")
     video_path, srt_path = generate(
         image_path       = image_path,
         bounds           = bounds,
@@ -1829,12 +2357,18 @@ def main():
         objects          = objects,
         extract_frames   = args.extract_frames or cfg.get("extract_frames", False),
         tracking_targets = tracking_targets,
+        telemetry_format = telemetry_format,
+        clip_to_targets   = _cli("clip_to_targets",  args.clip_to_targets,  False),
+        clip_padding_sec  = _cli("clip_padding_sec",  args.clip_padding,    2.0),
     )
 
     print("\n═══ Done ═══")
     print(f"Upload to TAE:")
     print(f"  {video_path}")
-    print(f"  {srt_path}")
+    if srt_path:
+        print(f"  {srt_path}")
+    else:
+        print("  (telemetry embedded in video — no .SRT sidecar)")
 
 
 if __name__ == "__main__":

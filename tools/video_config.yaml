@@ -32,6 +32,16 @@ overlap: 0          # auto
 output:         output/tracking_test
 extract_frames: true
 
+# Telemetry output format.
+# srt:      DJI Format-B .SRT sidecar alongside the .MP4 (default, always compatible)
+# embedded: dvtm_wm265e.proto packets in a djmd data track inside the .MP4.
+#           No .SRT file is produced. Tests DJIProtobufParser end-to-end.
+telemetry_format: embedded
+
+# Whether to trim the output video to the visibility window of the tracking targets,
+# plus some padding on each side. This is useful for testing on short clips.
+clip_to_targets: true
+clip_padding_sec: 3.0          # 3 s of context before/after the target appears
 
 # ── Tracking targets ──────────────────────────────────────────────────────────
 # Required per target:  png, real_size_m, speed_ms

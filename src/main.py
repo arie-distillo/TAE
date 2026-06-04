@@ -1212,10 +1212,11 @@ async def stream_start(request: Request):
         if not paths:
             return JSONResponse({"ok": False, "error": "No active mission"})
 
-        hls_dir    = paths.uploads.parent / "hls"
-        frames_dir = paths.uploads / "live_frames"
+        hls_dir      = paths.uploads.parent / "hls"
+        frames_dir   = paths.uploads / "live_frames"
+        segments_dir = paths.uploads.parent / "live_segments"
 
-        stream_mgr.start(url, lat, lon, hls_dir, frames_dir)
+        stream_mgr.start(url, lat, lon, hls_dir, frames_dir, segments_dir=segments_dir)
         _state["video_files"] = list(_state.get("video_files", []))  # keep existing
         logger.info("Stream started: url=%s lat=%s lon=%s", url, lat, lon)
         return JSONResponse({"ok": True})
@@ -2585,7 +2586,7 @@ def frame_view(det_id: str, mode: str = "tile"):
 
 # Wire stream callbacks
 def _stream_on_frames(paths, lat, lon):
-    """Index a batch of new live frames into LanceDB."""
+    """Index a batch of new live frames into LanceDB (fixed GPS anchor)."""
     import cv2 as _cv2
     paths_obj = _state.get('mission_paths')
     if not paths_obj:
@@ -2620,6 +2621,70 @@ def _stream_on_frames(paths, lat, lon):
     _state['ingested']    = True
     logger.info('Stream: indexed %d tiles from %d frames', tiles_ok, len(paths))
 
+
+def _stream_on_frames_telem(pairs):
+    """
+    Index live frames that carry real per-frame djmd telemetry.
+
+    pairs: list[tuple[Path, SRTFrame]] produced by DJIProtobufParser +
+    VideoSampler inside StreamManager._process_one_segment().
+    """
+    import cv2 as _cv2
+    paths_obj = _state.get('mission_paths')
+    if not paths_obj:
+        return
+
+    meta = {}
+    for p, srt_frame in pairs:
+        img = _cv2.imread(str(p))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        meta[p.name] = _srt_parser.to_meta_entry(srt_frame, p, w, h)
+
+    if not meta:
+        return
+
+    # Update map centre from the first frame with a real GPS fix
+    for entry in meta.values():
+        if entry.get("lat") and entry.get("lon"):
+            _state["map_center"] = [entry["lat"], entry["lon"]]
+            _state["map_zoom"]   = 16
+            break
+
+    # Merge incrementally into the mission metadata file
+    meta_file = paths_obj.sim_metadata
+    existing: dict = {}
+    if meta_file.exists():
+        try:
+            existing = json.loads(meta_file.read_text())
+        except Exception:
+            pass
+    existing.update(meta)
+    meta_file.write_text(json.dumps(existing))
+
+    from core.sim_provider import SimD3Environment
+    from core.ingestion import run_ingestion
+    sim = SimD3Environment(str(meta_file))   # yields (img_cv2, telemetry) — what run_ingestion expects
+    tiles_ok, _ = run_ingestion(sim, spatial, _main_get_search_lib(), db)
+
+    _state['frame_count'] = _state.get('frame_count', 0) + len(pairs)
+    _state['tile_count']  = _state.get('tile_count',  0) + tiles_ok
+    _state['ingested']    = True
+
+    alts = [e.get("z") or e.get("alt_m") for e in meta.values()]
+    alts = [a for a in alts if a]
+    if alts:
+        _state["mean_alt_m"] = sum(alts) / len(alts)
+
+    logger.info(
+        'Stream (djmd): %d tiles from %d frames | GPS (%.5f, %.5f) | alt %.0fm',
+        tiles_ok, len(pairs),
+        next(iter(meta.values())).get("lat", 0),
+        next(iter(meta.values())).get("lon", 0),
+        _state.get("mean_alt_m", 0),
+    )
+
 def _stream_on_analyse():
     """Trigger auto-analysis against mission definition."""
     mid = _state.get('mission_id')
@@ -2632,7 +2697,7 @@ def _stream_on_analyse():
     _state['query_color_idx'] += 1
     from ai.detection_pipeline import run_detection_pipeline
     _classified = intent_clf.classify(m.definition)
-    run_detection_pipeline(
+    tracks = run_detection_pipeline(
         params         = _classified.params,
         all_tiles      = db.get_all_tiles(),
         original_query = m.definition,
@@ -2647,9 +2712,50 @@ def _stream_on_analyse():
         actual_alt_m   = _state.get("mean_alt_m", 100.0),
         color          = color,
     )
-    logger.info('Stream auto-analysis complete')
+    if tracks:
+        for track in tracks:
+            best   = max(track.detections, key=lambda d: d.confidence)
+            det_id = f"{track.label}_{track.track_id}"
+            _state["detections"][det_id] = {
+                "lat":           track.lat,
+                "lon":           track.lon,
+                "label":         track.label,
+                "color":         color,
+                "confirmed":     True,
+                "img_urls":      [],        # no thumbnail in streaming path
+                "is_multiangle": len(track.detections) > 1,
+                "source_count":  len(track.detections),
+                "gsd":           "-",
+                "bbox":          best.bbox_tile,
+                "source":        Path(best.parent_path).name,
+                "parent_path":   best.parent_path,
+                "tile_x":        best.tile_x,
+                "tile_y":        best.tile_y,
+                "tile_w":        best.tile_w,
+                "tile_h":        best.tile_h,
+                "vlm_report":    best.vlm_report,
+                "track_id":      track.track_id,
+                "trajectory":    [{"lat": d.lat, "lon": d.lon}
+                                   for d in track.detections],
+                "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
+                "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
+            }
+        _recenter_on_detections(list(_state["detections"].keys()))
+        _save_tracks(tracks, color)
+        _build_map()
+        paths = _state.get("mission_paths")
+        if paths:
+            _save_detections(paths.detections)
+        logger.info(
+            'Stream auto-analysis: %d track(s) confirmed for "%s"',
+            len(tracks), m.definition,
+        )
+    else:
+        logger.info(
+            'Stream auto-analysis: no detections for "%s"', m.definition
+        )
 
-stream_mgr.init(_stream_on_frames, _stream_on_analyse)
+stream_mgr.init(_stream_on_frames, _stream_on_analyse, _stream_on_frames_telem)
 
 _startup()
 _PORT = int(os.environ.get("PORT", 8000))

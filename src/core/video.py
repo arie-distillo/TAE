@@ -895,6 +895,7 @@ class VideoSampler:
         focal_mm:           float = 4.5,
         jpeg_quality:       int   = 92,
         on_progress:        Callable[[int, int], None] | None = None,
+        base_ms:            int   = 0,
     ) -> list[tuple[Path, "SRTFrame | None"]]:
         """
         Extract frames at computed intervals and pair with telemetry.
@@ -963,9 +964,15 @@ class VideoSampler:
             if not ret:
                 break
 
-            current_ms = int(fi / src_fps * 1000)
+            # Two clocks. rel_ms drives the sampling cadence (segment-relative,
+            # always starts at 0). abs_ms is the position on the FULL-video
+            # timeline and is the ONLY thing telemetry may be keyed against —
+            # otherwise each segment re-reads telemetry from t=0 and later
+            # segments geolocate through the wrong drone pose.
+            rel_ms = int(fi / src_fps * 1000)
+            abs_ms = base_ms + rel_ms
 
-            if current_ms >= next_ms:
+            if rel_ms >= next_ms:
                 # Motion filter: skip frames that are nearly identical to the
                 # previous accepted frame (drone hovering / very slow movement).
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -982,10 +989,12 @@ class VideoSampler:
                     str(fname), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
                 )
 
-                # Pair with interpolated telemetry
+                # Pair with interpolated telemetry — keyed on the ABSOLUTE
+                # video time. interpolate() stamps the returned SRTFrame with
+                # abs_ms, so downstream timestamps are monotonic across segments.
                 telem: SRTFrame | None = None
                 if srt_frames:
-                    telem = self._parser.interpolate(srt_frames, current_ms)
+                    telem = self._parser.interpolate(srt_frames, abs_ms)
 
                 results.append((fname, telem))
                 sample_idx += 1

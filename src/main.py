@@ -2713,23 +2713,8 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
         return
     h, w = img.shape[:2]
 
-    # ── register timestamp — corrected for segment PTS reset ─────────────────
-    # VideoSampler extracts frames with segment-relative PTS (0, 3000, 6000 ms).
-    # The second segment's PTS also starts from 0, colliding with the first
-    # segment's timestamps.  Detect the reset (raw_ts ≤ prev_raw_ts) and carry
-    # forward a monotonic offset so track_stage sees a causal time sequence.
-    raw_ts      = srt_frame.timestamp_ms
-    prev_raw_ts = _state.get("_stream_prev_raw_ts", -1)
-    ts_offset   = _state.get("_stream_ts_offset", 0)
-    if prev_raw_ts >= 0 and raw_ts <= prev_raw_ts:
-        # New segment started — advance offset by last interval to stay monotonic
-        interval  = _state.get("_stream_last_raw_interval", 3000)
-        ts_offset = prev_raw_ts + ts_offset + interval
-        _state["_stream_ts_offset"] = ts_offset
-    elif prev_raw_ts >= 0 and raw_ts > prev_raw_ts:
-        _state["_stream_last_raw_interval"] = raw_ts - prev_raw_ts
-    abs_ts_ms = raw_ts + ts_offset
-    _state["_stream_prev_raw_ts"] = raw_ts
+    # __ register timestamp for timeline and tracking ___________________________
+    abs_ts_ms = srt_frame.timestamp_ms
     _state.setdefault("frame_timestamps", {})[jpeg_path.name] = abs_ts_ms
 
     # ── update map centre on first GPS fix ─────────────────────────────────────

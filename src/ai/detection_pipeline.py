@@ -27,6 +27,7 @@ import re
 import tempfile
 import time
 import uuid
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -92,7 +93,14 @@ class Track:
     detections: list = field(default_factory=list)
     label:      str  = ""
     color:      str  = "#4ade80"
+    _speed_ms:  float = 0.0      # populated by track_stage() from _TrackState.speed_ms
 
+    @property
+    def speed_ms(self) -> float:
+        # Public, always-present accessor. Callers must never reach for the
+        # private _speed_ms attribute directly.
+        return self._speed_ms
+    
     @property
     def lat(self):
         # Latest observed latitude (most recent detection in temporal order).
@@ -667,7 +675,23 @@ def _frame_ts_ms(det) -> float:
     # Still image without a video timestamp — use filename sort order as proxy.
     # All stills get ts = 0; they are grouped by parent_path anyway.
     return 0.0
- 
+
+# Helper for stable track ID generation across streaming updates (see docstring below)
+def _stable_track_id(det) -> str:
+    """
+    Deterministic 8-char ID derived from the detection that ANCHORS a track
+    (its earliest in temporal order).
+
+    track_stage() processes a stable temporal sort with a single greedy
+    forward pass, so the anchor of any given track never changes as later
+    detections accumulate. Deriving the ID from the anchor keeps it constant
+    across the per-frame rebuilds in the streaming path, instead of minting a
+    fresh uuid4 on every call (which made the displayed track_id churn every
+    frame and flicker the markers / detections.json keys).
+    """
+    key = f"{det.parent_path}|{det.tile_x},{det.tile_y}|{det.bbox_tile}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+
  
 def track_stage(confirmed: list, color: str = "#4ade80") -> list:
     """
@@ -745,7 +769,7 @@ def track_stage(confirmed: list, color: str = "#4ade80") -> list:
                 det.track_id = best_st.track_id
             else:
                 new_st = _TrackState(
-                    track_id = uuid.uuid4().hex[:8],
+                    track_id = _stable_track_id(det),
                     label    = label,
                     color    = color,
                     dets     = [det],

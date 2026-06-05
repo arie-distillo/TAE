@@ -56,6 +56,7 @@ class StreamManager:
         self._running            = False
         self._stopping           = False
         self._frame_count        = 0
+        self._timeline_ms        = 0     # absolute offset of next segment
         self._error: str | None  = None
         self._url: str           = ""
         self._hls_dir: Path | None      = None
@@ -111,6 +112,7 @@ class StreamManager:
             self._hls_dir     = hls_dir
             self._frames_dir  = frames_dir
             self._frame_count = 0
+            self._timeline_ms = 0
             self._error       = None
             self._stopping    = False
 
@@ -394,6 +396,20 @@ class StreamManager:
                 break
             time.sleep(POLL_INTERVAL_S)
 
+    # helper to get the true duration of a segment file in ms (frame_count / fps).
+    @staticmethod
+    def _segment_duration_ms(seg_path: Path) -> int:
+        """True duration of a segment file in ms (frame_count / fps)."""
+        import cv2
+        cap = cv2.VideoCapture(str(seg_path))
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+            n   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        finally:
+            cap.release()
+        return int(n / fps * 1000) if fps > 0 else 0
+    
+
     def _process_one_segment(
         self,
         seg_path:     Path,
@@ -421,13 +437,23 @@ class StreamManager:
             logger.warning("Segment %s: no source telemetry — skipped", seg_path.name)
             return
 
+        # Each segment occupies a contiguous slice of the source timeline.
+        # ffmpeg's segment muxer cuts on keyframes, so segment durations are
+        # NOT uniform (e.g. 25s then 16s) — accumulate the real per-segment
+        # duration rather than assuming SEGMENT_DURATION_S.
+        base_ms = self._timeline_ms
         try:
             frame_pairs = video_sampler.sample_file(
                 seg_path, srt_frames=self._source_telem, out_dir=frames_dir,
+                base_ms=base_ms,
             )
         except Exception as exc:
             logger.warning("Segment %s VideoSampler error: %s", seg_path.name, exc)
             return
+
+        # Advance the absolute timeline by this segment's TRUE duration so the
+        # next segment's frames resolve telemetry at the correct video time.
+        self._timeline_ms = base_ms + self._segment_duration_ms(seg_path)
 
         if not frame_pairs:
             logger.debug("Segment %s: no sampled frames", seg_path.name)

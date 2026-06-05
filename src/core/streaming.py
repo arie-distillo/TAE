@@ -1,31 +1,30 @@
 """
 core/streaming.py — Live stream ingestion manager.
 
-Accepts an RTSP/RTMP/file URL and runs two parallel pipelines:
+Two processing paths depending on whether the source carries an embedded
+djmd telemetry stream:
 
-  1. HLS transcoding  — ffmpeg writes .m3u8 + .ts segments to hls_dir/.
-     The browser plays these via hls.js with ~5–10 s latency.
+Path A — no embedded telemetry (fixed GPS anchor)
+    ffmpeg writes JPEG frames at FRAME_INTERVAL_S to frames_dir/.
+    Background thread batches new frames → on_frames(paths, lat, lon).
 
-  2a. Frame extraction (no embedded telemetry) — ffmpeg writes a JPEG every
-      FRAME_INTERVAL_S seconds to frames_dir/.  A background thread picks up
-      new frames, calls on_frames(paths, lat, lon) with the fixed GPS anchor
-      supplied at start, and periodically triggers on_analyse().
+Path B — djmd telemetry detected (per-frame real-time)
+    ffmpeg segments the source into SEGMENT_DURATION_S MP4 chunks.
+    For each completed segment VideoSampler extracts frames.
+    Each frame is handed individually to on_frame_telem(jpeg_path, srt_frame)
+    in strict temporal order so the caller can:
+      - CLIP-index the frame immediately
+      - run detection on only that frame's tiles
+      - update a persistent cross-frame tracker
+      - rebuild the map as confirmed detections accumulate
 
-  2b. Segment extraction (embedded djmd telemetry detected) — ffmpeg muxes ALL
-      tracks into SEGMENT_DURATION_S-long MP4 chunks written to segments_dir/.
-      A background thread processes each completed segment with DJIProtobufParser
-      + VideoSampler (both from core/video.py) to extract per-frame GPS, altitude,
-      and gimbal angles from the djmd protobuf stream, then calls
-      on_frames_telem([(jpeg_path, SRTFrame), ...]).
-
-      Detection: ffprobe probes the source URL before start.  If a stream with
-      codec_tag_string == "djmd" or handler_name containing "dji meta" is found,
-      telemetry mode activates automatically.
+    This is true near-real-time processing: index → detect → track → map,
+    one frame at a time, rather than batch-after-all-frames.
 
 Thread safety
--------------
-All state is guarded by a single threading.Lock().  The stream manager is a
-singleton instantiated once in main.py and shared across requests.
+─────────────
+All mutable state is guarded by a single Lock.  The stream manager is a
+singleton instantiated once in main.py.
 """
 
 import json
@@ -39,26 +38,21 @@ from typing import Callable
 logger = logging.getLogger("TAE.Stream")
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-FRAME_INTERVAL_S   = 2.0    # JPEG extraction rate for the fixed-anchor path
-SEGMENT_DURATION_S = 5      # MP4 segment length for the djmd telemetry path
-ANALYSIS_EVERY_N   = 10     # trigger on_analyse() after this many new frames
-HLS_SEGMENT_S      = 2      # HLS segment duration in seconds
-HLS_LIST_SIZE      = 5      # HLS playlist window size
+FRAME_INTERVAL_S   = 2.0    # JPEG extraction rate (Path A only)
+SEGMENT_DURATION_S = 5      # MP4 segment length in seconds
+ANALYSIS_EVERY_N   = 5      # call on_analyse() every N segments (Path A)
+HLS_SEGMENT_S      = 2
+HLS_LIST_SIZE      = 5
 FFMPEG_LOGLEVEL    = "warning"
-POLL_INTERVAL_S    = 0.5    # background thread polling interval
-DJMD_PROBE_TIMEOUT = 12     # ffprobe timeout for djmd stream detection (seconds)
+POLL_INTERVAL_S    = 0.5
+DJMD_PROBE_TIMEOUT = 12
 
 
 class StreamManager:
-    """
-    Lifecycle: idle → starting → running → stopping → idle
-    A single instance is shared across the application.
-    """
 
     def __init__(self) -> None:
         self._lock               = threading.Lock()
         self._proc: subprocess.Popen | None = None
-        self._thread: threading.Thread | None = None
         self._running            = False
         self._stopping           = False
         self._frame_count        = 0
@@ -68,38 +62,38 @@ class StreamManager:
         self._frames_dir: Path | None   = None
         self._segments_dir: Path | None = None
         self._telemetry_enabled  = False
-        self._source_telem: list = []   # pre-parsed SRTFrames from source (djmd path)
-        # Callbacks wired by main.py at startup
-        self._on_frames:       Callable[[list[Path], float, float], None] | None = None
-        self._on_frames_telem: Callable[[list[tuple]], None] | None = None
-        self._on_analyse:      Callable[[], None] | None = None
+        self._source_telem: list = []
+        # Callbacks
+        self._on_frames:      Callable | None = None   # Path A batch callback
+        self._on_frame_telem: Callable | None = None   # Path B per-frame callback
+        self._on_analyse:     Callable | None = None
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def init(
         self,
-        on_frames:       Callable[[list[Path], float, float], None],
-        on_analyse:      Callable[[], None],
-        on_frames_telem: Callable[[list[tuple]], None] | None = None,
+        on_frames:      Callable[[list[Path], float, float], None],
+        on_analyse:     Callable[[], None],
+        on_frame_telem: Callable[[Path, object], None] | None = None,
     ) -> None:
         """
-        Wire up callbacks from main.py.
+        Wire up callbacks.
 
         on_frames(paths, lat, lon)
-            Fixed-anchor path: list of new JPEG paths + operator-supplied GPS.
-            Used when no djmd stream is present in the source.
+            Path A (no djmd): batch of new JPEG paths + fixed GPS anchor.
 
-        on_frames_telem(pairs)
-            Telemetry path: list of (jpeg_path, SRTFrame) tuples, one per
-            sampled frame extracted from a completed MP4 segment.  SRTFrame
-            carries real GPS, altitude, and gimbal angles from the djmd stream.
+        on_frame_telem(jpeg_path, srt_frame)
+            Path B (djmd detected): one JPEG + its SRTFrame telemetry.
+            Called in strict temporal order, one frame at a time.
+            The caller is responsible for indexing, detecting, tracking and
+            updating the map — all per frame.
 
         on_analyse()
-            Called every ANALYSIS_EVERY_N frames; triggers detection pipeline.
+            Path A only: periodic trigger for auto-analysis.
         """
-        self._on_frames       = on_frames
-        self._on_frames_telem = on_frames_telem
-        self._on_analyse      = on_analyse
+        self._on_frames      = on_frames
+        self._on_frame_telem = on_frame_telem
+        self._on_analyse     = on_analyse
 
     def start(
         self,
@@ -110,11 +104,6 @@ class StreamManager:
         frames_dir:   Path,
         segments_dir: Path | None = None,
     ) -> None:
-        """
-        Probe the source for a djmd telemetry track, then start ffmpeg and
-        the appropriate background processing thread.
-        Raises RuntimeError if already running.
-        """
         with self._lock:
             if self._running:
                 raise RuntimeError("Stream already running — stop it first.")
@@ -139,10 +128,10 @@ class StreamManager:
             with self._lock:
                 self._segments_dir = seg_dir
 
-            # Pre-parse all djmd telemetry from the source now.
-            # Segments will carry video only (ffmpeg cannot copy the djmd track
-            # to a new mp4 — codec_id=NONE is rejected by the mp4 muxer).
-            # Telemetry is matched to segment frames by absolute timestamp.
+            # Pre-parse all djmd telemetry from the source.
+            # ffmpeg cannot copy the djmd track to mp4 segments (codec_id=NONE
+            # is rejected by the mp4 muxer), so we parse the source directly
+            # and supply the full SRTFrame list to VideoSampler per segment.
             try:
                 from core.video import DJIProtobufParser
                 self._source_telem = DJIProtobufParser().parse(Path(url))
@@ -151,17 +140,17 @@ class StreamManager:
                     len(self._source_telem),
                 )
             except Exception as exc:
-                logger.warning("Failed to pre-parse djmd telemetry: %s", exc)
+                logger.warning("djmd pre-parse failed: %s", exc)
                 self._source_telem = []
 
             logger.info(
-                "djmd stream found at index %d — telemetry-aware segment path active",
+                "djmd stream at index %d — per-frame real-time path active",
                 djmd_idx,
             )
         else:
             self._source_telem = []
             logger.info(
-                "No djmd stream in '%s' — using fixed GPS anchor (%.6f, %.6f)",
+                "No djmd stream in '%s' — fixed GPS anchor (%.6f, %.6f)",
                 url, lat, lon,
             )
 
@@ -169,20 +158,15 @@ class StreamManager:
         m3u8      = hls_dir / "stream.m3u8"
         frame_pat = frames_dir / "live_%05d.jpg"
 
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", FFMPEG_LOGLEVEL,
-        ]
-        # -rtsp_transport is an RTSP-demuxer option; passing it before a local
-        # file path causes ffmpeg to abort with "Option not found".
+        cmd = ["ffmpeg", "-y", "-loglevel", FFMPEG_LOGLEVEL]
         if url.lower().startswith(("rtsp://", "rtsps://")):
             cmd += ["-rtsp_transport", "tcp"]
         cmd += [
             "-i", url,
-            # Output 1: HLS for browser playback (always present)
+            # HLS output — always present for browser playback
             "-map", "0:v:0",
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-g", str(HLS_SEGMENT_S * 30),
-            "-sc_threshold", "0",
+            "-g", str(HLS_SEGMENT_S * 30), "-sc_threshold", "0",
             "-f", "hls",
             "-hls_time",      str(HLS_SEGMENT_S),
             "-hls_list_size", str(HLS_LIST_SIZE),
@@ -191,26 +175,15 @@ class StreamManager:
         ]
 
         if djmd_idx is None:
-            # Output 2a: JPEG frames at fixed rate, fixed GPS anchor
+            # Path A: JPEG frames at fixed interval
             cmd += [
                 "-map", "0:v:0",
                 "-vf", f"fps=1/{FRAME_INTERVAL_S}",
-                "-q:v", "3",
-                "-update", "0",
+                "-q:v", "3", "-update", "0",
                 str(frame_pat),
             ]
         else:
-            # Output 2b: video-only MP4 segments.
-            #
-            # We do NOT use -map 0 here because the djmd data track has
-            # codec_id=NONE which the mp4 muxer rejects ("Could not find tag
-            # for codec none in stream").  Telemetry was pre-parsed from the
-            # source above and is matched to frames by absolute timestamp.
-            #
-            # -reset_timestamps is NOT used so that segment frame timestamps
-            # remain absolute (relative to source start), which lets
-            # VideoSampler / SRTParser.interpolate match them against the
-            # pre-parsed SRTFrame list by absolute timestamp_ms.
+            # Path B: video-only MP4 segments (djmd parsed separately above)
             cmd += [
                 "-map", "0:v:0",
                 "-c:v", "copy",
@@ -226,38 +199,26 @@ class StreamManager:
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             )
         except FileNotFoundError:
-            raise RuntimeError(
-                "ffmpeg not found. Install it: https://ffmpeg.org/download.html"
-            )
+            raise RuntimeError("ffmpeg not found.")
 
         with self._lock:
             self._proc    = proc
             self._running = True
 
-        threading.Thread(
-            target=self._read_stderr, args=(proc,), daemon=True,
-        ).start()
+        threading.Thread(target=self._read_stderr, args=(proc,), daemon=True).start()
 
         if djmd_idx is None:
             t = threading.Thread(
-                target=self._process_frames,
-                args=(frames_dir, lat, lon),
-                daemon=True,
+                target=self._process_frames, args=(frames_dir, lat, lon), daemon=True,
             )
         else:
             t = threading.Thread(
-                target=self._process_segments,
-                args=(seg_dir, frames_dir, self._source_telem),
-                daemon=True,
+                target=self._process_segments, args=(seg_dir, frames_dir), daemon=True,
             )
         t.start()
-        with self._lock:
-            self._thread = t
-
         logger.info("Stream started: %s (telemetry=%s)", url, djmd_idx is not None)
 
     def stop(self) -> None:
-        """Terminate ffmpeg and signal the processing thread to exit."""
         with self._lock:
             if not self._running:
                 return
@@ -304,24 +265,17 @@ class StreamManager:
     # ── djmd detection ─────────────────────────────────────────────────────────
 
     def _detect_djmd(self, url: str) -> int | None:
-        """
-        Probe the source URL with ffprobe.  Return the stream index of the
-        djmd data track, or None if not present or probe fails.
-        """
         cmd = ["ffprobe", "-v", "error"]
         if url.lower().startswith(("rtsp://", "rtsps://")):
             cmd += ["-rtsp_transport", "tcp"]
         cmd += ["-show_streams", "-of", "json", url]
         try:
-            res = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=DJMD_PROBE_TIMEOUT,
-            )
+            res  = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=DJMD_PROBE_TIMEOUT)
             info = json.loads(res.stdout)
         except Exception as exc:
-            logger.debug("djmd probe failed for '%s': %s", url, exc)
+            logger.debug("djmd probe failed: %s", exc)
             return None
-
         for s in info.get("streams", []):
             tag     = s.get("codec_tag_string", "").lower()
             handler = s.get("tags", {}).get("handler_name", "").lower()
@@ -337,7 +291,7 @@ class StreamManager:
             if not text:
                 continue
             low = text.lower()
-            if any(k in low for k in ("error", "invalid", "no such file", "failed")):
+            if any(k in low for k in ("error", "invalid", "failed", "no such file")):
                 logger.warning("ffmpeg ERROR: %s", text)
                 with self._lock:
                     self._error = text[:200]
@@ -347,20 +301,13 @@ class StreamManager:
     # ── Path A: fixed-anchor JPEG processing ───────────────────────────────────
 
     def _process_frames(self, frames_dir: Path, lat: float, lon: float) -> None:
-        """
-        Poll frames_dir for new JPEGs written by ffmpeg's fps filter.
-        Call on_frames(paths, lat, lon) and trigger on_analyse() periodically.
-        All frames share the fixed GPS anchor (lat, lon) supplied at start().
-        """
         processed: set[str] = set()
         since_analysis = 0
-
         while True:
             with self._lock:
                 if not self._running:
                     break
                 stopping = self._stopping
-
             try:
                 new = sorted(
                     [p for p in frames_dir.glob("live_*.jpg")
@@ -369,24 +316,16 @@ class StreamManager:
                 )
             except Exception:
                 new = []
-
             if new:
-                logger.info(
-                    "Stream: %d new frame(s) — total %d",
-                    len(new), len(processed) + len(new),
-                )
                 if self._on_frames:
                     try:
                         self._on_frames(new, lat, lon)
                     except Exception as exc:
                         logger.error("on_frames error: %s", exc)
-
                 for p in new:
                     processed.add(p.name)
-
                 with self._lock:
                     self._frame_count = len(processed)
-
                 since_analysis += len(new)
                 if since_analysis >= ANALYSIS_EVERY_N and self._on_analyse:
                     since_analysis = 0
@@ -394,39 +333,26 @@ class StreamManager:
                         self._on_analyse()
                     except Exception as exc:
                         logger.error("on_analyse error: %s", exc)
-
             if stopping:
                 break
             time.sleep(POLL_INTERVAL_S)
-
         logger.info("Frame processor thread exiting.")
 
-    # ── Path B: djmd telemetry segment processing ──────────────────────────────
+    # ── Path B: per-frame real-time processing ─────────────────────────────────
 
-    def _process_segments(self, segments_dir: Path, frames_dir: Path, source_telem: list) -> None:
-        """
-        Poll segments_dir for completed video-only MP4 segments.
-        source_telem is the full list of SRTFrames pre-parsed from the djmd
-        track of the source file; it is passed to VideoSampler so that each
-        segment's extracted frames get real per-frame GPS and gimbal data
-        matched by absolute timestamp.
-        """
+    def _process_segments(self, segments_dir: Path, frames_dir: Path) -> None:
         try:
-            self._run_segment_loop(segments_dir, frames_dir, source_telem)
+            self._run_segment_loop(segments_dir, frames_dir)
         except Exception as exc:
-            logger.error(
-                "Segment processor thread crashed: %s", exc, exc_info=True
-            )
+            logger.error("Segment processor crashed: %s", exc, exc_info=True)
         finally:
             logger.info("Segment processor thread exiting.")
 
-    def _run_segment_loop(self, segments_dir: Path, frames_dir: Path, source_telem: list) -> None:
-        """Inner loop — separated so the outer method can catch all exceptions."""
+    def _run_segment_loop(self, segments_dir: Path, frames_dir: Path) -> None:
         from core.video import VideoSampler
 
         video_sampler = VideoSampler()
         processed: set[str] = set()
-        since_analysis = 0
 
         logger.info("Segment loop started — watching %s", segments_dir)
 
@@ -444,31 +370,21 @@ class StreamManager:
                     len(segs), len(processed),
                 )
 
-            # A segment is complete when either:
-            #   (a) a newer sibling exists (ffmpeg has moved on), or
-            #   (b) it is the sole/last file AND its mtime is older than
-            #       SEGMENT_DURATION_S + 2 s (ffmpeg has finished writing it)
+            # A segment is complete when a newer sibling exists, or when it is
+            # old enough that ffmpeg has certainly finished writing it.
             now = time.time()
             complete = [
                 s for s in segs
                 if s.name not in processed
                 and (
-                    s is not segs[-1]                               # has a newer sibling
-                    or now - s.stat().st_mtime > SEGMENT_DURATION_S + 2  # or sealed by age
+                    s is not segs[-1]
+                    or now - s.stat().st_mtime > SEGMENT_DURATION_S + 2
                 )
             ]
 
             for seg in complete:
-                self._process_one_segment(seg, frames_dir, source_telem, video_sampler)
+                self._process_one_segment(seg, frames_dir, video_sampler)
                 processed.add(seg.name)
-                since_analysis += 1
-                if since_analysis >= max(1, ANALYSIS_EVERY_N // SEGMENT_DURATION_S) \
-                        and self._on_analyse:
-                    since_analysis = 0
-                    try:
-                        self._on_analyse()
-                    except Exception as exc:
-                        logger.error("on_analyse error: %s", exc)
                 try:
                     seg.unlink()
                 except Exception:
@@ -482,25 +398,32 @@ class StreamManager:
         self,
         seg_path:     Path,
         frames_dir:   Path,
-        source_telem: list,   # pre-parsed list[SRTFrame] from source file
         video_sampler,
     ) -> None:
         """
-        Extract video frames from one MP4 segment and pair them with telemetry
-        from the pre-parsed source SRTFrame list using absolute timestamps.
+        Extract frames from one MP4 segment and process each individually.
 
-        Segments carry video only (djmd was parsed from the source directly).
-        VideoSampler extracts frames whose PTS timestamps are absolute (relative
-        to source start), so SRTParser.interpolate matches them correctly
-        against the full source_telem list.
+        VideoSampler returns all frames for the segment at once (ffmpeg
+        constraint) but we iterate through them one by one in temporal order,
+        calling on_frame_telem(jpeg_path, srt_frame) for each.
+
+        This gives the caller (main.py) the ability to:
+          1. CLIP-index each frame immediately
+          2. register its timestamp for the tracker
+          3. run detection on that frame's tiles only
+          4. update the persistent cross-frame tracker
+          5. rebuild the map as confirmed detections accumulate
+
+        Temporal order is guaranteed because VideoSampler sorts frames by PTS
+        and source_telem is sorted by timestamp_ms from the full-video parse.
         """
-        if not source_telem:
-            logger.warning("Segment %s: no source telemetry available — skipped", seg_path.name)
+        if not self._source_telem:
+            logger.warning("Segment %s: no source telemetry — skipped", seg_path.name)
             return
 
         try:
             frame_pairs = video_sampler.sample_file(
-                seg_path, srt_frames=source_telem, out_dir=frames_dir,
+                seg_path, srt_frames=self._source_telem, out_dir=frames_dir,
             )
         except Exception as exc:
             logger.warning("Segment %s VideoSampler error: %s", seg_path.name, exc)
@@ -513,15 +436,19 @@ class StreamManager:
         n  = len(frame_pairs)
         f0 = frame_pairs[0][1]
         logger.info(
-            "Segment %s → %d frame(s) | GPS (%.5f, %.5f) | alt %.0fm",
+            "Segment %s → %d frame(s) | GPS (%.5f, %.5f) | alt %.0fm "
+            "— processing frame by frame",
             seg_path.name, n, f0.lat, f0.lon, f0.alt_m,
         )
 
-        if self._on_frames_telem:
-            try:
-                self._on_frames_telem(frame_pairs)
-            except Exception as exc:
-                logger.error("on_frames_telem error: %s", exc)
-
-        with self._lock:
-            self._frame_count += n
+        # ── per-frame sequential processing ───────────────────────────────────
+        for jpeg_path, srt_frame in frame_pairs:
+            if self._on_frame_telem:
+                try:
+                    self._on_frame_telem(jpeg_path, srt_frame)
+                except Exception as exc:
+                    logger.error(
+                        "on_frame_telem error for %s: %s", jpeg_path.name, exc,
+                    )
+            with self._lock:
+                self._frame_count += 1

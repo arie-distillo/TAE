@@ -160,3 +160,18 @@ class TacticalDatabase:
         except Exception as e:
             logger.error("get_all_tiles failed: %s", e)
             return []
+
+    def get_tiles_for_frame(self, parent_path: str) -> list[dict]:
+        """
+        Return tile records for a single frame, matched by parent_path.
+        Used by the per-frame streaming detection path so the detector operates
+        on one frame's tiles at a time rather than the entire accumulated index.
+        """
+        if self.table is None:
+            return []
+        try:
+            df = self.table.to_pandas()
+            return df[df["parent_path"] == parent_path].to_dict(orient="records")
+        except Exception as e:
+            logger.error("get_tiles_for_frame failed: %s", e)
+            return []

@@ -1051,14 +1051,73 @@ function startStream(event) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({url: url, lat: lat, lon: lon})
   }).then(function(r){return r.json();}).then(function(d){
-    if (d.ok) htmx.ajax('GET', '/stream/panel', {target: '#video-panel', swap: 'innerHTML'});
-    else alert('Stream error: ' + d.error);
+    if (d.ok) {
+      htmx.ajax('GET', '/stream/panel', {target: '#video-panel', swap: 'innerHTML'});
+      // Plain setInterval is more reliable than HTMX polling on dynamically
+      // injected divs.  Script tags inside hx-swap responses may not execute
+      // depending on HTMX version/config, so we avoid that entirely.
+      if (window._streamPollId) clearInterval(window._streamPollId);
+      window._streamPollId = setInterval(function() {
+        fetch('/stream/updates')
+          .then(function(r){ return r.json(); })
+          .then(function(data) {
+            if (!data.running) {
+              clearInterval(window._streamPollId);
+              window._streamPollId = null;
+              // Final chat message when stream ends
+              var msgs = document.getElementById('tae-msgs');
+              if (msgs && data.frame_count > 0) {
+                var ts = new Date().toTimeString().slice(0,5);
+                msgs.insertAdjacentHTML('beforeend',
+                  '<div class="msg sys"><span class="msg-time">' + ts + '</span>' +
+                  '<div class="msg-bubble">✓ Stream complete — ' + data.frame_count + ' frames processed</div></div>');
+                if (typeof scrollChat === 'function') scrollChat();
+              }
+              return;
+            }
+            if (data.pending) {
+              refreshMap();
+              htmx.ajax('GET', '/detections_panel_content',
+                {target: '#det-panel-list', swap: 'innerHTML'});
+              var img = document.getElementById('stream-frame-img');
+              if (img) img.src = '/serve_stream_frame?ts=' + Date.now();
+              var fc = document.getElementById('stream-frame-count');
+              if (fc) fc.textContent = data.frame_count + ' frames';
+            }
+            // Append any queued chat messages
+            if (data.chat_html) {
+              var msgs = document.getElementById('tae-msgs');
+              if (msgs) {
+                msgs.insertAdjacentHTML('beforeend', data.chat_html);
+                if (typeof scrollChat === 'function') scrollChat();
+              }
+            }
+            // Update status badge (shows "No index" during streaming)
+            if (data.frame_count > 0) {
+              document.querySelectorAll('.sdot').forEach(function(dot) {
+                dot.classList.add('active');
+                var sib = dot.nextSibling;
+                if (sib) sib.textContent = 'Index ready \u00b7 ' + data.frame_count + ' frames';
+              });
+            }
+          })
+          .catch(function(){});  // keep polling on transient errors
+      }, 2000);
+    } else {
+      alert('Stream error: ' + d.error);
+    }
   });
 }
 
 function stopStream() {
   fetch('/stream/stop', {method:'POST'})
-    .then(function(){htmx.ajax('GET','/stream/panel',{target:'#video-panel',swap:'innerHTML'});});
+    .then(function(){
+      htmx.ajax('GET', '/stream/panel', {target: '#video-panel', swap: 'innerHTML'});
+      if (window._streamPollId) {
+        clearInterval(window._streamPollId);
+        window._streamPollId = null;
+      }
+    });
 }
 
 // ── Video playback ────────────────────────────────────────────────────────────

@@ -1109,33 +1109,29 @@ def stream_panel():
     )
 
     if st["running"]:
-        # ── Live player ───────────────────────────────────────────────────────
+        # ── Current-frame viewer ──────────────────────────────────────────────
+        # Shows the latest JPEG extracted from the live stream — the exact frame
+        # being analysed — mirroring the "paused video" experience of a file upload.
+        # The image src is refreshed by the setInterval in startStream() JS.
+        # Always render <img id="stream-frame-img"> so getElementById always succeeds.
+        current = _state.get("stream_current_frame")
+        ts      = int(time.time() * 1000)
         return (
             header,
             Div(
-                NotStr("""
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-<video id="tae-live-video" controls autoplay muted
-  style="width:100%;display:block;max-height:280px;object-fit:contain;background:#000">
-</video>
-<script>
-(function(){
-  const v = document.getElementById('tae-live-video');
-  if (Hls.isSupported()) {
-    const h = new Hls({lowLatencyMode:true});
-    h.loadSource('/hls/stream.m3u8');
-    h.attachMedia(v);
-  } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
-    v.src = '/hls/stream.m3u8';
-  }
-})();
-</script>"""),
+                Img(
+                    src=f"/serve_stream_frame?ts={ts}" if current else "",
+                    id="stream-frame-img",
+                    alt="Waiting for first frame…",
+                    style="width:100%;display:block;max-height:280px;"
+                          "object-fit:contain;background:#111;min-height:120px",
+                ),
                 cls="video-wrap",
             ),
             Div(
                 Div(
-                    Span("● LIVE", style="color:#f87171;font-size:10px;font-weight:700"),
-                    Span("", id="stream-frame-count",
+                    Span("● LIVE  PROCESSING", style="color:#f87171;font-size:10px;font-weight:700"),
+                    Span(f"{st['frame_count']} frames", id="stream-frame-count",
                          style="color:var(--muted);font-size:9px"),
                     style="display:flex;justify-content:space-between;padding:10px 14px 6px",
                 ),
@@ -1216,6 +1212,20 @@ async def stream_start(request: Request):
         frames_dir   = paths.uploads / "live_frames"
         segments_dir = paths.uploads.parent / "live_segments"
 
+        # Reset per-session streaming state so accumulated detections from a
+        # previous stream don't bleed into the new one.
+        _state["stream_confirmed"]       = []
+        _state["_stream_map_ts"]         = 0.0
+        _state["detections"]             = {}
+        _state["frame_timestamps"]       = {}
+        _state["_stream_updates_pending"] = False
+        _state["stream_current_frame"]   = None
+        _state["stream_chat_queue"]      = []
+        # Monotonic timestamp correction across segment PTS resets
+        _state["_stream_prev_raw_ts"]       = -1
+        _state["_stream_ts_offset"]         = 0
+        _state["_stream_last_raw_interval"] = 3000
+
         stream_mgr.start(url, lat, lon, hls_dir, frames_dir, segments_dir=segments_dir)
         _state["video_files"] = list(_state.get("video_files", []))  # keep existing
         logger.info("Stream started: url=%s lat=%s lon=%s", url, lat, lon)
@@ -1254,8 +1264,65 @@ def serve_hls(filename: str):
     suffix = hls_file.suffix.lower()
     mime = {".m3u8": "application/vnd.apple.mpegurl",
             ".ts":   "video/mp2t"}.get(suffix, "application/octet-stream")
+
+    if suffix == ".m3u8":
+        # Read into memory before responding — avoids a race with ffmpeg, which
+        # continuously rewrites the playlist.  FileResponse stats the file to
+        # set Content-Length and then streams the body; if ffmpeg shortens the
+        # file between those two operations Starlette raises:
+        #   RuntimeError: Response content shorter than Content-Length
+        try:
+            content = hls_file.read_bytes()
+        except OSError:
+            return Response("Not found", status_code=404)
+        return Response(content, media_type=mime,
+                        headers={"Cache-Control": "no-cache"})
+
     return FileResponse(str(hls_file), media_type=mime,
                         headers={"Cache-Control": "no-cache"})
+
+
+@rt("/serve_stream_frame")
+def serve_stream_frame():
+    """
+    Serve the most recently extracted stream frame as a JPEG.
+    Cache-Control: no-store ensures the browser never reuses a cached copy —
+    each call to this endpoint always returns the latest frame.
+    """
+    from starlette.responses import Response
+    current = _state.get("stream_current_frame")
+    if not current:
+        return Response("No frame yet", status_code=404)
+    p = Path(current)
+    if not p.exists():
+        return Response("Frame not found", status_code=404)
+    return FileResponse(str(p), media_type="image/jpeg",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
+@rt("/stream/frame_count")
+def stream_frame_count():
+    """Tiny HTMX fragment: the frame counter string shown in the streaming Video panel."""
+    return f"{stream_mgr.status()['frame_count']} frames"
+
+
+@rt("/stream/updates")
+def stream_updates():
+    """
+    JSON polling endpoint consumed by setInterval in startStream() JS.
+    Returns {running, pending, frame_count, chat_html}.
+    pending=True signals the client to refresh map + detections + frame image.
+    chat_html is HTML to append to the chat panel (empty string when no updates).
+    """
+    pending = _state.pop("_stream_updates_pending", False)
+    # Drain the chat queue — consume all pending messages in one response
+    chat_msgs = _state.pop("stream_chat_queue", [])
+    return {
+        "running":     stream_mgr.running,
+        "pending":     bool(pending),
+        "frame_count": stream_mgr.status()["frame_count"],
+        "chat_html":   "".join(chat_msgs),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2586,176 +2653,283 @@ def frame_view(det_id: str, mode: str = "tile"):
 
 # Wire stream callbacks
 def _stream_on_frames(paths, lat, lon):
-    """Index a batch of new live frames into LanceDB (fixed GPS anchor)."""
+    """Index a batch of new live frames into LanceDB (fixed GPS anchor, Path A)."""
     import cv2 as _cv2
     paths_obj = _state.get('mission_paths')
     if not paths_obj:
         return
-    gen = TAESimGenerator(str(paths_obj.uploads), str(paths_obj.uploads))
     meta = {}
     for p in paths:
         img = _cv2.imread(str(p))
         if img is not None:
             h, w = img.shape[:2]
             meta[p.name] = {
-                "full_path":    str(p),
-                "lat":          lat,
-                "lon":          lon,
-                "z":            80.0,
-                "gimbal_pitch": -90.0,
-                "gimbal_yaw":   0.0,
-                "gimbal_roll":  0.0,
-                "img_w_px":     w,
-                "img_h_px":     h,
+                "full_path": str(p), "lat": lat, "lon": lon, "z": 80.0,
+                "gimbal_pitch": -90.0, "gimbal_yaw": 0.0, "gimbal_roll": 0.0,
+                "img_w_px": w, "img_h_px": h,
             }
     if not meta:
         return
     meta_file = paths_obj.uploads / 'live_meta.json'
     meta_file.write_text(json.dumps(meta))
-    sim = TAESimGenerator(str(paths_obj.uploads), str(paths_obj.uploads))
-    sim.pose_metadata = meta
-    from core.ingestion import run_ingestion
-    tiles_ok, _ = run_ingestion(sim, spatial, _main_get_search_lib(), db)
+    from core.sim_provider import SimD3Environment
+    from core.ingestion   import run_ingestion
+    tiles_ok, _ = run_ingestion(
+        SimD3Environment(str(meta_file)), spatial, _main_get_search_lib(), db,
+    )
     _state['frame_count'] = _state.get('frame_count', 0) + len(paths)
     _state['tile_count']  = _state.get('tile_count',  0) + tiles_ok
     _state['ingested']    = True
-    logger.info('Stream: indexed %d tiles from %d frames', tiles_ok, len(paths))
+    logger.info('Stream (anchor): %d tiles from %d frames', tiles_ok, len(paths))
 
 
-def _stream_on_frames_telem(pairs):
+def _stream_on_frame_telem(jpeg_path, srt_frame):
     """
-    Index live frames that carry real per-frame djmd telemetry.
+    True near-real-time per-frame callback (Path B — djmd telemetry present).
 
-    pairs: list[tuple[Path, SRTFrame]] produced by DJIProtobufParser +
-    VideoSampler inside StreamManager._process_one_segment().
+    Called once per frame in strict temporal order.  Each call:
+      1. CLIP-indexes the frame → LanceDB
+      2. Registers timestamp → _state["frame_timestamps"]  (fixes tracking)
+      3. Runs detection on THIS frame's tiles only
+      4. Accumulates confirmed detections → _state["stream_confirmed"]
+      5. Re-runs track_stage on full accumulated history
+      6. Updates _state["detections"] with the current track picture
+      7. Throttled map + detections.json rebuild
     """
     import cv2 as _cv2
+    import time as _time
+    from pathlib import Path as _Path
+
+    _MAP_INTERVAL_S = 10.0    # minimum seconds between map rebuilds
+
     paths_obj = _state.get('mission_paths')
     if not paths_obj:
         return
 
-    meta = {}
-    for p, srt_frame in pairs:
-        img = _cv2.imread(str(p))
-        if img is None:
-            continue
-        h, w = img.shape[:2]
-        meta[p.name] = _srt_parser.to_meta_entry(srt_frame, p, w, h)
-
-    if not meta:
+    # ── read frame ─────────────────────────────────────────────────────────────
+    img = _cv2.imread(str(jpeg_path))
+    if img is None:
+        logger.warning("stream frame unreadable: %s", jpeg_path.name)
         return
+    h, w = img.shape[:2]
 
-    # Update map centre from the first frame with a real GPS fix
-    for entry in meta.values():
-        if entry.get("lat") and entry.get("lon"):
-            _state["map_center"] = [entry["lat"], entry["lon"]]
-            _state["map_zoom"]   = 16
-            break
+    # ── register timestamp — corrected for segment PTS reset ─────────────────
+    # VideoSampler extracts frames with segment-relative PTS (0, 3000, 6000 ms).
+    # The second segment's PTS also starts from 0, colliding with the first
+    # segment's timestamps.  Detect the reset (raw_ts ≤ prev_raw_ts) and carry
+    # forward a monotonic offset so track_stage sees a causal time sequence.
+    raw_ts      = srt_frame.timestamp_ms
+    prev_raw_ts = _state.get("_stream_prev_raw_ts", -1)
+    ts_offset   = _state.get("_stream_ts_offset", 0)
+    if prev_raw_ts >= 0 and raw_ts <= prev_raw_ts:
+        # New segment started — advance offset by last interval to stay monotonic
+        interval  = _state.get("_stream_last_raw_interval", 3000)
+        ts_offset = prev_raw_ts + ts_offset + interval
+        _state["_stream_ts_offset"] = ts_offset
+    elif prev_raw_ts >= 0 and raw_ts > prev_raw_ts:
+        _state["_stream_last_raw_interval"] = raw_ts - prev_raw_ts
+    abs_ts_ms = raw_ts + ts_offset
+    _state["_stream_prev_raw_ts"] = raw_ts
+    _state.setdefault("frame_timestamps", {})[jpeg_path.name] = abs_ts_ms
 
-    # Merge incrementally into the mission metadata file
-    meta_file = paths_obj.sim_metadata
-    existing: dict = {}
-    if meta_file.exists():
-        try:
-            existing = json.loads(meta_file.read_text())
-        except Exception:
-            pass
-    existing.update(meta)
-    meta_file.write_text(json.dumps(existing))
+    # ── update map centre on first GPS fix ─────────────────────────────────────
+    if not _state.get("map_center") or _state["map_center"] == [0.0, 0.0]:
+        _state["map_center"] = [srt_frame.lat, srt_frame.lon]
+        _state["map_zoom"]   = 16
 
-    from core.sim_provider import SimD3Environment
-    from core.ingestion import run_ingestion
-    sim = SimD3Environment(str(meta_file))   # yields (img_cv2, telemetry) — what run_ingestion expects
-    tiles_ok, _ = run_ingestion(sim, spatial, _main_get_search_lib(), db)
+    # ── CLIP-index single frame (temp JSON → SimD3Environment → run_ingestion) ─
+    meta_entry = _srt_parser.to_meta_entry(srt_frame, jpeg_path, w, h)
+    tmp = paths_obj.uploads / f"_stmp_{jpeg_path.stem}.json"
+    try:
+        tmp.write_text(json.dumps({jpeg_path.name: meta_entry}))
+        from core.sim_provider import SimD3Environment
+        from core.ingestion   import run_ingestion
+        tiles_ok, _ = run_ingestion(
+            SimD3Environment(str(tmp)), spatial, _main_get_search_lib(), db,
+        )
+    finally:
+        tmp.unlink(missing_ok=True)
 
-    _state['frame_count'] = _state.get('frame_count', 0) + len(pairs)
+    _state['frame_count'] = _state.get('frame_count', 0) + 1
     _state['tile_count']  = _state.get('tile_count',  0) + tiles_ok
     _state['ingested']    = True
-
-    alts = [e.get("z") or e.get("alt_m") for e in meta.values()]
-    alts = [a for a in alts if a]
-    if alts:
-        _state["mean_alt_m"] = sum(alts) / len(alts)
+    _state["mean_alt_m"]  = float(meta_entry.get("z") or _state.get("mean_alt_m", 80.0))
+    # Track current frame so the Video panel can display it
+    _state["stream_current_frame"] = str(jpeg_path)
 
     logger.info(
-        'Stream (djmd): %d tiles from %d frames | GPS (%.5f, %.5f) | alt %.0fm',
-        tiles_ok, len(pairs),
-        next(iter(meta.values())).get("lat", 0),
-        next(iter(meta.values())).get("lon", 0),
-        _state.get("mean_alt_m", 0),
+        "Stream indexed: %s | %d tile(s) | ts=%.1fs",
+        jpeg_path.name, tiles_ok, srt_frame.timestamp_ms / 1000.0,
     )
 
-def _stream_on_analyse():
-    """Trigger auto-analysis against mission definition."""
+    # ── per-frame detection (only when mission has a definition) ───────────────
     mid = _state.get('mission_id')
-    if not mid:
-        return
-    m = mission_mgr.get(mid)
+    m   = mission_mgr.get(mid) if mid else None
     if not (m and m.definition):
         return
-    color = _MARKER_COLORS[_state['query_color_idx'] % len(_MARKER_COLORS)]
-    _state['query_color_idx'] += 1
-    from ai.detection_pipeline import run_detection_pipeline
-    _classified = intent_clf.classify(m.definition)
-    tracks = run_detection_pipeline(
-        params         = _classified.params,
-        all_tiles      = db.get_all_tiles(),
-        original_query = m.definition,
-        analyst        = analyst,
-        # SAM segementation is currently disabled in the pipeline due to SAM center-point prompting on nadir aerial imagery doesn't work reliably. 
-        # Re-enable when you find a Replicate model that accepts bounding box prompts directly.
-        # To enable: sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None
-        sam_segmentor    = None,                  # 
-        api_key        = getattr(settings, "REPLICATE_API_KEY", ""),
-        model_version  = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
-        timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
-        actual_alt_m   = _state.get("mean_alt_m", 100.0),
-        color          = color,
+
+    frame_tiles = db.get_tiles_for_frame(str(jpeg_path))
+    if not frame_tiles:
+        return
+
+    color = _MARKER_COLORS[_state.get('query_color_idx', 0) % len(_MARKER_COLORS)]
+
+    try:
+        from ai.detection_pipeline import (
+            run_detector_stage, cross_tile_nms,
+            sam_refine_stage, vlm_verify_stage,
+            geolocate_stage, track_stage,
+        )
+        _classified  = intent_clf.classify(m.definition)
+        params       = _classified.params
+        actual_alt_m = _state.get("mean_alt_m", 100.0)
+
+        logger.info(
+            "Stream detect: %s | %d tiles | %s",
+            jpeg_path.name, len(frame_tiles), params.yolo_classes,
+        )
+
+        raw = run_detector_stage(
+            tiles         = frame_tiles,
+            classes       = params.yolo_classes,
+            confidence    = params.yolo_confidence,
+            api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
+            model_version = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
+            timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
+        )
+        if not raw:
+            return
+
+        candidates = cross_tile_nms(raw)
+        candidates = [
+            d for d in candidates
+            if (d.bbox_tile[2] - d.bbox_tile[0]) >= settings.DETECTION_MIN_BBOX_PX
+            and (d.bbox_tile[3] - d.bbox_tile[1]) >= settings.DETECTION_MIN_BBOX_PX
+        ]
+        if not candidates:
+            return
+
+        candidates = sam_refine_stage(
+            candidates, params.shape_priors, actual_alt_m, None,
+        )
+        if not candidates:
+            return
+
+        confirmed = vlm_verify_stage(candidates, params, m.definition, analyst)
+        if not confirmed:
+            return
+
+        confirmed = geolocate_stage(confirmed)
+
+    except Exception as exc:
+        logger.error("Stream detection error (%s): %s", jpeg_path.name, exc)
+        return
+
+    if not confirmed:
+        return
+
+    # ── accumulate across ALL frames of the session ────────────────────────────
+    _state.setdefault("stream_confirmed", []).extend(confirmed)
+    logger.info(
+        "Frame %s: +%d confirmed | session total %d",
+        jpeg_path.name, len(confirmed), len(_state["stream_confirmed"]),
     )
-    if tracks:
-        for track in tracks:
-            best   = max(track.detections, key=lambda d: d.confidence)
-            det_id = f"{track.label}_{track.track_id}"
-            _state["detections"][det_id] = {
-                "lat":           track.lat,
-                "lon":           track.lon,
-                "label":         track.label,
-                "color":         color,
-                "confirmed":     True,
-                "img_urls":      [],        # no thumbnail in streaming path
-                "is_multiangle": len(track.detections) > 1,
-                "source_count":  len(track.detections),
-                "gsd":           "-",
-                "bbox":          best.bbox_tile,
-                "source":        Path(best.parent_path).name,
-                "parent_path":   best.parent_path,
-                "tile_x":        best.tile_x,
-                "tile_y":        best.tile_y,
-                "tile_w":        best.tile_w,
-                "tile_h":        best.tile_h,
-                "vlm_report":    best.vlm_report,
-                "track_id":      track.track_id,
-                "trajectory":    [{"lat": d.lat, "lon": d.lon}
-                                   for d in track.detections],
-                "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
-                "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
-            }
-        _recenter_on_detections(list(_state["detections"].keys()))
-        _save_tracks(tracks, color)
+
+    # ── re-run tracker on full temporal history ────────────────────────────────
+    all_tracks = track_stage(_state["stream_confirmed"], color=color)
+
+    # ── update detections state — REPLACE not accumulate ──────────────────────
+    _state["detections"] = {}
+    new_det_ids = []
+    for track in all_tracks:
+        best   = track.best
+        det_id = f"{track.label}_{track.track_id}"
+        _state["detections"][det_id] = {
+            "lat":           track.lat,    "lon":          track.lon,
+            "label":         track.label,  "color":        color,
+            "confirmed":     True,         "img_urls":     [],
+            "is_multiangle": len(track.detections) > 1,
+            "source_count":  len(track.detections),
+            "gsd":           "-",          "bbox":         best.bbox_tile,
+            "source":        _Path(best.parent_path).name,
+            "parent_path":   best.parent_path,
+            "tile_x":        best.tile_x,  "tile_y":       best.tile_y,
+            "tile_w":        best.tile_w,  "tile_h":       best.tile_h,
+            "vlm_report":    best.vlm_report,
+            "track_id":      track.track_id,
+            "trajectory":    [{"lat": d.lat, "lon": d.lon}
+                               for d in track.detections],
+            "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
+            "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
+        }
+        new_det_ids.append(det_id)
+
+    # Auto-zoom map to detection area (same as regular query path)
+    _recenter_on_detections(new_det_ids)
+
+    # Queue a chat notification for new multi-frame tracks
+    multi = [t for t in all_tracks if len(t.detections) > 1]
+    if multi:
+        ts_str  = datetime.now().strftime("%H:%M")
+        entries = ", ".join(
+            f"{t.label} ({t.speed_ms:.1f} m/s, {len(t.detections)} frames)"
+            for t in sorted(multi, key=lambda t: -len(t.detections))[:3]
+        )
+        chat_html = (
+            f'<div class="msg sys">'
+            f'<span class="msg-time">{ts_str}</span>'
+            f'<div class="msg-bubble">📡 Streaming detection: {entries}</div>'
+            f'</div>'
+        )
+        _state.setdefault("stream_chat_queue", []).append(chat_html)
+
+    # ── throttled map rebuild ──────────────────────────────────────────────────
+    now = _time.time()
+    if now - _state.get("_stream_map_ts", 0.0) >= _MAP_INTERVAL_S:
+        _state["_stream_map_ts"] = now
+        p2 = _state.get("mission_paths")
+        if p2:
+            (p2.detections / "tracks.json").unlink(missing_ok=True)
+        _save_tracks(all_tracks, color)
+        _build_map()
+        if p2:
+            _save_detections(p2.detections)
+        _state["_stream_updates_pending"] = True
+        logger.info(
+            "Stream map updated: %d track(s) | %d total detection(s)",
+            len(all_tracks), len(_state["detections"]),
+        )
+
+
+def _stream_on_analyse():
+    """
+    Final map flush after a segment batch completes (Path B).
+
+    Per-frame detection runs synchronously inside _stream_on_frame_telem, so
+    _stream_on_analyse no longer runs the full detection pipeline.  Its only
+    job is to ensure the map is saved with the latest confirmed detections,
+    and to do the final _save_detections write that may have been skipped by
+    the throttle.
+    """
+    confirmed = _state.get("stream_confirmed", [])
+    if not confirmed:
+        return
+    color = _MARKER_COLORS[_state.get('query_color_idx', 0) % len(_MARKER_COLORS)]
+    from ai.detection_pipeline import track_stage
+    all_tracks = track_stage(confirmed, color=color)
+    if all_tracks:
+        _save_tracks(all_tracks, color)
         _build_map()
         paths = _state.get("mission_paths")
         if paths:
             _save_detections(paths.detections)
         logger.info(
-            'Stream auto-analysis: %d track(s) confirmed for "%s"',
-            len(tracks), m.definition,
-        )
-    else:
-        logger.info(
-            'Stream auto-analysis: no detections for "%s"', m.definition
+            "Stream on_analyse flush: %d track(s) | %d detection(s)",
+            len(all_tracks), len(_state["detections"]),
         )
 
-stream_mgr.init(_stream_on_frames, _stream_on_analyse, _stream_on_frames_telem)
+
+stream_mgr.init(_stream_on_frames, _stream_on_analyse, _stream_on_frame_telem)
 
 _startup()
 _PORT = int(os.environ.get("PORT", 8000))

@@ -32,6 +32,7 @@ from ai.vlm import TacticalAnalyst
 from tools.ingest_telemetry import TAESimGenerator
 from core.video import SRTParser, VideoSampler, AdaptiveSampler, EmbeddedTelemetryParser, DJIProtobufParser
 from core.streaming import StreamManager
+from core.tile_novelty import TileNoveltyTracker, BackgroundDetectionWorker
 from core.app_state import (
     _state, _frame_img_cache, _tile_img_cache,
     _MARKER_COLORS, _CLIP_AERIAL_CTX,
@@ -96,6 +97,10 @@ _embedded_parser = EmbeddedTelemetryParser() # exiftool fallback (single fix onl
 
 # Live streaming manager (Phase D)
 stream_mgr = StreamManager()
+
+# ── Streaming pipeline optimisation (Phase 1 + 2) ────────────────────────
+_novelty_tracker = TileNoveltyTracker()
+_bg_worker       = BackgroundDetectionWorker()
 
 def _main_get_search_lib():          # rename locally to be unambiguous
     global _search_lib
@@ -1226,6 +1231,11 @@ async def stream_start(request: Request):
         _state["_stream_ts_offset"]         = 0
         _state["_stream_last_raw_interval"] = 3000
 
+        # Phase 1+2: reset streaming optimisation state
+        _state["_stream_intent_cache"]      = None
+        _novelty_tracker.reset()
+        _bg_worker.start()
+
         stream_mgr.start(url, lat, lon, hls_dir, frames_dir, segments_dir=segments_dir)
         _state["video_files"] = list(_state.get("video_files", []))  # keep existing
         logger.info("Stream started: url=%s lat=%s lon=%s", url, lat, lon)
@@ -1239,6 +1249,7 @@ async def stream_start(request: Request):
 def stream_stop():
     """Stop the live stream."""
     from starlette.responses import JSONResponse
+    _bg_worker.stop()
     stream_mgr.stop()
     return JSONResponse({"ok": True})
 
@@ -2683,6 +2694,132 @@ def _stream_on_frames(paths, lat, lon):
     logger.info('Stream (anchor): %d tiles from %d frames', tiles_ok, len(paths))
 
 
+def _get_active_track_positions() -> list[tuple[float, float]]:
+    """
+    Extract predicted (lat, lon) positions of active tracks.
+
+    Used by the novelty tracker to promote tiles that contain tracked
+    objects to foreground processing.  Uses the last known position
+    (velocity prediction is handled by the tracker itself on reassignment).
+    """
+    positions = []
+    for det in _state.get("detections", {}).values():
+        lat = det.get("lat", 0.0)
+        lon = det.get("lon", 0.0)
+        if lat and lon:
+            positions.append((lat, lon))
+    return positions
+
+
+def _bg_detect_callback(
+    tiles:       list[dict],
+    params,
+    definition:  str,
+    color:       str,
+    actual_alt_m: float,
+) -> None:
+    """
+    Run detection pipeline stages on background (seen) tiles.
+
+    Called by BackgroundDetectionWorker in its daemon thread.  Any confirmed
+    detections are appended to the session accumulator and the tracker is
+    re-run so the map eventually reflects objects on all tiles.
+    """
+    import time as _time
+    from pathlib import Path as _Path
+
+    if not tiles:
+        return
+
+    try:
+        from ai.detection_pipeline import (
+            run_detector_stage, cross_tile_nms,
+            sam_refine_stage, vlm_verify_stage,
+            geolocate_stage, track_stage,
+        )
+
+        logger.info("BG detect: %d tiles", len(tiles))
+
+        raw = run_detector_stage(
+            tiles         = tiles,
+            classes       = params.yolo_classes,
+            confidence    = params.yolo_confidence,
+            api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
+            model_version = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
+            timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
+        )
+        if not raw:
+            return
+
+        candidates = cross_tile_nms(raw)
+        candidates = [
+            d for d in candidates
+            if (d.bbox_tile[2] - d.bbox_tile[0]) >= settings.DETECTION_MIN_BBOX_PX
+            and (d.bbox_tile[3] - d.bbox_tile[1]) >= settings.DETECTION_MIN_BBOX_PX
+        ]
+        if not candidates:
+            return
+
+        candidates = sam_refine_stage(candidates, params.shape_priors, actual_alt_m, None)
+        if not candidates:
+            return
+
+        confirmed = vlm_verify_stage(candidates, params, definition, analyst)
+        if not confirmed:
+            return
+
+        confirmed = geolocate_stage(confirmed)
+        if not confirmed:
+            return
+
+        # Accumulate into the session-wide confirmed list
+        _state.setdefault("stream_confirmed", []).extend(confirmed)
+        logger.info("BG detect: +%d confirmed | session total %d",
+                     len(confirmed), len(_state["stream_confirmed"]))
+
+        # Re-run tracker on full temporal history
+        all_tracks = track_stage(_state["stream_confirmed"], color=color)
+
+        # Update detection state (same logic as foreground path)
+        _state["detections"] = {}
+        for track in all_tracks:
+            best   = track.best
+            det_id = f"{track.label}_{track.track_id}"
+            _state["detections"][det_id] = {
+                "lat":           track.lat,    "lon":          track.lon,
+                "label":         track.label,  "color":        color,
+                "confirmed":     True,         "img_urls":     [],
+                "is_multiangle": len(track.detections) > 1,
+                "source_count":  len(track.detections),
+                "gsd":           "-",          "bbox":         best.bbox_tile,
+                "source":        _Path(best.parent_path).name,
+                "parent_path":   best.parent_path,
+                "tile_x":        best.tile_x,  "tile_y":       best.tile_y,
+                "tile_w":        best.tile_w,  "tile_h":       best.tile_h,
+                "vlm_report":    best.vlm_report,
+                "track_id":      track.track_id,
+                "trajectory":    [{"lat": d.lat, "lon": d.lon}
+                                   for d in track.detections],
+                "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
+                "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
+            }
+
+        # Rebuild map for background results
+        _save_tracks(all_tracks, color)
+        _build_map()
+        paths = _state.get("mission_paths")
+        if paths:
+            _save_detections(paths.detections)
+        _state["_stream_updates_pending"] = True
+        logger.info("BG map updated: %d track(s)", len(all_tracks))
+
+    except Exception as exc:
+        logger.error("BG detection error: %s", exc, exc_info=True)
+
+    # Mark background tiles as processed in the novelty tracker
+    _novelty_tracker.mark_processed(tiles)
+
+
 def _stream_on_frame_telem(jpeg_path, srt_frame):
     """
     True near-real-time per-frame callback (Path B — djmd telemetry present).
@@ -2690,11 +2827,12 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
     Called once per frame in strict temporal order.  Each call:
       1. CLIP-indexes the frame → LanceDB
       2. Registers timestamp → _state["frame_timestamps"]  (fixes tracking)
-      3. Runs detection on THIS frame's tiles only
-      4. Accumulates confirmed detections → _state["stream_confirmed"]
-      5. Re-runs track_stage on full accumulated history
-      6. Updates _state["detections"] with the current track picture
-      7. Throttled map + detections.json rebuild
+      3. Classifies tiles by novelty (foreground vs background)
+      4. Runs detection on foreground tiles only (Phase 2)
+      5. Queues background tiles for deferred detection
+      6. Accumulates confirmed detections → _state["stream_confirmed"]
+      7. Re-runs track_stage on full accumulated history
+      8. Throttled map + detections.json rebuild
     """
     import cv2 as _cv2
     import time as _time
@@ -2765,17 +2903,62 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
             sam_refine_stage, vlm_verify_stage,
             geolocate_stage, track_stage,
         )
-        _classified  = intent_clf.classify(m.definition)
+        # Phase 1: intent caching — classify once per stream session, not per frame
+        _cache = _state.get("_stream_intent_cache")
+        if _cache and _cache.get("definition") == m.definition:
+            _classified = _cache["classified"]
+        else:
+            _classified = intent_clf.classify(m.definition)
+            _state["_stream_intent_cache"] = {
+                "definition": m.definition,
+                "classified": _classified,
+            }
         params       = _classified.params
         actual_alt_m = _state.get("mean_alt_m", 100.0)
 
-        logger.info(
-            "Stream detect: %s | %d tiles | %s",
-            jpeg_path.name, len(frame_tiles), params.yolo_classes,
+        # Phase 2: tile novelty — split into foreground (novel) vs background (seen)
+        # Adaptive threshold: compute tile width from footprint, feed drone position
+        if frame_tiles:
+            t0 = frame_tiles[0]
+            nw_lat = t0.get("fp_nw_lat", 0.0)
+            nw_lon = t0.get("fp_nw_lon", 0.0)
+            ne_lat = t0.get("fp_ne_lat", 0.0)
+            ne_lon = t0.get("fp_ne_lon", 0.0)
+            if nw_lat and ne_lat:
+                from core.geo import haversine_m as _hav
+                tile_w_m = _hav(nw_lat, nw_lon, ne_lat, ne_lon)
+            else:
+                tile_w_m = 0.0
+            _novelty_tracker.update_threshold(
+                srt_frame.lat, srt_frame.lon, tile_width_m=tile_w_m,
+            )
+        track_positions = _get_active_track_positions()
+        foreground, background = _novelty_tracker.classify_tiles(
+            frame_tiles, track_positions=track_positions,
         )
 
+        logger.info(
+            "Stream detect: %s | %d fg + %d bg tiles | %s",
+            jpeg_path.name, len(foreground), len(background),
+            params.yolo_classes,
+        )
+
+        # Queue background tiles for deferred processing
+        if background:
+            _bg_worker.enqueue(
+                background,
+                lambda tiles, _p=params, _d=m.definition, _c=color, _a=actual_alt_m:
+                    _bg_detect_callback(tiles, _p, _d, _c, _a),
+            )
+
+        # Mark foreground tiles as processed so they become "seen" next frame
+        _novelty_tracker.mark_processed(foreground)
+
+        if not foreground:
+            return
+
         raw = run_detector_stage(
-            tiles         = frame_tiles,
+            tiles         = foreground,
             classes       = params.yolo_classes,
             confidence    = params.yolo_confidence,
             api_key       = getattr(settings, "REPLICATE_API_KEY", ""),

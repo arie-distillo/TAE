@@ -838,7 +838,10 @@ def run_detection_pipeline(
         return []
 
     # CLIP pre-filter (easy/medium only)
-    if params.expected_difficulty != "hard" and len(all_tiles) > 20:
+    # Threshold lowered from 20→4 so this fires during per-frame streaming
+    # (typically 8 tiles/frame).  For small sets keep 50-60 % (conservative);
+    # for large batch sets keep 30 %.
+    if params.expected_difficulty != "hard" and len(all_tiles) >= 4:
         try:
             from core.services import get_search_lib
             lib   = get_search_lib()
@@ -848,7 +851,10 @@ def run_detection_pipeline(
             vecs   = np.array([t["vector"] for t in all_tiles], dtype=np.float32)
             norms  = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9
             scores = (vecs / norms) @ q_vec
-            top_n  = max(20, int(len(all_tiles) * 0.30))
+            if len(all_tiles) <= 20:
+                top_n = max(2, int(len(all_tiles) * 0.60))   # streaming: keep 60 %
+            else:
+                top_n = max(20, int(len(all_tiles) * 0.30))   # batch: keep 30 %
             idx    = np.argsort(scores)[::-1][:top_n]
             tiles  = [all_tiles[i] for i in idx]
             logger.info("CLIP pre-filter (%s): %d → %d tiles",

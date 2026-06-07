@@ -507,6 +507,91 @@ def _pf_varint(f: dict, n: int) -> int | None:
     return None
 
 
+# ── Proto variant detection + altitude recovery ──────────────────────────────
+
+def _extract_proto_variant(handler: str) -> str:
+    """Extract DJI protobuf variant (e.g. 'wm265e') from handler_name."""
+    m = re.search(r'dvtm_(\w+)', handler, re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
+# Variants known to share the wm265e field layout
+_WM265E_COMPAT = {"wm265e", "wm265", "wm265m", "wm267"}
+
+# Valid drone altitude range (metres)
+_ALT_MIN, _ALT_MAX = 1.0, 10_000.0
+
+
+def _try_rescale_altitude(raw_val: float | None) -> float | None:
+    """
+    If *raw_val* is outside the sane altitude range, try interpreting it
+    as millimetres or centimetres (some proto variants store altitude in
+    sub-metre units as float32).  Returns metres or None.
+    """
+    if raw_val is None:
+        return None
+    if _ALT_MIN < raw_val < _ALT_MAX:
+        return raw_val                          # already in metres
+    for divisor in (1000.0, 100.0, 10.0):       # mm, cm, dm → m
+        scaled = raw_val / divisor
+        if _ALT_MIN < scaled < _ALT_MAX:
+            return scaled
+    return None
+
+
+def _probe_altitude(raw: bytes) -> tuple[float | None, str]:
+    """
+    Search a djmd packet for a value that looks like drone altitude.
+
+    Strategy (executed in order, first valid value wins):
+      1. Float fields at wm265e positions, with unit rescaling
+      2. Varint fields at wm265e positions (÷1000 for mm, ÷100 for cm)
+      3. Float/varint scan across nearby sub-messages under [3][N]
+
+    Returns (altitude_m, description) or (None, "").
+    """
+    root = _proto_parse(raw)
+    b3 = _pf_bytes(root, 3)
+    if not b3:
+        return None, ""
+    f3 = _proto_parse(b3)
+
+    # ── Strategy 1+2: try known wm265e positions with rescaling ──────────
+
+    # The attitude/GPS wrapper field number may differ across variants:
+    # wm265e uses [3][3], others may use [3][2] or [3][4].
+    for wrapper_n in (3, 2, 4):
+        bw = _pf_bytes(f3, wrapper_n)
+        if not bw:
+            continue
+        fw = _proto_parse(bw)
+
+        # Try rel_alt positions: [3][N][5][1], [3][N][6][1]
+        for sub_n in (5, 6, 4):
+            bs = _pf_bytes(fw, sub_n)
+            if not bs:
+                continue
+            fs = _proto_parse(bs)
+            for field_n in (1, 2, 3):
+                # Float (wire_type 1 or 5)
+                v = _try_rescale_altitude(_pf_float(fs, field_n))
+                if v is not None:
+                    return v, f"float at [3][{wrapper_n}][{sub_n}][{field_n}]"
+                # Varint (wire_type 0), try mm/cm/dm
+                vi = _pf_varint(fs, field_n)
+                if vi is not None and vi > 0:
+                    v = _try_rescale_altitude(float(vi))
+                    if v is not None:
+                        return v, f"varint at [3][{wrapper_n}][{sub_n}][{field_n}]"
+
+        # Try direct float in wrapper: [3][N][2], [3][N][5], etc.
+        for field_n in range(1, 10):
+            v = _try_rescale_altitude(_pf_float(fw, field_n))
+            if v is not None:
+                return v, f"float at [3][{wrapper_n}][{field_n}]"
+
+    return None, ""
+
+
 def _parse_wm265e_packet(raw: bytes) -> dict:
     """
     Parse one dvtm_wm265e protobuf packet (Mavic 3 / M3E djmd stream).
@@ -594,7 +679,7 @@ def _parse_wm265e_packet(raw: bytes) -> dict:
 
 class DJIProtobufParser:
     """
-    Per-frame DJI djmd telemetry extractor for Mavic 3 / M3E videos.
+    Per-frame DJI djmd telemetry extractor.
 
     Extracts the raw djmd binary stream via ffmpeg, then decodes each
     protobuf packet using the schema published in ExifTool's DJI tag
@@ -605,17 +690,18 @@ class DJIProtobufParser:
     Requires ffprobe + ffmpeg (already present in TAE's environment).
     No exiftool dependency.
 
-    Protocol supported: dvtm_wm265e.proto (Mavic 3 / M3E).
-    The Category tag in the video identifies the protocol;
-    other protocols share the same sub-message layout but differ in top-level
-    field paths — extend _parse_wm265e_packet() or add a protocol-dispatch
-    table if other DJI models need to be supported.
+    Protocol detection:
+      The handler_name tag identifies the proto variant (e.g. dvtm_wm265e).
+      For wm265e-compatible variants the parser uses known field paths.
+      For unknown variants, GPS is parsed from the shared sub-message
+      layout; altitude is recovered via unit-rescaling (mm/cm → m) and
+      positional probing across the proto tree.
     """
 
     # ── Stream discovery ──────────────────────────────────────────────────────
 
-    def _find_djmd_stream(self, video_path: Path) -> int | None:
-        """Return the MP4 stream index of the djmd track, or None."""
+    def _find_djmd_stream(self, video_path: Path) -> tuple[int | None, str]:
+        """Return (stream_index, proto_variant) of the djmd track, or (None, '')."""
         cmd = ["ffprobe", "-v", "error", "-show_streams",
                "-of", "json", str(video_path)]
         try:
@@ -623,14 +709,19 @@ class DJIProtobufParser:
             info = json.loads(res.stdout)
         except Exception as exc:
             logger.warning("DJIProtobufParser: ffprobe streams failed: %s", exc)
-            return None
+            return None, ""
 
         for s in info.get("streams", []):
             tag     = s.get("codec_tag_string", "").lower()
             handler = s.get("tags", {}).get("handler_name", "").lower()
             if tag == "djmd" or "dji meta" in handler:
-                return s["index"]
-        return None
+                variant = _extract_proto_variant(handler)
+                logger.info(
+                    "DJIProtobufParser: djmd stream %d | handler='%s' | variant=%s",
+                    s["index"], handler, variant or "(unknown)",
+                )
+                return s["index"], variant
+        return None, ""
 
     # ── Packet extraction ─────────────────────────────────────────────────────
 
@@ -685,12 +776,14 @@ class DJIProtobufParser:
         frame (≈ FPS × duration frames total).
         Returns [] if the video has no djmd stream or extraction fails.
         """
-        stream_idx = self._find_djmd_stream(video_path)
+        stream_idx, variant = self._find_djmd_stream(video_path)
         if stream_idx is None:
             logger.info(
                 "DJIProtobufParser: no djmd stream in '%s'", video_path.name
             )
             return []
+
+        is_wm265e = variant in _WM265E_COMPAT
 
         pkt_meta = self._get_packet_meta(video_path, stream_idx)
         if not pkt_meta:
@@ -719,6 +812,9 @@ class DJIProtobufParser:
         frames: list[SRTFrame] = []
         offset = 0
         n_gps_ok = 0
+        _DEFAULT_ALT_M = 80.0          # last-resort fallback
+        _alt_probe_result: float | None = None   # cached probe result
+        _alt_probe_done = False
 
         for frame_idx, (pts_s, size) in enumerate(pkt_meta):
             chunk = raw_stream[offset:offset + size]
@@ -740,13 +836,49 @@ class DJIProtobufParser:
             if lat is None or lon is None:
                 continue    # packet has no GPS fix
 
+            # ── Altitude recovery ────────────────────────────────────────
+            raw_alt = p["rel_alt"] or p["abs_alt"] or 0.0
+
+            if is_wm265e:
+                # Trusted layout — just clamp obviously bad values
+                if raw_alt <= 0:
+                    raw_alt = _DEFAULT_ALT_M
+            else:
+                # Unknown variant — try rescaling, then probe, then default
+                rescued = _try_rescale_altitude(raw_alt)
+                if rescued is not None:
+                    raw_alt = rescued
+                elif not _alt_probe_done:
+                    # Probe once on this packet to find altitude elsewhere
+                    probed, desc = _probe_altitude(chunk)
+                    _alt_probe_done = True
+                    if probed is not None:
+                        _alt_probe_result = probed
+                        logger.info(
+                            "DJIProtobufParser: altitude probed → %.1fm "
+                            "from %s (variant=%s)",
+                            probed, desc, variant or "unknown",
+                        )
+                        raw_alt = probed
+                    else:
+                        logger.warning(
+                            "DJIProtobufParser: altitude probe failed "
+                            "(variant=%s) — using %.0fm default",
+                            variant or "unknown", _DEFAULT_ALT_M,
+                        )
+                        raw_alt = _DEFAULT_ALT_M
+                elif _alt_probe_result is not None:
+                    raw_alt = _alt_probe_result     # reuse cached probe
+                else:
+                    raw_alt = _DEFAULT_ALT_M
+
             n_gps_ok += 1
             frames.append(SRTFrame(
                 frame_idx    = frame_idx,
                 timestamp_ms = int(pts_s * 1000),
                 lat          = lat,
                 lon          = lon,
-                alt_m        = p["rel_alt"] or p["abs_alt"] or 0.0,
+                alt_m        = raw_alt,
                 gimbal_pitch = p["gimbal_pitch"] if p["gimbal_pitch"] is not None else -90.0,
                 gimbal_yaw   = p["gimbal_yaw"]   if p["gimbal_yaw"]   is not None else 0.0,
                 gimbal_roll  = p["gimbal_roll"]  if p["gimbal_roll"]  is not None else 0.0,

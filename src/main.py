@@ -1932,7 +1932,6 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                             "is_multiangle": len(_track.detections) > 1,
                             "source_count": len(_track.detections),
                             "bbox": _best.bbox_tile,
-                            "frame_path":       _best.parent_path,
                             "source": Path(_best.parent_path).name,
                             "parent_path": _crop_path or _best.parent_path,
                             "tile_x": _best.tile_x, "tile_y": _best.tile_y,
@@ -2344,7 +2343,6 @@ def _handle_anomaly_query(message, params, color, user_bubble, mission):
                 "img_urls":        [],
                 "gsd":             "—",
                 "bbox":            seg.bbox,
-                "frame_path":      seg.frame_path,
                 "source":          Path(seg.frame_path).name,
                 "parent_path":     seg.frame_path,
                 "tile_x":          seg.bbox[0] if seg.bbox else 0,
@@ -2490,7 +2488,6 @@ async def query(message: str):  # noqa — signature only for illustration
             "gsd":             "-",
             "bbox":            best.bbox_tile,
             # Task 4: frame provenance — permanent path to the parent frame
-            "frame_path":      best.parent_path,
             "source":          Path(best.parent_path).name,
             # Task 4: parent_path now points to the saved crop in detections/
             # (not uploads/live_frames which is erased at run end)
@@ -2849,7 +2846,6 @@ def _bg_detect_callback(
                 "is_multiangle":   len(track.detections) > 1,
                 "source_count":    len(track.detections),
                 "gsd":             "-",          "bbox":           best.bbox_tile,
-                "frame_path":      best.parent_path,
                 "source":          _Path(best.parent_path).name,
                 "parent_path":     _crop_path_bg or best.parent_path,
                 "tile_x":          best.tile_x,  "tile_y":         best.tile_y,
@@ -3109,7 +3105,6 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
             "is_multiangle":   len(track.detections) > 1,
             "source_count":    len(track.detections),
             "gsd":             "-",          "bbox":           best.bbox_tile,
-            "frame_path":      best.parent_path,
             "source":          _Path(best.parent_path).name,
             "parent_path":     _crop_path or best.parent_path,
             "tile_x":          best.tile_x,  "tile_y":         best.tile_y,

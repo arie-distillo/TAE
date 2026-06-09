@@ -444,15 +444,37 @@ def _save_tracks(tracks: list, color: str) -> None:
             key=lambda d: frame_ts.get(Path(d.parent_path).name, 0),
         )
  
-        trajectory = [
-            {
-                "lat":    d.lat,
-                "lon":    d.lon,
-                "source": Path(d.parent_path).name,
-                "ts_ms":  frame_ts.get(Path(d.parent_path).name, 0),
-            }
-            for d in dets_sorted
-        ]
+        trajectory = []
+        for d in dets_sorted:
+            frame_name = Path(d.parent_path).name          # e.g. "seg_00001_s00000.jpg"
+            frame_stem = Path(d.parent_path).stem          # e.g. "seg_00001_s00000"
+            ts_ms      = frame_ts.get(frame_name, 0)
+
+            # Retrieve the on-disk crop path stashed by _annotate_and_save
+            from core.app_state import _tile_img_cache as _tc
+            crop_path = None
+            for _k, _v in _tc.items():
+                if _k.startswith("path_") and isinstance(_v, str):
+                    if frame_stem in _v:
+                        crop_path = _v
+                        break
+
+            trajectory.append({
+                "lat":              d.lat,
+                "lon":              d.lon,
+                "ts_ms":            ts_ms,
+                "frame":            frame_stem,
+                "bbox":             d.bbox_tile,
+                "tile_x":           d.tile_x,
+                "tile_y":           d.tile_y,
+                "tile_w":           d.tile_w,
+                "tile_h":           d.tile_h,
+                "gdino_confidence": round(d.confidence, 4),
+                "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
+                "vlm_reason":       getattr(d, "vlm_reason", ""),
+                "vlm_report":       getattr(d, "vlm_report", {}),
+                "crop_path":        crop_path or "",
+            })
  
         new_entries[track.track_id] = {
             "id":         track.track_id,

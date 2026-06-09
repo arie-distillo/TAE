@@ -206,19 +206,17 @@ def _build_full_frame_verify_prompt(
         f"For EACH candidate decide: confirmed or rejected.\n"
         f"Return ONLY valid JSON — a list in candidate index order:\n"
         f"[\n"
-        f"  // confirmed: all fields\n"
+        f"  // CONFIRMED — include reason (what makes you sure) + report\n"
         f"  {{\"index\": 0, \"confirmed\": true, \"confidence\": 0.9,\n"
         f"   \"detected_label\": \"accurate class name\",\n"
-        f"   \"reason\": \"brief reason\",\n"
+        f"   \"reason\": \"brief explanation of why this is confirmed\",\n"
         f"   \"report\": {{{field_schema}}}}},\n"
-        f"  // rejected: minimal fields only (saves tokens)\n"
+        f"  // REJECTED — omit reason and report entirely (saves tokens)\n"
         f"  {{\"index\": 1, \"confirmed\": false, \"confidence\": 0.1}},\n"
-        f"  ...\n"
         f"]\n"
         f"Rules:\n"
-        f"- confirmed is a boolean (true/false), NOT a string.\n"
-        f"- confidence is 0.0–1.0 float.\n"
-        f"- For rejected entries, omit reason and report entirely.\n"
+        f"- For CONFIRMED entries: reason is mandatory — describe what you see.\n"
+        f"- For REJECTED entries: omit reason and report to save tokens.\n"
         f"- No markdown, no text outside the JSON array."
     )
 
@@ -499,6 +497,7 @@ class TacticalAnalyst:
 
         try:
             clean   = re.sub(r"^```json\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+            clean   = re.sub(r"^\s*>+\s*", "", clean)   # strip leading > emitted by some providers
             results = json.loads(clean)
             out = [{"confirmed": False, "confidence": 0.0, "report": {}}] * len(detections)
             for r in results:

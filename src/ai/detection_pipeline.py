@@ -545,13 +545,13 @@ def _vlm_verify_full_frame(candidates, params, original_query, analyst):
                 det.confirmed      = True
                 det.vlm_report     = result.get("report", {})
                 det.vlm_confidence = float(result.get("confidence", 1.0))
-                det.vlm_reason     = ""
+                det.vlm_reason     = result.get("reason", "")   # reason explains WHY confirmed
                 vlm_label = result.get("detected_label", "").strip()
                 if vlm_label:
                     det.label = vlm_label
                 confirmed.append(det)
-                logger.info("VLM (full-frame) confirmed %s in %s",
-                            det.label, Path(parent_path).name)
+                logger.info("VLM (full-frame) confirmed %s in %s: %s",
+                            det.label, Path(parent_path).name, det.vlm_reason)
             else:
                 reason = result.get("reason", "")
                 det.vlm_confidence = float(result.get("confidence", 0.0))
@@ -625,13 +625,13 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
                 det.confirmed      = True
                 det.vlm_report     = result.get("report", {})
                 det.vlm_confidence = float(result.get("confidence", 1.0))
-                det.vlm_reason     = ""
+                det.vlm_reason     = result.get("reason", "")   # reason explains WHY confirmed
                 vlm_label = result.get("detected_label", "").strip()
                 if vlm_label:
                     det.label = vlm_label
                 confirmed.append(det)
-                logger.info("VLM confirmed %s in %s tile(%d,%d)",
-                            det.label, Path(parent).name, tx, ty)
+                logger.info("VLM confirmed %s in %s tile(%d,%d): %s",
+                            det.label, Path(parent).name, tx, ty, det.vlm_reason)
             else:
                 reason = result.get("reason", "")
                 det.vlm_confidence = float(result.get("confidence", 0.0))
@@ -736,23 +736,20 @@ class _TrackState:
         )
  
     # ── Adaptive association gate ──────────────────────────────────────────────
+    _MAX_GATE_M = 50.0  # no ground object teleports >50m between any two frames
+                        # covers GPS error (~1.5m) + footprint projection error (~20m)
+                        # while rejecting 203m false associations
+
     def gate_m(self, dt_s: float) -> float:
-        """
-        Returns the maximum acceptable distance (metres) between the predicted
-        position and a candidate detection.
- 
-        Cold-start (< 2 hits): use MAX_COLD_SPEED to cover the first interval
-            regardless of direction, since velocity is unknown.
-        Warm (≥ 2 hits): scale the gate with the estimated speed + 50% margin.
-        """
         if len(self.dets) < 2:
-            return _STATIC_GATE_M + _MAX_COLD_SPEED * abs(dt_s)
+            return min(_STATIC_GATE_M + _MAX_COLD_SPEED * abs(dt_s), _MAX_GATE_M)
         speed = math.hypot(
             self.vel_lat * _M_PER_DEG_LAT,
             self.vel_lon * _m_per_deg_lon(self.last_lat),
-        )  # m/s
-        return _STATIC_GATE_M + speed * abs(dt_s) * 1.5
- 
+        )
+        return min(_STATIC_GATE_M + speed * abs(dt_s) * 1.5, _MAX_GATE_M)
+
+
     # ── Update after a successful association ──────────────────────────────────
     def update(self, det, ts_ms: float) -> None:
         dt = (ts_ms - self.last_ts) / 1000.0

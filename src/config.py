@@ -53,11 +53,20 @@ class Settings(BaseSettings):
         extra="ignore",   # silently ignore any .env keys not declared below
     )
 
-    # ── AI — VLM ─────────────────────────────────────────────────────────────
+    # ── AI - provider ─────────────────────────────────────────────────────────────
     AI_PROVIDER:        str        = "openrouter"
-    OPENROUTER_API_KEY: str | None = None
-    VLM_MODEL:          str        = "qwen/qwen2.5-vl-72b-instruct"
     INTENT_MODEL:       str | None = "anthropic/claude-haiku-4-5"
+    OPENROUTER_API_KEY: str | None = None
+
+
+    # ── AI - VLM ─────────────────────────────────────────────────────────────
+    VLM_MODEL:          str        = "qwen/qwen2.5-vl-72b-instruct"
+    # When True, send the full parent frame to VLM for candidate validation instead
+    # of one tile at a time.  The frame image carries all candidates from all tiles
+    # of that frame in a single call, annotated with numbered bboxes.
+    # Response schema is compact: confirmed → {index, confirmed, confidence, reason}
+    #                             rejected  → {index, confirmed, confidence}
+    VLM_FULL_FRAME_MODE: bool = True
 
     # ── AI — CLIP ────────────────────────────────────────────────────────────
     CLIP_MODEL: str = "ViT-B/32"
@@ -70,7 +79,9 @@ class Settings(BaseSettings):
         "medium": 0.13,   # medium objects with moderate camouflage (cows in grass)
         "hard":   0.03,   # small or highly camouflaged (people, stones, prone animals)
     }
-
+    # Maximum G-DINO candidates forwarded to VLM per tile (sorted by confidence desc).
+    # Prevents VLM token overflow on dense tiles; 8 matches verify_detections_batch capacity.
+    MAX_CANDIDATES_PER_TILE: int = 8
 
     # ── AI — Anomaly detection ────────────────────────────────────────────────
     ANOMALY_SCORE_MARGIN: float = 0.05

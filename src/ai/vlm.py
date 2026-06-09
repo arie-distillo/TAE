@@ -176,6 +176,52 @@ def _build_batch_verify_prompt(
         f"No markdown, no text outside the JSON array."
     )
 
+def _build_full_frame_verify_prompt(
+    label_hints:    list[str],
+    bboxes:         list[list],   # frame-absolute pixel coords
+    criteria:       str,
+    report_fields:  list[str],
+    original_query: str,
+    frame_w: int, frame_h: int,
+) -> str:
+    """
+    Task 3 — Compact full-frame prompt.
+
+    Confirmed objects get: {index, confirmed, confidence, reason, detected_label, report}
+    Rejected objects get:  {index, confirmed, confidence}
+    This asymmetry saves output tokens — most objects are rejected.
+    """
+    candidates_desc = "\n".join(
+        f"  {i}: label='{label_hints[i]}' bbox={bboxes[i]}"
+        for i in range(len(bboxes))
+    )
+    field_schema = ", ".join(f'"{f}"' for f in report_fields)
+    return (
+        f"You are analyzing a full UAV nadir (top-down) aerial frame.\n"
+        f"Frame size: {frame_w}×{frame_h} pixels. 0,0 is top-left.\n"
+        f"Original query: \"{original_query}\"\n\n"
+        f"VERIFICATION CRITERIA\n{criteria}\n\n"
+        f"The following {len(bboxes)} candidate detection(s) are marked on the frame:\n"
+        f"{candidates_desc}\n\n"
+        f"For EACH candidate decide: confirmed or rejected.\n"
+        f"Return ONLY valid JSON — a list in candidate index order:\n"
+        f"[\n"
+        f"  // confirmed: all fields\n"
+        f"  {{\"index\": 0, \"confirmed\": true, \"confidence\": 0.9,\n"
+        f"   \"detected_label\": \"accurate class name\",\n"
+        f"   \"reason\": \"brief reason\",\n"
+        f"   \"report\": {{{field_schema}}}}},\n"
+        f"  // rejected: minimal fields only (saves tokens)\n"
+        f"  {{\"index\": 1, \"confirmed\": false, \"confidence\": 0.1}},\n"
+        f"  ...\n"
+        f"]\n"
+        f"Rules:\n"
+        f"- confirmed is a boolean (true/false), NOT a string.\n"
+        f"- confidence is 0.0–1.0 float.\n"
+        f"- For rejected entries, omit reason and report entirely.\n"
+        f"- No markdown, no text outside the JSON array."
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TacticalAnalyst
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,6 +446,81 @@ class TacticalAnalyst:
         except (json.JSONDecodeError, ValueError) as exc:
             logger.warning("Batch VLM parse error: %s\nRaw: %s", exc, raw[:300])
             return [{"confirmed": False, "reason": f"parse error: {exc}", "report": {}}
+                    for _ in detections]
+
+    def verify_detections_full_frame(
+        self,
+        frame_img:      np.ndarray,      # full frame BGR array (already annotated)
+        detections:     list[dict],      # [{"label": str, "bbox": [x1,y1,x2,y2]}, ...]
+        criteria:       str,
+        report_fields:  list[str],
+        original_query: str,
+        colour_hint:    str | None = None,
+        size_qualifier: str | None = None,
+        frame_w:        int = 0,
+        frame_h:        int = 0,
+    ) -> list[dict]:
+        """
+        Task 3 — Validate ALL detections in a single full-frame VLM call.
+
+        Sends the annotated full frame (with numbered bbox overlays) to the VLM.
+        Returns a list parallel to `detections` with compact confirmed/rejected dicts:
+          confirmed → {"confirmed": True,  "confidence": float, "reason": str,
+                       "detected_label": str, "report": dict}
+          rejected  → {"confirmed": False, "confidence": float}
+        """
+        if not detections or frame_img is None:
+            return [{"confirmed": False, "confidence": 0.0, "report": {}}
+                    for _ in detections]
+
+        h, w = frame_img.shape[:2]
+        fw = frame_w or w
+        fh = frame_h or h
+
+        prompt = _build_full_frame_verify_prompt(
+            label_hints    = [d["label"] for d in detections],
+            bboxes         = [d["bbox"]  for d in detections],
+            criteria       = criteria,
+            report_fields  = report_fields,
+            original_query = original_query,
+            frame_w        = fw,
+            frame_h        = fh,
+        )
+
+        try:
+            if self.provider == "openrouter":
+                raw = self._analyze_openrouter(frame_img, "full_frame.jpg", prompt)
+            else:
+                raw = self._analyze_ollama(frame_img, "full_frame.jpg", prompt)
+        except Exception as exc:
+            logger.warning("Full-frame VLM failed: %s", exc)
+            return [{"confirmed": False, "confidence": 0.0, "report": {}}
+                    for _ in detections]
+
+        try:
+            clean   = re.sub(r"^```json\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+            results = json.loads(clean)
+            out = [{"confirmed": False, "confidence": 0.0, "report": {}}] * len(detections)
+            for r in results:
+                idx = int(r.get("index", -1))
+                if 0 <= idx < len(detections):
+                    if r.get("confirmed"):
+                        out[idx] = {
+                            "confirmed":      True,
+                            "confidence":     float(r.get("confidence", 1.0)),
+                            "detected_label": r.get("detected_label", "").strip(),
+                            "reason":         r.get("reason", ""),
+                            "report":         r.get("report", {}),
+                        }
+                    else:
+                        out[idx] = {
+                            "confirmed":  False,
+                            "confidence": float(r.get("confidence", 0.0)),
+                        }
+            return out
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Full-frame VLM parse error: %s\nRaw: %s", exc, raw[:300])
+            return [{"confirmed": False, "confidence": 0.0, "report": {}}
                     for _ in detections]
 
     # ──────────────────────────────────────────────────────────────────────────

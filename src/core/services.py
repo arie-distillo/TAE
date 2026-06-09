@@ -342,12 +342,18 @@ def _annotate_and_save(
     try:
         paths = _state.get("mission_paths")
         if paths:
-            det_dir = Path(paths.uploads).parent / "detections"
+            det_dir = Path(paths.detections)
             det_dir.mkdir(exist_ok=True)
             safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label[:20])
-            (det_dir / f"{safe_label}_{key[:8]}.jpg").write_bytes(img_bytes)
+            detection_img_path = det_dir / f"{safe_label}_{key[:8]}.jpg"
+            detection_img_path.write_bytes(img_bytes)
+
+            # Stash path for later use when building the detection dict
+            _tile_img_cache[f"path_{key}"] = str(detection_img_path)
     except Exception:
         pass
+
+    
 
     return f"/tile_img/{key}"
 
@@ -427,7 +433,7 @@ def _save_tracks(tracks: list, color: str) -> None:
  
     frame_ts: dict = _state.get("frame_timestamps", {})
  
-    new_entries: list[dict] = []
+    new_entries: dict[str, dict] = {}
     for track in tracks:
         if len(track.detections) < 2:
             continue
@@ -448,13 +454,13 @@ def _save_tracks(tracks: list, color: str) -> None:
             for d in dets_sorted
         ]
  
-        new_entries.append({
+        new_entries[track.track_id] = {
             "id":         track.track_id,
             "label":      track.label,
             "color":      color,
             "trajectory": trajectory,
             "speed_ms":   round(getattr(track, "_speed_ms", 0.0), 2),
-        })
+        }
  
     if not new_entries:
         return
@@ -467,18 +473,25 @@ def _save_tracks(tracks: list, color: str) -> None:
         except Exception:
             existing = []
  
-    existing_ids = {t["id"] for t in existing}
-    added = 0
-    for entry in new_entries:
-        if entry["id"] not in existing_ids:
-            existing.append(entry)
+    # replaces existing entries, appends new ones
+    existing_by_id = {t["id"]: t for t in existing}
+    added, updated = 0, 0
+    for tid, entry in new_entries.items():
+        if tid in existing_by_id:
+            existing_by_id[tid] = entry
+            updated += 1
+        else:
+            existing_by_id[tid] = entry
             added += 1
- 
-    tracks_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    logger.info(
-        "_save_tracks: %d new multi-frame track(s) → %s",
-        added, tracks_file,
+
+    tracks_file.write_text(
+        json.dumps(list(existing_by_id.values()), indent=2), encoding="utf-8"
     )
+    logger.info(
+        "_save_tracks: %d new, %d updated multi-frame track(s) → %s",
+        added, updated, tracks_file,
+    )
+
 
 def _load_detections(detections_path) -> dict:
     """Load detections from detections.json. Returns {} if absent."""

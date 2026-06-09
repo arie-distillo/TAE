@@ -65,6 +65,7 @@
 - [] code duplication in `_bg_detect_callback` `_stream_on_frame_telem` and `run_detection_pipeline`
 - [] replace all `yolo_` with `detector_`
 - [] migrate the map renderer to read from detections.json (as you suggested) so we can reitire tracks.json
+- [] two different usages of term   `segment` - (1) image segmentation with SAM2, and (2) video segmentations. Confusing
 
 
 ### Geospatial

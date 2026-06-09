@@ -85,6 +85,8 @@ class Detection:
     fp_se_lon:   float  = 0.0
     fp_sw_lat:   float  = 0.0
     fp_sw_lon:   float  = 0.0
+    vlm_confidence: float = 0.0   # VLM-assigned confidence for confirmed/rejected
+    vlm_reason:  str    = ""      # VLM rejection reason (empty when confirmed)
 
 
 @dataclass
@@ -140,7 +142,7 @@ def _m_per_deg_lon(lat: float) -> float:
     return 111_320.0 * math.cos(math.radians(lat))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 — Detector
+# Detector
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_detector_output(output, tile):
@@ -349,7 +351,7 @@ def cross_tile_nms(raw, iou_threshold=0.50):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 3 — SAM refinement + shape filter
+# SAM refinement + shape filter
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_ratio(mask, bbox):
@@ -463,20 +465,133 @@ def sam_refine_stage(candidates, priors, actual_alt_m, sam_segmentor):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 4 — VLM verification
+# VLM verification
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _vlm_verify_full_frame(candidates, params, original_query, analyst):
+    """
+    Full-frame VLM verification.
+
+    Groups all candidates by parent frame, then sends the full frame image to
+    the VLM once per frame (not once per tile).  All candidate bboxes are drawn
+    with frame-absolute coordinates so the VLM sees spatial context across tiles.
+
+    The compact response schema saves output tokens:
+      confirmed → {"index": N, "confirmed": true,  "confidence": 0.9, "reason": "..."}
+      rejected  → {"index": N, "confirmed": false, "confidence": 0.1}
+    """
+    from collections import defaultdict
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Group by parent frame
+    frame_groups: dict[str, list[Detection]] = defaultdict(list)
+    for det in candidates:
+        frame_groups[det.parent_path].append(det)
+
+    logger.info("VLM batch (full-frame mode): %d candidates across %d frame(s)",
+                len(candidates), len(frame_groups))
+
+    def _verify_frame(parent_path: str, frame_dets: list[Detection]):
+        frame_img = cv2.imread(parent_path)
+        if frame_img is None:
+            logger.warning("Full-frame VLM: cannot read %s", parent_path)
+            return []
+
+        fh, fw = frame_img.shape[:2]
+
+        # Annotate the full frame with numbered bboxes (frame-absolute coords)
+        annotated = frame_img.copy()
+        for i, det in enumerate(frame_dets):
+            x1 = det.tile_x + det.bbox_tile[0]
+            y1 = det.tile_y + det.bbox_tile[1]
+            x2 = det.tile_x + det.bbox_tile[2]
+            y2 = det.tile_y + det.bbox_tile[3]
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (74, 222, 128), 2)
+            cv2.putText(annotated, str(i), (x1, max(y1 - 4, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (74, 222, 128), 2)
+
+        # Build candidate descriptor list with frame-absolute bboxes
+        frame_dets_input = [
+            {
+                "label": d.label,
+                "bbox": [
+                    d.tile_x + d.bbox_tile[0], d.tile_y + d.bbox_tile[1],
+                    d.tile_x + d.bbox_tile[2], d.tile_y + d.bbox_tile[3],
+                ],
+            }
+            for d in frame_dets
+        ]
+
+        # ── THIS is where verify_detections_full_frame() is called ────────────
+        # analyst is the TacticalAnalyst instance passed down from run_detection_pipeline.
+        # _verify_frame calls analyst.verify_detections_full_frame() — the VLM
+        # service method in ai/vlm.py — passing the annotated full-frame image and
+        # the frame-absolute bbox list. One HTTP call per frame.
+        results = analyst.verify_detections_full_frame(
+            frame_img      = annotated,
+            detections     = frame_dets_input,
+            criteria       = params.vlm_verification_criteria,
+            report_fields  = params.vlm_reporting_fields,
+            original_query = original_query,
+            colour_hint    = getattr(params, "colour_hint", None),
+            size_qualifier = getattr(params, "size_qualifier", None),
+            frame_w        = fw,
+            frame_h        = fh,
+        )
+
+        confirmed = []
+        for det, result in zip(frame_dets, results):
+            if result.get("confirmed"):
+                det.confirmed      = True
+                det.vlm_report     = result.get("report", {})
+                det.vlm_confidence = float(result.get("confidence", 1.0))
+                det.vlm_reason     = ""
+                vlm_label = result.get("detected_label", "").strip()
+                if vlm_label:
+                    det.label = vlm_label
+                confirmed.append(det)
+                logger.info("VLM (full-frame) confirmed %s in %s",
+                            det.label, Path(parent_path).name)
+            else:
+                reason = result.get("reason", "")
+                det.vlm_confidence = float(result.get("confidence", 0.0))
+                det.vlm_reason     = reason
+                logger.info("VLM (full-frame) rejected %s in %s: %s",
+                            det.label, Path(parent_path).name, reason)
+        return confirmed
+
+    confirmed = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(_verify_frame, parent, dets): parent
+            for parent, dets in frame_groups.items()
+        }
+        for future in as_completed(futures):
+            confirmed.extend(future.result())
+
+    logger.info("VLM (full-frame): %d candidates → %d confirmed",
+                len(candidates), len(confirmed))
+    return confirmed
 
 def vlm_verify_stage(candidates, params, original_query, analyst):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from collections import defaultdict
 
+    # ── Mode switch ───────────────────────────────────────────────────────────
+    # When VLM_FULL_FRAME_MODE=True, hand off to the full-frame path immediately.
+    # _vlm_verify_full_frame has the same signature and returns the same type,
+    # so the caller (run_detection_pipeline) sees no difference.
+    if getattr(settings, "VLM_FULL_FRAME_MODE", False):
+        return _vlm_verify_full_frame(candidates, params, original_query, analyst)
+
+    # ── Tile-by-tile mode (default) ───────────────────────────────────────────
     # Group candidates by (parent_path, tile_x, tile_y) — same tile
     tile_groups: dict[tuple, list[Detection]] = defaultdict(list)
     for det in candidates:
         key = (det.parent_path, det.tile_x, det.tile_y)
         tile_groups[key].append(det)
 
-    logger.info("VLM batch: %d candidates across %d tiles",
+    logger.info("VLM batch (tile mode): %d candidates across %d tiles",
                 len(candidates), len(tile_groups))
 
     def _verify_tile(tile_key, tile_dets):
@@ -507,9 +622,10 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
         confirmed = []
         for det, result in zip(tile_dets, results):
             if result.get("confirmed"):
-                det.confirmed = True
-                det.vlm_report = result.get("report", {})
-                # Prefer VLM's own label over GDINO's; fall back to GDINO label
+                det.confirmed      = True
+                det.vlm_report     = result.get("report", {})
+                det.vlm_confidence = float(result.get("confidence", 1.0))
+                det.vlm_reason     = ""
                 vlm_label = result.get("detected_label", "").strip()
                 if vlm_label:
                     det.label = vlm_label
@@ -518,6 +634,8 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
                             det.label, Path(parent).name, tx, ty)
             else:
                 reason = result.get("reason", "")
+                det.vlm_confidence = float(result.get("confidence", 0.0))
+                det.vlm_reason     = reason
                 logger.info("VLM rejected %s in %s tile(%d,%d): %s",
                             det.label, Path(parent).name, tx, ty, reason)
                 # Save rejected crop for debugging
@@ -546,7 +664,7 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
     return confirmed
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 5 — Geo-location
+# Geo-location
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bilinear(nw, ne, sw, se, u, v):
@@ -587,7 +705,7 @@ def geolocate_stage(confirmed):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 6 — Tracking
+# Tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -865,7 +983,9 @@ def run_detection_pipeline(
     else:
         tiles = all_tiles
 
-    # Stage 1
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Stage 1 - Object detection with Grounding DINO
+    # ─────────────────────────────────────────────────────────────────────────────
     raw = run_detector_stage(
         tiles=tiles,
         classes=params.yolo_classes,
@@ -877,8 +997,10 @@ def run_detection_pipeline(
     if not raw:
         logger.info("No detections from detector — pipeline ends")
         return []
-
-    # Stage 2
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Stage 2 - NMS across tile boundaries, then filter by min bbox size in pixels (removes tiny detections that are hard to verify and geolocate accurately, especially at high altitudes).  
+    # NMS is important because GDINO often fires multiple times on the same object across overlapping tiles; without NMS we get duplicate tracks that confuse the analyst and downstream stages.
+    # ─────────────────────────────────────────────────────────────────────────────
     candidates = cross_tile_nms(raw)    
     candidates = [
         d for d in candidates
@@ -889,20 +1011,47 @@ def run_detection_pipeline(
     if not candidates:
         return []    
 
-    # Stage 3
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Stage 2a - cap candidates per tile by G-DINO confidence (removes low-confidence duplicates on tile boundaries, keeps the best ones for SAM refinement and VLM verification)
+    # ─────────────────────────────────────────────────────────────────────────────
+    max_per_tile = getattr(settings, "MAX_CANDIDATES_PER_TILE", 8)
+    tile_buckets: dict[tuple, list] = defaultdict(list)
+    for det in candidates:
+        tile_buckets[(det.parent_path, det.tile_x, det.tile_y)].append(det)
+    capped = []
+    for key, bucket in tile_buckets.items():
+        bucket.sort(key=lambda d: d.confidence, reverse=True)
+        if len(bucket) > max_per_tile:
+            logger.info(
+                "Tile (%d,%d) %s: capped %d → %d candidates",
+                key[1], key[2], Path(key[0]).name, len(bucket), max_per_tile,
+            )
+        capped.extend(bucket[:max_per_tile])
+    candidates = capped
+    logger.info("Per-tile cap (max=%d): %d candidates remain", max_per_tile, len(candidates))
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Stage 3 - SAM refinement + shape filtering (removes candidates with low SAM bbox-mask overlap, which are often background detections that are hard to verify and geolocate accurately)
+    # ─────────────────────────────────────────────────────────────────────────────
     candidates = sam_refine_stage(candidates, params.shape_priors, actual_alt_m, sam_segmentor)
     if not candidates:
         return []
 
-    # Stage 4
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Stage 4 - VLM verification (removes candidates that don't meet the analyst's criteria in the VLM, e.g. "is this a car?" → "yes, it's a red car" or "no, it's a tree")
+    # ─────────────────────────────────────────────────────────────────────────────
     confirmed = vlm_verify_stage(candidates, params, original_query, analyst)
     if not confirmed:
         return []
 
-    # Stage 5
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Stage 5 - Geo-location (adds lat/lon to each confirmed detection based on its position in the tile and the tile's geo-referencing)
+    # ─────────────────────────────────────────────────────────────────────────────
     confirmed = geolocate_stage(confirmed)
 
-    # Stage 6
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Stage 6 - Tracking (associates detections across frames into tracks, adds track_id to each detection)
+    # ─────────────────────────────────────────────────────────────────────────────
     tracks = track_stage(confirmed, color=color)
 
     logger.info("Pipeline: %d tracks, %d detections", len(tracks), len(confirmed))

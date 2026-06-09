@@ -1,6 +1,7 @@
 ### Operations
 - [] add detailed logging at each step
 - [1] audit
+- [] Streaming a file from a local disk - what is the right behaviour at the end of the file? Can TAE stop at the end of a file?
 
 ### Misc
 - [v] YOLO-World / Grounding DINO on each tile   ← fast, local, zero-shot  [YOLO26](https://docs.ultralytics.com/tasks#detection)
@@ -11,6 +12,7 @@
 - [v] Missions
   - [v] mission CRUD in UI
   - [v] databases / directories per mission
+- [] The Intent model extands a user query to addional terms (e.g `car` into [`vehicle`, `car`, `truck`, `SUV`). As a result, G-Dino may detect same object on different frames once as a `car` and once as a `SUV` which hurts tracking
 
 ### Refactoring
 - [-] Split into two services - on-edge server and cloud server
@@ -59,6 +61,13 @@
 - [x] video panel stall after ingestion / processing
 - [] update the anomaly path to be in sync with all the changes in object detection path
 
+### Cleanup
+- [] code duplication in `_bg_detect_callback` `_stream_on_frame_telem` and `run_detection_pipeline`
+- [] replace all `yolo_` with `detector_`
+- [] migrate the map renderer to read from detections.json (as you suggested) so we can reitire tracks.json
+
+
 ### Geospatial
 - [x] Need to have retry on detector (Grounding DINO via Replicate) calls - fix for _run_detector_on_tile in ai/detection_pipeline.py  (see Claude)
+
 

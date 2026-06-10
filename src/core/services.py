@@ -339,23 +339,24 @@ def _annotate_and_save(
     _tile_img_cache[key] = img_bytes
 
     # Save to disk for debugging/analysis
+    disk_path = ""
     try:
         paths = _state.get("mission_paths")
         if paths:
             det_dir = Path(paths.uploads).parent / "detections"
             det_dir.mkdir(exist_ok=True)
             safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label[:20])
-            (det_dir / f"{safe_label}_{key[:8]}.jpg").write_bytes(img_bytes)
+            disk_path = str(det_dir / f"{safe_label}_{key[:8]}.jpg")
+            Path(disk_path).write_bytes(img_bytes)
     except Exception:
         pass
 
-    return f"/tile_img/{key}"
-
+    return f"/tile_img/{key}", disk_path
 
 def _tile_to_static_url(candidate: dict) -> str | None:
     """Crop tile (no annotation), cache, return URL."""
-    return _annotate_and_save(candidate, None, "")
-
+    url, _ = _annotate_and_save(candidate, None, "")
+    return url
 
 def _extract_video_frames(
     video_path: str,
@@ -467,19 +468,23 @@ def _save_tracks(tracks: list, color: str) -> None:
         except Exception:
             existing = []
  
-    existing_ids = {t["id"] for t in existing}
-    added = 0
+    existing_by_id: dict[str, int] = {t["id"]: i for i, t in enumerate(existing)}
+    added = updated = 0
     for entry in new_entries:
-        if entry["id"] not in existing_ids:
+        if entry["id"] in existing_by_id:
+            existing[existing_by_id[entry["id"]]] = entry   # replace in-place
+            updated += 1
+        else:
+            existing_by_id[entry["id"]] = len(existing)
             existing.append(entry)
             added += 1
- 
+
     tracks_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     logger.info(
-        "_save_tracks: %d new multi-frame track(s) → %s",
-        added, tracks_file,
+        "_save_tracks: %d new + %d updated multi-frame track(s) → %s",
+        added, updated, tracks_file,
     )
-
+    
 def _load_detections(detections_path) -> dict:
     """Load detections from detections.json. Returns {} if absent."""
     try:

@@ -167,6 +167,7 @@ def _activate_mission(mission: Mission) -> None:
         "video_files":     [],
         "frame_timestamps": {},
         "last_query":       None,
+        "det_crops":        {},   # id(Detection) → disk path of annotated crop
     })
 
     db.reconnect(str(paths.lancedb))
@@ -1909,32 +1910,64 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                     # Persist tracks → _state["detections"], rebuild map
                     _new_det_ids = []
                     for _track in _tracks:
-                        _det_id = uuid.uuid4().hex[:10]
-                        _best   = _track.best
+                        _det_id   = uuid.uuid4().hex[:10]
+                        _best     = _track.best
                         _img_urls = []
+                        _det_crops: dict = _state.setdefault("det_crops", {})
                         for _det in _track.detections:
-                            _u = _annotate_and_save(
-                                {"parent_path": _det.parent_path,
-                                "tile_x": _det.tile_x, "tile_y": _det.tile_y,
-                                "tile_w": _det.tile_w, "tile_h": _det.tile_h},
-                                _det.bbox_tile, _det.label
-                            )
+                            if id(_det) not in _det_crops:
+                                _u, _disk = _annotate_and_save(
+                                    {"parent_path": _det.parent_path,
+                                    "tile_x": _det.tile_x, "tile_y": _det.tile_y,
+                                    "tile_w": _det.tile_w, "tile_h": _det.tile_h},
+                                    _det.bbox_tile, _best.label
+                                )
+                                _det_crops[id(_det)] = _disk
+                            else:
+                                _u = None
                             if _u:
                                 _img_urls.append(_u)
                         _state["detections"][_det_id] = {
-                            "lat": _track.lat, "lon": _track.lon,
-                            "label": _best.label, "color": color,
-                            "confirmed": True, "img_urls": _img_urls,
-                            "is_multiangle": len(_track.detections) > 1,
-                            "source_count": len(_track.detections),
-                            "bbox": _best.bbox_tile,
-                            "source": Path(_best.parent_path).name,
-                            "parent_path": _best.parent_path,
-                            "tile_x": _best.tile_x, "tile_y": _best.tile_y,
-                            "tile_w": _best.tile_w, "tile_h": _best.tile_h,
-                            "vlm_report": _best.vlm_report,
-                            "track_id": _track.track_id,
-                            "gsd":          "—",
+                            "lat":              _track.lat,
+                            "lon":              _track.lon,
+                            "label":            _best.label,
+                            "color":            color,
+                            "confirmed":        True,
+                            "img_urls":         _img_urls,
+                            "is_multiangle":    len(_track.detections) > 1,
+                            "source_count":     len(_track.detections),
+                            "gsd":              "—",
+                            "bbox":             _best.bbox_tile,
+                            "source":           Path(_best.parent_path).name,
+                            "parent_path":      _best.parent_path,
+                            "tile_x":           _best.tile_x,
+                            "tile_y":           _best.tile_y,
+                            "tile_w":           _best.tile_w,
+                            "tile_h":           _best.tile_h,
+                            "gdino_confidence": round(_best.confidence, 4),
+                            "vlm_confidence":   round(getattr(_best, "vlm_confidence", 0.0), 4),
+                            "vlm_reason":       getattr(_best, "vlm_reason", ""),
+                            "vlm_report":       _best.vlm_report,
+                            "track_id":         _track.track_id,
+                            "trajectory": [
+                                {
+                                    "lat":              d.lat,
+                                    "lon":              d.lon,
+                                    "source":           Path(d.parent_path).name,
+                                    "tile_x":           d.tile_x,
+                                    "tile_y":           d.tile_y,
+                                    "tile_w":           d.tile_w,
+                                    "tile_h":           d.tile_h,
+                                    "bbox":             d.bbox_tile,
+                                    "gdino_confidence": round(d.confidence, 4),
+                                    "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
+                                    "vlm_reason":       getattr(d, "vlm_reason", ""),
+                                    "detection_image":  _det_crops.get(id(d), ""),
+                                }
+                                for d in _track.detections
+                            ],
+                            "is_moving":        getattr(_track, "_speed_ms", 0.0) > 1.0,
+                            "speed_ms":         round(getattr(_track, "_speed_ms", 0.0), 2),
                         }
                         _new_det_ids.append(_det_id)
 
@@ -2328,24 +2361,24 @@ def _handle_anomaly_query(message, params, color, user_bubble, mission):
             lon = cand_match["lon"] if cand_match else 0.0
 
             _state["detections"][det_id] = {
-                "lat":       lat,
-                "lon":       lon,
-                "label":     message,
-                "color":     color,
-                "confirmed": True,
-                "img_urls":  [],
-                "gsd":       "—",
-                "bbox":      seg.bbox,
-                "source":    Path(seg.frame_path).name,
-                "parent_path": seg.frame_path,
-                "tile_x":    seg.bbox[0] if seg.bbox else 0,
-                "tile_y":    seg.bbox[1] if seg.bbox else 0,
-                "tile_w":    (seg.bbox[2] - seg.bbox[0]) if seg.bbox else 640,
-                "tile_h":    (seg.bbox[3] - seg.bbox[1]) if seg.bbox else 640,
-                "vlm_report": verify.get("report", {}),
-                "trajectory": [{"lat": d.lat, "lon": d.lon} for d in track.detections],
-                "is_moving":  getattr(track, "_speed_ms", 0.0) > 1.0,
-                "speed_ms":   round(getattr(track, "_speed_ms", 0.0), 2),
+                "lat":             lat,
+                "lon":             lon,
+                "label":           message,
+                "color":           color,
+                "confirmed":       True,
+                "img_urls":        [],
+                "gsd":             "—",
+                "bbox":            seg.bbox,
+                "source":          Path(seg.frame_path).name,
+                "parent_path":     seg.frame_path,
+                "tile_x":          seg.bbox[0] if seg.bbox else 0,
+                "tile_y":          seg.bbox[1] if seg.bbox else 0,
+                "tile_w":          (seg.bbox[2] - seg.bbox[0]) if seg.bbox else 640,
+                "tile_h":          (seg.bbox[3] - seg.bbox[1]) if seg.bbox else 640,
+                "gdino_confidence": 0.0,
+                "vlm_confidence":  round(float(verify.get("confidence", 0.0)), 4),
+                "vlm_reason":      "",
+                "vlm_report":      verify.get("report", {}),
             }
             new_det_ids.append(det_id)
 
@@ -2444,48 +2477,72 @@ async def query(message: str):  # noqa — signature only for illustration
     )
  
     new_det_ids: list[str] = []
+    det_crops: dict = _state.setdefault("det_crops", {})
     for track in tracks:
         det_id = uuid.uuid4().hex[:10]
         best   = track.best
- 
+
         img_urls = []
         for det in track.detections:
-            tile_candidate = {
-                "parent_path": det.parent_path,
-                "tile_x": det.tile_x, "tile_y": det.tile_y,
-                "tile_w": det.tile_w, "tile_h": det.tile_h,
-            }
-            url = _annotate_and_save(tile_candidate, det.bbox_tile, best.label)
+            if id(det) not in det_crops:
+                tile_candidate = {
+                    "parent_path": det.parent_path,
+                    "tile_x": det.tile_x, "tile_y": det.tile_y,
+                    "tile_w": det.tile_w, "tile_h": det.tile_h,
+                }
+                url, disk_path = _annotate_and_save(tile_candidate, det.bbox_tile, best.label)
+                det_crops[id(det)] = disk_path
+            else:
+                url = None
             if url:
                 img_urls.append(url)
- 
+
         report_summary = ""
         if best.vlm_report:
             parts = [f"{k}: {v}" for k, v in best.vlm_report.items() if v]
             report_summary = " · ".join(parts[:3])
- 
+
         _state["detections"][det_id] = {
-            "lat":           track.lat,
-            "lon":           track.lon,
-            "label":         best.label,
-            "color":         color,
-            "confirmed":     True,
-            "img_urls":      img_urls,
-            "is_multiangle": len(track.detections) > 1,
-            "source_count":  len(track.detections),
-            "gsd":           "-",
-            "bbox":          best.bbox_tile,
-            "source":        Path(best.parent_path).name,
-            "parent_path":   best.parent_path,
-            "tile_x":        best.tile_x,
-            "tile_y":        best.tile_y,
-            "tile_w":        best.tile_w,
-            "tile_h":        best.tile_h,
-            "vlm_report":    best.vlm_report,
-            "track_id":      track.track_id,
-            "trajectory":    [{"lat": d.lat, "lon": d.lon} for d in track.detections],
-            "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
-            "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
+            "lat":              track.lat,
+            "lon":              track.lon,
+            "label":            best.label,
+            "color":            color,
+            "confirmed":        True,
+            "img_urls":         img_urls,
+            "is_multiangle":    len(track.detections) > 1,
+            "source_count":     len(track.detections),
+            "gsd":              "-",
+            "bbox":             best.bbox_tile,
+            "source":           Path(best.parent_path).name,
+            "parent_path":      best.parent_path,
+            "tile_x":           best.tile_x,
+            "tile_y":           best.tile_y,
+            "tile_w":           best.tile_w,
+            "tile_h":           best.tile_h,
+            "gdino_confidence": round(best.confidence, 4),
+            "vlm_confidence":   round(getattr(best, "vlm_confidence", 0.0), 4),
+            "vlm_reason":       getattr(best, "vlm_reason", ""),
+            "vlm_report":       best.vlm_report,
+            "track_id":         track.track_id,
+            "trajectory": [
+                {
+                    "lat":              d.lat,
+                    "lon":              d.lon,
+                    "source":           Path(d.parent_path).name,
+                    "tile_x":           d.tile_x,
+                    "tile_y":           d.tile_y,
+                    "tile_w":           d.tile_w,
+                    "tile_h":           d.tile_h,
+                    "bbox":             d.bbox_tile,
+                    "gdino_confidence": round(d.confidence, 4),
+                    "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
+                    "vlm_reason":       getattr(d, "vlm_reason", ""),
+                    "detection_image":  det_crops.get(id(d), ""),
+                }
+                for d in track.detections
+            ],
+            "is_moving":        getattr(track, "_speed_ms", 0.0) > 1.0,
+            "speed_ms":         round(getattr(track, "_speed_ms", 0.0), 2),
         }
         new_det_ids.append(det_id)
         n_frames = len(set(d.parent_path for d in track.detections))
@@ -2740,9 +2797,17 @@ def _bg_detect_callback(
 
         logger.info("BG detect: %d tiles", len(tiles))
 
+        # Task 6: use enriched GDINO classes if configured
+        from config import settings as _settings
+        _gdino_classes = params.yolo_classes
+        if getattr(_settings, "GDINO_ENRICHED_QUERY", True):
+            _enriched = getattr(params, "gdino_classes", [])
+            if _enriched:
+                _gdino_classes = _enriched
+
         raw = run_detector_stage(
             tiles         = tiles,
-            classes       = params.yolo_classes,
+            classes       = _gdino_classes,
             confidence    = params.yolo_confidence,
             api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
             model_version = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
@@ -2759,6 +2824,18 @@ def _bg_detect_callback(
         ]
         if not candidates:
             return
+
+        # Task 1: cap per tile
+        from collections import defaultdict as _dd
+        _max = getattr(settings, "MAX_CANDIDATES_PER_TILE", 8)
+        _buckets: dict = _dd(list)
+        for _d in candidates:
+            _buckets[(_d.parent_path, _d.tile_x, _d.tile_y)].append(_d)
+        _capped = []
+        for _b in _buckets.values():
+            _b.sort(key=lambda _x: _x.confidence, reverse=True)
+            _capped.extend(_b[:_max])
+        candidates = _capped
 
         candidates = sam_refine_stage(candidates, params.shape_priors, actual_alt_m, None)
         if not candidates:
@@ -2782,26 +2859,68 @@ def _bg_detect_callback(
 
         # Update detection state (same logic as foreground path)
         _state["detections"] = {}
+        _bg_crops: dict = _state.setdefault("det_crops", {})
         for track in all_tracks:
-            best   = track.best
-            det_id = f"{track.label}_{track.track_id}"
+            best          = track.best
+            det_id        = f"{track.label}_{track.track_id}"
+            _img_urls_bg  = []
+            for _bd in track.detections:
+                if id(_bd) not in _bg_crops:
+                    try:
+                        _u_bg, _disk_bg = _annotate_and_save(
+                            {"parent_path": _bd.parent_path,
+                             "tile_x": _bd.tile_x, "tile_y": _bd.tile_y,
+                             "tile_w": _bd.tile_w, "tile_h": _bd.tile_h},
+                            _bd.bbox_tile, best.label,
+                        )
+                        _bg_crops[id(_bd)] = _disk_bg
+                    except Exception:
+                        _u_bg = None
+                else:
+                    _u_bg = None
+                if _u_bg:
+                    _img_urls_bg.append(_u_bg)
             _state["detections"][det_id] = {
-                "lat":           track.lat,    "lon":          track.lon,
-                "label":         track.label,  "color":        color,
-                "confirmed":     True,         "img_urls":     [],
-                "is_multiangle": len(track.detections) > 1,
-                "source_count":  len(track.detections),
-                "gsd":           "-",          "bbox":         best.bbox_tile,
-                "source":        _Path(best.parent_path).name,
-                "parent_path":   best.parent_path,
-                "tile_x":        best.tile_x,  "tile_y":       best.tile_y,
-                "tile_w":        best.tile_w,  "tile_h":       best.tile_h,
-                "vlm_report":    best.vlm_report,
-                "track_id":      track.track_id,
-                "trajectory":    [{"lat": d.lat, "lon": d.lon}
-                                   for d in track.detections],
-                "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
-                "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
+                "lat":              track.lat,
+                "lon":              track.lon,
+                "label":            track.label,
+                "color":            color,
+                "confirmed":        True,
+                "img_urls":         _img_urls_bg,
+                "is_multiangle":    len(track.detections) > 1,
+                "source_count":     len(track.detections),
+                "gsd":              "-",
+                "bbox":             best.bbox_tile,
+                "source":           _Path(best.parent_path).name,
+                "parent_path":      best.parent_path,
+                "tile_x":           best.tile_x,
+                "tile_y":           best.tile_y,
+                "tile_w":           best.tile_w,
+                "tile_h":           best.tile_h,
+                "gdino_confidence": round(best.confidence, 4),
+                "vlm_confidence":   round(getattr(best, "vlm_confidence", 0.0), 4),
+                "vlm_reason":       getattr(best, "vlm_reason", ""),
+                "vlm_report":       best.vlm_report,
+                "track_id":         track.track_id,
+                "trajectory": [
+                    {
+                        "lat":              d.lat,
+                        "lon":              d.lon,
+                        "source":           _Path(d.parent_path).name,
+                        "tile_x":           d.tile_x,
+                        "tile_y":           d.tile_y,
+                        "tile_w":           d.tile_w,
+                        "tile_h":           d.tile_h,
+                        "bbox":             d.bbox_tile,
+                        "gdino_confidence": round(d.confidence, 4),
+                        "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
+                        "vlm_reason":       getattr(d, "vlm_reason", ""),
+                        "detection_image":  _bg_crops.get(id(d), ""),
+                    }
+                    for d in track.detections
+                ],
+                "is_moving":        getattr(track, "_speed_ms", 0.0) > 1.0,
+                "speed_ms":         round(getattr(track, "_speed_ms", 0.0), 2),
             }
 
         # Rebuild map for background results
@@ -2959,7 +3078,9 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
 
         raw = run_detector_stage(
             tiles         = foreground,
-            classes       = params.yolo_classes,
+            classes       = getattr(params, "gdino_classes", []) or params.yolo_classes
+                            if getattr(settings, "GDINO_ENRICHED_QUERY", True) and getattr(params, "gdino_classes", [])
+                            else params.yolo_classes,
             confidence    = params.yolo_confidence,
             api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
             model_version = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
@@ -2976,6 +3097,18 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
         ]
         if not candidates:
             return
+
+        # Task 1: cap per tile by GDINO confidence
+        from collections import defaultdict as _fdd
+        _fmax = getattr(settings, "MAX_CANDIDATES_PER_TILE", 8)
+        _fbuckets: dict = _fdd(list)
+        for _fd in candidates:
+            _fbuckets[(_fd.parent_path, _fd.tile_x, _fd.tile_y)].append(_fd)
+        _fcapped = []
+        for _fb in _fbuckets.values():
+            _fb.sort(key=lambda _x: _x.confidence, reverse=True)
+            _fcapped.extend(_fb[:_fmax])
+        candidates = _fcapped
 
         candidates = sam_refine_stage(
             candidates, params.shape_priors, actual_alt_m, None,
@@ -3008,27 +3141,69 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
 
     # ── update detections state — REPLACE not accumulate ──────────────────────
     _state["detections"] = {}
+    _stream_crops: dict = _state.setdefault("det_crops", {})
     new_det_ids = []
     for track in all_tracks:
         best   = track.best
         det_id = f"{track.label}_{track.track_id}"
+        _img_urls = []
+        for _sd in track.detections:
+            if id(_sd) not in _stream_crops:
+                try:
+                    _u, _disk = _annotate_and_save(
+                        {"parent_path": _sd.parent_path,
+                         "tile_x": _sd.tile_x, "tile_y": _sd.tile_y,
+                         "tile_w": _sd.tile_w, "tile_h": _sd.tile_h},
+                        _sd.bbox_tile, best.label,
+                    )
+                    _stream_crops[id(_sd)] = _disk
+                except Exception:
+                    _u = None
+            else:
+                _u = None
+            if _u:
+                _img_urls.append(_u)
         _state["detections"][det_id] = {
-            "lat":           track.lat,    "lon":          track.lon,
-            "label":         track.label,  "color":        color,
-            "confirmed":     True,         "img_urls":     [],
-            "is_multiangle": len(track.detections) > 1,
-            "source_count":  len(track.detections),
-            "gsd":           "-",          "bbox":         best.bbox_tile,
-            "source":        _Path(best.parent_path).name,
-            "parent_path":   best.parent_path,
-            "tile_x":        best.tile_x,  "tile_y":       best.tile_y,
-            "tile_w":        best.tile_w,  "tile_h":       best.tile_h,
-            "vlm_report":    best.vlm_report,
-            "track_id":      track.track_id,
-            "trajectory":    [{"lat": d.lat, "lon": d.lon}
-                               for d in track.detections],
-            "is_moving":     getattr(track, "_speed_ms", 0.0) > 1.0,
-            "speed_ms":      round(getattr(track, "_speed_ms", 0.0), 2),
+            "lat":              track.lat,
+            "lon":              track.lon,
+            "label":            track.label,
+            "color":            color,
+            "confirmed":        True,
+            "img_urls":         _img_urls,
+            "is_multiangle":    len(track.detections) > 1,
+            "source_count":     len(track.detections),
+            "gsd":              "-",
+            "bbox":             best.bbox_tile,
+            "source":           _Path(best.parent_path).name,
+            "parent_path":      best.parent_path,
+            "tile_x":           best.tile_x,
+            "tile_y":           best.tile_y,
+            "tile_w":           best.tile_w,
+            "tile_h":           best.tile_h,
+            "gdino_confidence": round(best.confidence, 4),
+            "vlm_confidence":   round(getattr(best, "vlm_confidence", 0.0), 4),
+            "vlm_reason":       getattr(best, "vlm_reason", ""),
+            "vlm_report":       best.vlm_report,
+            "track_id":         track.track_id,
+            "trajectory": [
+                {
+                    "lat":              d.lat,
+                    "lon":              d.lon,
+                    "source":           _Path(d.parent_path).name,
+                    "tile_x":           d.tile_x,
+                    "tile_y":           d.tile_y,
+                    "tile_w":           d.tile_w,
+                    "tile_h":           d.tile_h,
+                    "bbox":             d.bbox_tile,
+                    "gdino_confidence": round(d.confidence, 4),
+                    "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
+                    "vlm_reason":       getattr(d, "vlm_reason", ""),
+                    "detection_image":  _stream_crops.get(id(d), ""),
+                }
+                for d in track.detections
+            ],
+            "is_moving":        getattr(track, "_speed_ms", 0.0) > 1.0,
+            "speed_ms":         round(getattr(track, "_speed_ms", 0.0), 2),
         }
         new_det_ids.append(det_id)
 
@@ -3055,11 +3230,9 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
     now = _time.time()
     if now - _state.get("_stream_map_ts", 0.0) >= _MAP_INTERVAL_S:
         _state["_stream_map_ts"] = now
-        p2 = _state.get("mission_paths")
-        if p2:
-            (p2.detections / "tracks.json").unlink(missing_ok=True)
-        _save_tracks(all_tracks, color)
+        _save_tracks(all_tracks, color)   # upserts — no prior unlink needed
         _build_map()
+        p2 = _state.get("mission_paths")
         if p2:
             _save_detections(p2.detections)
         _state["_stream_updates_pending"] = True

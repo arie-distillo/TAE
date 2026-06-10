@@ -85,6 +85,9 @@ class Detection:
     fp_se_lon:   float  = 0.0
     fp_sw_lat:   float  = 0.0
     fp_sw_lon:   float  = 0.0
+    detection_image: str    = ""        # abs path to crop saved under DATA_DIR/detections/
+    vlm_confidence:  float  = 0.0       # 0–1 score from VLM (confirmed detections only)
+    vlm_reason:      str    = ""        # brief confirmation rationale (confirmed only)
 
 
 @dataclass
@@ -509,6 +512,8 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
             if result.get("confirmed"):
                 det.confirmed = True
                 det.vlm_report = result.get("report", {})
+                det.vlm_confidence = float(result.get("confidence", 0.0))
+                det.vlm_reason     = result.get("reason", "")
                 # Prefer VLM's own label over GDINO's; fall back to GDINO label
                 vlm_label = result.get("detected_label", "").strip()
                 if vlm_label:

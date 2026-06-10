@@ -169,7 +169,8 @@ def _build_batch_verify_prompt(
         f"[\n"
         f"  {{\"index\": 0, \"confirmed\": true/false, "
         f"\"detected_label\": \"the most accurate class name for what you see\", "
-        f"\"reason\": \"...\", "
+        f"\"confidence\": 0.0-1.0, "
+        f"\"reason\": \"one sentence — ONLY when confirmed; omit key entirely if rejected\", "
         f"\"report\": {{{field_schema}: \"...\"}}}},\n"
         f"  ...\n"
         f"]\n"
@@ -391,10 +392,11 @@ class TacticalAnalyst:
                 idx = int(r.get("index", -1))
                 if 0 <= idx < len(detections):
                     out[idx] = {
-                        "confirmed": bool(r.get("confirmed", False)),
+                        "confirmed":      bool(r.get("confirmed", False)),
                         "detected_label": r.get("detected_label", "").strip(),
-                        "reason":    r.get("reason", ""),
-                        "report":    r.get("report", {}),
+                        "confidence":     float(r.get("confidence", 0.0)),
+                        "reason":         r.get("reason", ""),   # empty string for rejections
+                        "report":         r.get("report", {}),
                     }
             return out
         except (json.JSONDecodeError, ValueError) as exc:

@@ -57,6 +57,7 @@ tracking_targets:
 
   - id:          orange_car
     png:         data/assets/orange_car.png
-    real_size_m: 6.0
+    real_size_m: 4.0
     speed_ms:    2.0
     direction_deg: 270      # optional: fix bearing (West); omit for random
+    same_pass_as: yellow_car

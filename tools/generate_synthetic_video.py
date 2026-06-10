@@ -396,8 +396,9 @@ class TrackingTarget:
 
     # Sizing: provide real_size_m for GSD-correct sizing, or scale as a
     # fraction of the frame short-edge.  real_size_m takes priority.
-    real_size_m: Optional[float] = None   # physical width in metres
-    scale:       float           = 0.05   # fallback: fraction of frame short-edge
+    real_size_m:  Optional[float] = None   # physical width in metres
+    scale:        float           = 0.05   # fallback: fraction of frame short-edge
+    same_pass_as: Optional[str]   = None   # if set: auto-place simultaneously with this target id
 
     # Resolved at load time
     _img_rgba:   Optional[np.ndarray] = field(default=None, repr=False)
@@ -743,8 +744,9 @@ def load_yaml_config(config_path: Path) -> dict:
             start_frame = start_frame,
             end_frame   = end_frame,           # clamped to total_frames-1 in generate()
             trajectory  = trajectory,
-            start_lat   = float(spec["start_lat"]) if "start_lat" in spec else float("nan"),
-            start_lon   = float(spec["start_lon"]) if "start_lon" in spec else float("nan"),
+            start_lat    = float(spec["start_lat"]) if "start_lat" in spec else float("nan"),
+            start_lon    = float(spec["start_lon"]) if "start_lon" in spec else float("nan"),
+            same_pass_as = spec.get("same_pass_as"),
             real_size_m = float(spec["real_size_m"]) if "real_size_m" in spec else None,
             scale       = float(spec.get("scale", 0.05)),
         )
@@ -785,6 +787,40 @@ def load_yaml_config(config_path: Path) -> dict:
 # Auto-placement  (new)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _quick_vis_range(
+    target:       "TrackingTarget",
+    direction_deg: float,
+    waypoints:    list["Waypoint"],
+    fp_w_m:       float,
+    fp_h_m:       float,
+    fps:          float,
+    total_frames: int,
+    center_lat:   float,
+) -> "tuple[int,int] | None":
+    """
+    Return (first_visible_frame, last_visible_frame) for an already-placed target.
+
+    Used after auto_place_target() to record the *actual* visibility window
+    (not the active window) so that same_pass_as constraints are correct.
+    """
+    half_w = (fp_w_m / 2.0) / m_per_deg_lon(center_lat)
+    half_h = (fp_h_m / 2.0) / M_PER_DEG_LAT
+    first_vis: int | None = None
+    last_vis:  int | None = None
+    for fi in range(max(0, target.start_frame),
+                    min(total_frames, target.end_frame + 1)):
+        dt_s  = (fi - target.start_frame) / fps
+        olat, olon = target.position_at_dt(
+            dt_s, direction_deg, target.start_lat, target.start_lon
+        )
+        dlat, dlon, _ = interpolate_position(waypoints, fi / fps)
+        if abs(olat - dlat) <= half_h and abs(olon - dlon) <= half_w:
+            if first_vis is None:
+                first_vis = fi
+            last_vis = fi
+    return (first_vis, last_vis) if first_vis is not None else None
+
+
 def auto_place_target(
     target:       "TrackingTarget",
     direction_deg: float,
@@ -795,8 +831,9 @@ def auto_place_target(
     fps:          float,
     total_frames: int,
     rng:          np.random.Generator,
-    min_visible:  int = 5,
-    max_attempts: int = 50,
+    min_visible:     int                    = 5,
+    max_attempts:    int                    = 50,
+    required_frames: "tuple[int,int] | None" = None,
 ) -> bool:
     """
     Auto-assign start_lat / start_lon so the object is guaranteed to be
@@ -840,6 +877,11 @@ def auto_place_target(
     if not active_frames:
         return False
 
+    # Constrain anchor candidates to required_frames window (same_pass_as feature)
+    if required_frames:
+        req_start, req_end = required_frames
+        constrained = [fi for fi in active_frames if req_start <= fi <= req_end]
+        active_frames = constrained if constrained else active_frames
     rng.shuffle(active_frames)
     candidates = active_frames[:max_attempts]
 
@@ -1976,16 +2018,20 @@ def generate(
             t.load_png()
 
         # ── Auto-placement for targets without explicit start_lat/start_lon ───
-        placement_rng = np.random.default_rng(1)   # separate seed from frame rng
+        placement_rng     = np.random.default_rng(1)   # separate seed from frame rng
+        _placed_visibility: dict[str, tuple[int, int]] = {}  # id → (first_vis, last_vis)
         for idx, t in enumerate(tracking_targets):
             if math.isnan(t.start_lat) or math.isnan(t.start_lon):
                 # Resolve direction first so auto-placement uses the same one
                 dir_rng   = np.random.default_rng(idx + 100)
                 direction = t.resolve_direction(dir_rng)
+                t.trajectory.direction_deg = direction   # freeze: prevent re-resolution later
                 print(f"  Auto-placing '{t.id}' (no start_lat/start_lon in config)…")
+                _req_frames = _placed_visibility.get(t.same_pass_as) if t.same_pass_as else None
                 ok = auto_place_target(
-                    target        = t,
-                    direction_deg = direction,
+                    target          = t,
+                    direction_deg   = direction,
+                    required_frames = _req_frames,
                     waypoints     = waypoints,
                     bounds        = bounds,
                     fp_w_m        = fp_w_m,
@@ -1996,6 +2042,23 @@ def generate(
                 )
                 status = "✓ placed" if ok else "⚠ fallback placement"
                 print(f"    {status}: start ({t.start_lat:.6f}, {t.start_lon:.6f})")
+                # Store ACTUAL visibility window (not just active window) so that
+                # same_pass_as constrains orange_car to the frames yellow_car is
+                # truly visible, not the whole 0–total_frames active span.
+                _vis = _quick_vis_range(
+                    t, direction, waypoints,
+                    fp_w_m, fp_h_m, fps, total_frames, bounds.center_lat,
+                )
+                if _vis:
+                    _placed_visibility[t.id] = _vis
+                    print(f"    Visibility window for same_pass_as: "
+                          f"frames {_vis[0]}–{_vis[1]}")
+                else:
+                    # Fallback: active window (won't be useful but won't crash)
+                    _placed_visibility[t.id] = (
+                        max(0, t.start_frame),
+                        min(total_frames - 1, t.end_frame),
+                    )
 
         # ── Visibility pre-scan ────────────────────────────────────────────────
         vis_results = estimate_visibility_windows(

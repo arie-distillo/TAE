@@ -450,6 +450,18 @@ class StreamManager:
         except Exception as exc:
             logger.warning("Segment %s VideoSampler error: %s", seg_path.name, exc)
             return
+        
+        # Log GPS for all frames in the segment to help debug temporal alignment issues.
+        for jpeg_path, srt_frame in frame_pairs:
+            if srt_frame:
+                logger.info(
+                    "GPS_TRACE | %s | abs_ms=%d | lat=%.7f | lon=%.7f | alt=%.1f",
+                    jpeg_path.name,
+                    srt_frame.timestamp_ms,
+                    srt_frame.lat,
+                    srt_frame.lon,
+                    srt_frame.alt_m,
+                )
 
         # Advance the absolute timeline by this segment's TRUE duration so the
         # next segment's frames resolve telemetry at the correct video time.

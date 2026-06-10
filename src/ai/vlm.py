@@ -53,6 +53,53 @@ def _load_tile_cv2(candidate: dict) -> np.ndarray | None:
     w, h = candidate["tile_w"], candidate["tile_h"]
     return img[y: y + h, x: x + w]
 
+#─────────────────────────────────────────────────────────────────────────────
+# Helpers 
+#─────────────────────────────────────────────────────────────────────────────
+
+def _context_crop_upscale(
+    tile_img:      np.ndarray,
+    bboxes:        list,          # [[x1,y1,x2,y2], ...]
+    pad_factor:    int   = 4,
+    min_pad_px:    int   = 48,
+    min_output_px: int   = 256,
+) -> np.ndarray:
+    """
+    Crop a context window around all detections in the tile and upscale.
+
+    Sends the VLM a focused, legible region rather than a full tile where
+    objects occupy <5% of the area. Preserves scene context via padding.
+    Falls back to the full tile if objects already dominate it.
+    """
+    th, tw = tile_img.shape[:2]
+    xs1 = [int(b[0]) for b in bboxes]; ys1 = [int(b[1]) for b in bboxes]
+    xs2 = [int(b[2]) for b in bboxes]; ys2 = [int(b[3]) for b in bboxes]
+
+    max_side = max(
+        max(x2 - x1 for x1, x2 in zip(xs1, xs2)),
+        max(y2 - y1 for y1, y2 in zip(ys1, ys2)),
+    )
+    # If objects are already large relative to tile, skip — full tile is fine
+    if max_side > min(tw, th) * 0.25:
+        return tile_img
+
+    pad  = max(min_pad_px, max_side * pad_factor)
+    cx1  = max(0, min(xs1) - pad)
+    cy1  = max(0, min(ys1) - pad)
+    cx2  = min(tw, max(xs2) + pad)
+    cy2  = min(th, max(ys2) + pad)
+    crop = tile_img[int(cy1):int(cy2), int(cx1):int(cx2)]
+
+    ch, cw = crop.shape[:2]
+    if min(ch, cw) < min_output_px:
+        scale = min_output_px / min(ch, cw)
+        crop  = cv2.resize(
+            crop,
+            (int(cw * scale), int(ch * scale)),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+    return crop
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt templates — analyze_multiple_views (legacy / anomaly path)
@@ -82,6 +129,10 @@ def _build_prompt(
         f"{img_info}\n\n"
         f"Find all instances of the following:\n"
         f"TARGET: {user_query}\n\n"
+        f"AERIAL IMAGERY NOTE: Objects are seen from above at altitude. "
+        f"Fine surface detail is not visible — judge by overall shape, approximate "
+        f"size, colour, and shadow. A rough match to the query description is "
+        f"sufficient to confirm. Do not reject because detail is absent.\n\n"
         "Return ONLY a valid JSON object:\n"
         "{\n"
         '  "report": "brief summary of findings",\n'
@@ -363,6 +414,10 @@ class TacticalAnalyst:
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (74, 222, 128), 2)
             cv2.putText(annotated, str(i), (x1, max(y1 - 4, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (74, 222, 128), 1)
+
+        # If objects are small relative to the tile, crop to context and upscale
+        all_bboxes = [det["bbox"] for det in detections]
+        annotated  = _context_crop_upscale(annotated, all_bboxes)
 
         prompt = _build_batch_verify_prompt(
             label_hints    = [d["label"] for d in detections],

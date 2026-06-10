@@ -52,12 +52,12 @@ tracking_targets:
 
   - id:          yellow_car
     png:         data/assets/yellow_car.png
-    real_size_m: 4.0        # physical size → geo-correct pixel footprint via GSD
+    real_size_m: 2.0        # physical size → geo-correct pixel footprint via GSD
     speed_ms:    2.0       # object speed in m/s
 
   - id:          orange_car
     png:         data/assets/orange_car.png
-    real_size_m: 4.0
+    real_size_m: 2.0
     speed_ms:    2.0
     direction_deg: 270      # optional: fix bearing (West); omit for random
     same_pass_as: yellow_car

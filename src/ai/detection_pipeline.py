@@ -138,6 +138,46 @@ def _load_tile_img(tile):
     x, y, w, h = tile["tile_x"], tile["tile_y"], tile["tile_w"], tile["tile_h"]
     return img[y: y + h, x: x + w]
 
+def _padded_upscaled_crop(
+    tile_img:      np.ndarray,
+    bbox:          list,          # [x1, y1, x2, y2] tile-local pixels
+    pad_factor:    int   = 4,     # context padding as multiple of object size
+    min_pad_px:    int   = 48,    # floor on padding regardless of object size
+    min_output_px: int   = 128,   # upscale until shortest side reaches this
+) -> np.ndarray:
+    """
+    Return a context-padded, upscaled crop centred on bbox.
+
+    Padding gives the VLM surrounding scene context so it can make a
+    meaningful decision about a small object. The object bbox is drawn
+    as a 1px green rectangle so the VLM knows exactly what to evaluate.
+    Upscaling with LANCZOS4 avoids pixelation artefacts on tiny crops.
+    """
+    x1, y1, x2, y2 = [max(0, int(v)) for v in bbox]
+    bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+    th, tw = tile_img.shape[:2]
+
+    pad  = max(min_pad_px, bw * pad_factor, bh * pad_factor)
+    cx1  = max(0, x1 - pad)
+    cy1  = max(0, y1 - pad)
+    cx2  = min(tw, x2 + pad)
+    cy2  = min(th, y2 + pad)
+    crop = tile_img[cy1:cy2, cx1:cx2].copy()
+
+    # Mark the object in crop-local coordinates
+    ox, oy = x1 - cx1, y1 - cy1
+    cv2.rectangle(crop, (ox, oy), (ox + bw, oy + bh), (74, 222, 128), 1)
+
+    # Upscale so VLM sees a reasonably sized image
+    ch, cw = crop.shape[:2]
+    if min(ch, cw) < min_output_px:
+        scale = min_output_px / min(ch, cw)
+        crop  = cv2.resize(
+            crop,
+            (int(cw * scale), int(ch * scale)),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+    return crop
  
 def _m_per_deg_lon(lat: float) -> float:
     return 111_320.0 * math.cos(math.radians(lat))
@@ -533,7 +573,8 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
                         rej_dir.mkdir(parents=True, exist_ok=True)
                         safe = det.label.replace(" ", "_")[:20]
                         fname = f"{safe}_{det.det_id[:8]}.jpg"
-                        cv2.imwrite(str(rej_dir / fname), det.masked_crop)
+                        debug_crop = _padded_upscaled_crop(tile_img, det.bbox_tile)
+                        cv2.imwrite(str(rej_dir / fname), debug_crop)
                 except Exception:
                     pass
         return confirmed

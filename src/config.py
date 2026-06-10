@@ -64,10 +64,10 @@ class Settings(BaseSettings):
     CLIP_DIM:   int = 512
 
     # ── AI — Object detection ───────────────────────────────────────────────
-    DETECTION_MIN_BBOX_PX: int = 30   # minimum detection bounding box side length in pixels
+    DETECTION_MIN_BBOX_PX: int = 8   # minimum detection bounding box side length in pixels
     DETECTION_CONFIDENCE: dict[str, float] = {
-        "easy":   0.13,   # large, visually distinctive objects (buildings, vehicles)
-        "medium": 0.13,   # medium objects with moderate camouflage (cows in grass)
+        "easy":   0.03,   # large, visually distinctive objects (buildings, vehicles)
+        "medium": 0.03,   # medium objects with moderate camouflage (cows in grass)
         "hard":   0.03,   # small or highly camouflaged (people, stones, prone animals)
     }
 

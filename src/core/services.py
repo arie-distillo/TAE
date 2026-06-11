@@ -319,6 +319,8 @@ def _annotate_and_save(
     bbox_px:   list | None,
     label:     str,
     persist: bool = True,
+    gdino_confidence: float | None = None,
+    vlm_confidence: float | None = None,
 ) -> str | None:
     """Crop tile, optionally draw bbox, cache JPEG bytes, return URL."""
     img = _load_tile(candidate)
@@ -348,7 +350,14 @@ def _annotate_and_save(
                 det_dir = Path(paths.uploads).parent / "detections"
                 det_dir.mkdir(exist_ok=True)
                 safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label[:20])
-                disk_path = str(det_dir / f"{safe_label}_{key[:8]}.jpg")
+                g_conf = gdino_confidence if gdino_confidence is not None \
+                         else float(candidate.get("gdino_confidence", candidate.get("confidence", 0.0)))
+                v_conf = vlm_confidence if vlm_confidence is not None \
+                         else float(candidate.get("vlm_confidence", 0.0))
+                g_str  = f"{g_conf:.2f}"
+                v_str  = f"{v_conf:.2f}"
+                # Filename: {label}_{vlm_conf}_{gdino_conf}_{id}.jpg  e.g. car_0.91_0.73_a3b4c5d6.jpg
+                disk_path = str(det_dir / f"{safe_label}_{v_str}_{g_str}_{key[:8]}.jpg")
                 Path(disk_path).write_bytes(img_bytes)
         except Exception:
             pass

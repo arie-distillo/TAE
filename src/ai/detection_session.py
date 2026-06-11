@@ -71,6 +71,8 @@ def collect_img_urls(track) -> list[str]:
                 },
                 det.bbox_tile,
                 track.best.label,
+                gdino_confidence=det.confidence,
+                vlm_confidence=getattr(det, "vlm_confidence", 0.0),
             )
             det_crops[id(det)] = disk_path
         except Exception:
@@ -294,6 +296,7 @@ def stream_detect_and_commit(
         sam_refine_stage, vlm_verify_stage,
         geolocate_stage, track_stage,
     )
+    from core import confidence_stats as _cstats
     from core.app_state import _state
 
     if not tiles:
@@ -308,6 +311,8 @@ def stream_detect_and_commit(
         if enriched:
             gdino_classes = enriched
 
+    _cstats.open_stream_run(definition, params.yolo_confidence)
+
     raw = run_detector_stage(
         tiles         = tiles,
         classes       = gdino_classes,
@@ -318,13 +323,16 @@ def stream_detect_and_commit(
     )
     if not raw:
         return [], []
+    _cstats.record_gdino_detections(raw)
 
-    candidates = cross_tile_nms(raw)
+    nms_output = cross_tile_nms(raw)
+    _cstats.record_nms_result(raw, nms_output)
     candidates = [
-        d for d in candidates
+        d for d in nms_output
         if (d.bbox_tile[2] - d.bbox_tile[0]) >= settings.DETECTION_MIN_BBOX_PX
         and (d.bbox_tile[3] - d.bbox_tile[1]) >= settings.DETECTION_MIN_BBOX_PX
     ]
+    _cstats.record_size_filter(nms_output, candidates)
     if not candidates:
         return [], []
 
@@ -345,7 +353,9 @@ def stream_detect_and_commit(
     if not candidates:
         return [], []
 
-    confirmed = vlm_verify_stage(candidates, params, definition, analyst)
+    vlm_candidates = candidates
+    confirmed = vlm_verify_stage(vlm_candidates, params, definition, analyst)
+    _cstats.record_vlm_result(vlm_candidates, confirmed if confirmed else [])
     if not confirmed:
         return [], []
 

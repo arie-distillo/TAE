@@ -1254,6 +1254,10 @@ def stream_stop():
     from starlette.responses import JSONResponse
     _bg_worker.stop()
     stream_mgr.stop()
+    from core import confidence_stats as _cstats
+    _paths = _state.get("mission_paths")
+    if _paths:
+        _cstats.finalize_run(_paths.detections)
     return JSONResponse({"ok": True})
 
 

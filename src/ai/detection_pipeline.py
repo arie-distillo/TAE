@@ -42,6 +42,8 @@ from core.app_state import _state
 from config import Settings
 settings = Settings()
 
+from core import confidence_stats as _cstats
+
 # ── Constants ─────────────────────────────────────────────────────────────────
  
 _STATIC_GATE_M   =   5.0   # base gate for stationary objects (m)
@@ -563,6 +565,8 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
                             det.label, Path(parent).name, tx, ty)
             else:
                 reason = result.get("reason", "")
+                det.vlm_confidence = float(result.get("confidence", 0.0))
+                det.vlm_reason     = reason
                 logger.info("VLM rejected %s in %s tile(%d,%d): %s",
                             det.label, Path(parent).name, tx, ty, reason)
                 # Save rejected crop for debugging
@@ -571,8 +575,10 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
                     if paths and det.masked_crop is not None:
                         rej_dir = Path(paths.detections) / "rejected"
                         rej_dir.mkdir(parents=True, exist_ok=True)
-                        safe = det.label.replace(" ", "_")[:20]
-                        fname = f"{safe}_{det.det_id[:8]}.jpg"
+                        safe  = det.label.replace(" ", "_")[:20]
+                        v_str = f"{det.vlm_confidence:.2f}"
+                        g_str = f"{det.confidence:.2f}"
+                        fname = f"{safe}_{v_str}_{g_str}_{det.det_id[:8]}.jpg"
                         debug_crop = _padded_upscaled_crop(tile_img, det.bbox_tile)
                         cv2.imwrite(str(rej_dir / fname), debug_crop)
                 except Exception:
@@ -883,6 +889,8 @@ def run_detection_pipeline(
         logger.warning("No tiles — aborted")
         return []
 
+    _cstats.start_run(original_query, params.yolo_confidence)
+
     # CLIP pre-filter (easy/medium only)
     # Threshold lowered from 20→4 so this fires during per-frame streaming
     # (typically 8 tiles/frame).  For small sets keep 50-60 % (conservative);
@@ -922,27 +930,36 @@ def run_detection_pipeline(
     )
     if not raw:
         logger.info("No detections from detector — pipeline ends")
+        _cstats.finalize_run(_state["mission_paths"].detections) if _state.get("mission_paths") else None
         return []
+    _cstats.record_gdino_detections(raw)
 
     # Stage 2
-    candidates = cross_tile_nms(raw)    
+    nms_output = cross_tile_nms(raw)
+    _cstats.record_nms_result(raw, nms_output)
     candidates = [
-        d for d in candidates
+        d for d in nms_output
         if (d.bbox_tile[2] - d.bbox_tile[0]) >= settings.DETECTION_MIN_BBOX_PX
         and (d.bbox_tile[3] - d.bbox_tile[1]) >= settings.DETECTION_MIN_BBOX_PX
     ]
     logger.info("Min-size filter: kept %d candidates", len(candidates))
+    _cstats.record_size_filter(nms_output, candidates)
     if not candidates:
-        return []    
+        _cstats.finalize_run(_state["mission_paths"].detections) if _state.get("mission_paths") else None
+        return []
 
     # Stage 3
     candidates = sam_refine_stage(candidates, params.shape_priors, actual_alt_m, sam_segmentor)
     if not candidates:
+        _cstats.finalize_run(_state["mission_paths"].detections) if _state.get("mission_paths") else None
         return []
 
     # Stage 4
-    confirmed = vlm_verify_stage(candidates, params, original_query, analyst)
+    vlm_candidates = candidates
+    confirmed = vlm_verify_stage(vlm_candidates, params, original_query, analyst)
+    _cstats.record_vlm_result(vlm_candidates, confirmed if confirmed else [])
     if not confirmed:
+        _cstats.finalize_run(_state["mission_paths"].detections) if _state.get("mission_paths") else None
         return []
 
     # Stage 5
@@ -952,4 +969,6 @@ def run_detection_pipeline(
     tracks = track_stage(confirmed, color=color)
 
     logger.info("Pipeline: %d tracks, %d detections", len(tracks), len(confirmed))
+    if _state.get("mission_paths"):
+        _cstats.finalize_run(_state["mission_paths"].detections)
     return tracks

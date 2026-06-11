@@ -57,20 +57,14 @@ def _load_tile_cv2(candidate: dict) -> np.ndarray | None:
 # Helpers 
 #─────────────────────────────────────────────────────────────────────────────
 
+# returns (image, remapped_bboxes) 
 def _context_crop_upscale(
     tile_img:      np.ndarray,
-    bboxes:        list,          # [[x1,y1,x2,y2], ...]
+    bboxes:        list,
     pad_factor:    int   = 4,
     min_pad_px:    int   = 48,
     min_output_px: int   = 256,
-) -> np.ndarray:
-    """
-    Crop a context window around all detections in the tile and upscale.
-
-    Sends the VLM a focused, legible region rather than a full tile where
-    objects occupy <5% of the area. Preserves scene context via padding.
-    Falls back to the full tile if objects already dominate it.
-    """
+) -> tuple[np.ndarray, list]:
     th, tw = tile_img.shape[:2]
     xs1 = [int(b[0]) for b in bboxes]; ys1 = [int(b[1]) for b in bboxes]
     xs2 = [int(b[2]) for b in bboxes]; ys2 = [int(b[3]) for b in bboxes]
@@ -79,9 +73,8 @@ def _context_crop_upscale(
         max(x2 - x1 for x1, x2 in zip(xs1, xs2)),
         max(y2 - y1 for y1, y2 in zip(ys1, ys2)),
     )
-    # If objects are already large relative to tile, skip — full tile is fine
     if max_side > min(tw, th) * 0.25:
-        return tile_img
+        return tile_img, bboxes      # no crop — bboxes are already correct
 
     pad  = max(min_pad_px, max_side * pad_factor)
     cx1  = max(0, min(xs1) - pad)
@@ -91,6 +84,7 @@ def _context_crop_upscale(
     crop = tile_img[int(cy1):int(cy2), int(cx1):int(cx2)]
 
     ch, cw = crop.shape[:2]
+    scale  = 1.0
     if min(ch, cw) < min_output_px:
         scale = min_output_px / min(ch, cw)
         crop  = cv2.resize(
@@ -98,8 +92,18 @@ def _context_crop_upscale(
             (int(cw * scale), int(ch * scale)),
             interpolation=cv2.INTER_LANCZOS4,
         )
-    return crop
 
+    # Remap bboxes into cropped+scaled coordinate space
+    remapped = [
+        [
+            max(0, int((b[0] - cx1) * scale)),
+            max(0, int((b[1] - cy1) * scale)),
+            max(0, int((b[2] - cx1) * scale)),
+            max(0, int((b[3] - cy1) * scale)),
+        ]
+        for b in bboxes
+    ]
+    return crop, remapped
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt templates — analyze_multiple_views (legacy / anomaly path)
@@ -416,18 +420,19 @@ class TacticalAnalyst:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (74, 222, 128), 1)
 
         # If objects are small relative to the tile, crop to context and upscale
-        all_bboxes = [det["bbox"] for det in detections]
-        annotated  = _context_crop_upscale(annotated, all_bboxes)
+        all_bboxes            = [det["bbox"] for det in detections]
+        annotated, vlm_bboxes = _context_crop_upscale(annotated, all_bboxes)
+        h, w                  = annotated.shape[:2]   # actual dims after crop+upscale
 
         prompt = _build_batch_verify_prompt(
             label_hints    = [d["label"] for d in detections],
-            bboxes         = [d["bbox"]  for d in detections],
+            bboxes         = vlm_bboxes,   # remapped to crop-local coordinates
             criteria       = criteria,
             report_fields  = report_fields,
             original_query = original_query,
-            img_w = w, img_h = h,
+            img_w = w, img_h = h,          # match the actual image the VLM receives
         )
-
+        
         try:
             if self.provider == "openrouter":
                 raw = self._analyze_openrouter(annotated, "tile_batch.jpg", prompt)

@@ -318,6 +318,7 @@ def _annotate_and_save(
     candidate: dict,
     bbox_px:   list | None,
     label:     str,
+    persist: bool = True,
 ) -> str | None:
     """Crop tile, optionally draw bbox, cache JPEG bytes, return URL."""
     img = _load_tile(candidate)
@@ -340,22 +341,23 @@ def _annotate_and_save(
 
     # Save to disk for debugging/analysis
     disk_path = ""
-    try:
-        paths = _state.get("mission_paths")
-        if paths:
-            det_dir = Path(paths.uploads).parent / "detections"
-            det_dir.mkdir(exist_ok=True)
-            safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label[:20])
-            disk_path = str(det_dir / f"{safe_label}_{key[:8]}.jpg")
-            Path(disk_path).write_bytes(img_bytes)
-    except Exception:
-        pass
+    if persist:
+        try:
+            paths = _state.get("mission_paths")
+            if paths:
+                det_dir = Path(paths.uploads).parent / "detections"
+                det_dir.mkdir(exist_ok=True)
+                safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label[:20])
+                disk_path = str(det_dir / f"{safe_label}_{key[:8]}.jpg")
+                Path(disk_path).write_bytes(img_bytes)
+        except Exception:
+            pass
 
     return f"/tile_img/{key}", disk_path
 
 def _tile_to_static_url(candidate: dict) -> str | None:
     """Crop tile (no annotation), cache, return URL."""
-    url, _ = _annotate_and_save(candidate, None, "")
+    url, _ = _annotate_and_save(candidate, None, "", persist=False)
     return url
 
 def _extract_video_frames(

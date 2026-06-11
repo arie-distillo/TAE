@@ -9,6 +9,7 @@ static/
 tools/*mp4
 tools/*jpg
 output/
+backlog/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -48,6 +48,8 @@ from ai.intent import (
     ClassifiedQuery,
 )
 from ai.detection_pipeline import run_detection_pipeline, Track
+from ai.detection_session import commit_tracks, flush_to_map, stream_detect_and_commit
+from ai.query_handlers import handle_object_detection, handle_anomaly_query
 from ui.styles import _CSS, _JS
 
 
@@ -1886,98 +1888,17 @@ def _ingest_background(saved_images: list[str], meta_file: Path, meta: dict):
                     _state["query_color_idx"] += 1
                     # Same parameters as a manual query — CLIP handles
                     # scanning the full index, VLM sees only the top matches.
-                    from ai.detection_pipeline import run_detection_pipeline
                     _classified = intent_clf.classify(m.definition)
-                    _tracks = run_detection_pipeline(
-                        params           = _classified.params,
-                        all_tiles        = db.get_all_tiles(),
-                        original_query   = m.definition,
-                        analyst          = analyst,
-                        # SAM segementation is currently disabled in the pipeline due to SAM center-point prompting on nadir aerial imagery doesn't work reliably. 
-                        # Re-enable when you find a Replicate model that accepts bounding box prompts directly.
-                        # To enable: sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None
-                        sam_segmentor    = None, 
-                        api_key          = getattr(settings, "REPLICATE_API_KEY", ""),
-                        model_version    = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
-                        timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
-                        actual_alt_m     = _state.get("mean_alt_m", 100.0),
-                        color            = color,
+                    _tracks, _err = handle_object_detection(
+                        m.definition, _classified.params, color, analyst, db
                     )
                     mission_mgr.update(mid, scene_context=m.definition)
-                    _state["last_query"] = m.definition
+                    _state["last_query"]       = m.definition
                     _state["detections_ready"] = True
 
-                    # Persist tracks → _state["detections"], rebuild map
-                    _new_det_ids = []
-                    for _track in _tracks:
-                        _det_id   = uuid.uuid4().hex[:10]
-                        _best     = _track.best
-                        _img_urls = []
-                        _det_crops: dict = _state.setdefault("det_crops", {})
-                        for _det in _track.detections:
-                            if id(_det) not in _det_crops:
-                                _u, _disk = _annotate_and_save(
-                                    {"parent_path": _det.parent_path,
-                                    "tile_x": _det.tile_x, "tile_y": _det.tile_y,
-                                    "tile_w": _det.tile_w, "tile_h": _det.tile_h},
-                                    _det.bbox_tile, _best.label
-                                )
-                                _det_crops[id(_det)] = _disk
-                            else:
-                                _u = None
-                            if _u:
-                                _img_urls.append(_u)
-                        _state["detections"][_det_id] = {
-                            "lat":              _track.lat,
-                            "lon":              _track.lon,
-                            "label":            _best.label,
-                            "color":            color,
-                            "confirmed":        True,
-                            "img_urls":         _img_urls,
-                            "is_multiangle":    len(_track.detections) > 1,
-                            "source_count":     len(_track.detections),
-                            "gsd":              "—",
-                            "bbox":             _best.bbox_tile,
-                            "source":           Path(_best.parent_path).name,
-                            "parent_path":      _best.parent_path,
-                            "tile_x":           _best.tile_x,
-                            "tile_y":           _best.tile_y,
-                            "tile_w":           _best.tile_w,
-                            "tile_h":           _best.tile_h,
-                            "gdino_confidence": round(_best.confidence, 4),
-                            "vlm_confidence":   round(getattr(_best, "vlm_confidence", 0.0), 4),
-                            "vlm_reason":       getattr(_best, "vlm_reason", ""),
-                            "vlm_report":       _best.vlm_report,
-                            "track_id":         _track.track_id,
-                            "trajectory": [
-                                {
-                                    "lat":              d.lat,
-                                    "lon":              d.lon,
-                                    "source":           Path(d.parent_path).name,
-                                    "tile_x":           d.tile_x,
-                                    "tile_y":           d.tile_y,
-                                    "tile_w":           d.tile_w,
-                                    "tile_h":           d.tile_h,
-                                    "bbox":             d.bbox_tile,
-                                    "gdino_confidence": round(d.confidence, 4),
-                                    "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
-                                    "vlm_reason":       getattr(d, "vlm_reason", ""),
-                                    "detection_image":  _det_crops.get(id(d), ""),
-                                }
-                                for d in _track.detections
-                            ],
-                            "is_moving":        getattr(_track, "_speed_ms", 0.0) > 1.0,
-                            "speed_ms":         round(getattr(_track, "_speed_ms", 0.0), 2),
-                        }
-                        _new_det_ids.append(_det_id)
-
-                    if _new_det_ids:
-                        _recenter_on_detections(_new_det_ids)
-                        _save_tracks(_tracks, color)  # ← writes tracks.json for PolyLines
-                        _build_map()
-                        _paths = _state.get("mission_paths")
-                        if _paths:
-                            _save_detections(_paths.detections)
+                    if not _err and _tracks:
+                        _new_det_ids = commit_tracks(_tracks, color)
+                        flush_to_map(_new_det_ids, _tracks, color)
 
                     snip = m.definition[:40] + (
                         "..." if len(m.definition) > 40 else ""
@@ -2280,159 +2201,38 @@ def _get_active_mission():
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Anomaly detection query handler
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _handle_anomaly_query(message, params, color, user_bubble, mission):
-    """
-    Handle anomaly_detection intent:
-    CLIP scene retrieval → SAM segments from SegmentStore → CLIP scoring → VLM verify.
-    """
-    try:
-        from ai.anomaly import VocabularyBuilder, score_segments
-        from core.segment_store import SegmentStore
-
-        paths = _state.get("mission_paths")
-        if not paths:
-            return user_bubble, _msg("⚠️  No active mission.", "sys")
-
-        seg_db_path = getattr(paths, "segments_db_path",
-                              getattr(paths, "segments_db", None))
-        if not seg_db_path or not Path(str(seg_db_path)).exists():
-            return (
-                user_bubble,
-                _msg(
-                    "⚠️  No segment index for this mission. "
-                    "Enable 'anomaly_detection' intent before uploading imagery "
-                    "so SAM2 segments are computed at ingest time.",
-                    "sys",
-                ),
-            )
-
-        lib   = _main_get_search_lib()
-        vocab = VocabularyBuilder(lib)
-        store = SegmentStore(str(seg_db_path))
-
-        # Retrieve candidate frames via CLIP, then score their segments
-        clip_query = f"aerial drone nadir overhead view: {message}"
-        q_vec      = lib.encode_text(clip_query)
-        candidates = db.semantic_search(q_vec, limit=20, frames_to_return=8)
-
-        if not candidates:
-            return user_bubble, _msg("No candidate frames found for anomaly search.", "sys")
-
-        scored = score_segments(
-            store       = store,
-            frame_paths = [c["parent_path"] for c in candidates],
-            vocab       = vocab,
-            query       = message,
-            top_n       = 5,
-        )
-
-        if not scored:
-            return (
-                user_bubble,
-                _msg(f"No anomalies detected for: <i>{message}</i>", "sys"),
-            )
-
-        new_det_ids: list[str] = []
-        for seg in scored:
-            # VLM verify
-            tile_img = seg.crop  # numpy array
-            if tile_img is None:
-                continue
-
-            verify = analyst.verify_detection(
-                image          = tile_img,
-                criteria       = params.vlm_verification_criteria,
-                report_fields  = params.vlm_reporting_fields,
-                original_query = message,
-            )
-            if not verify.get("confirmed"):
-                continue
-
-            det_id = uuid.uuid4().hex[:10]
-            # Geo-locate: use segment bbox centre within its parent frame
-            cand_match = next(
-                (c for c in candidates if c["parent_path"] == seg.frame_path), None
-            )
-            lat = cand_match["lat"] if cand_match else 0.0
-            lon = cand_match["lon"] if cand_match else 0.0
-
-            _state["detections"][det_id] = {
-                "lat":             lat,
-                "lon":             lon,
-                "label":           message,
-                "color":           color,
-                "confirmed":       True,
-                "img_urls":        [],
-                "gsd":             "—",
-                "bbox":            seg.bbox,
-                "source":          Path(seg.frame_path).name,
-                "parent_path":     seg.frame_path,
-                "tile_x":          seg.bbox[0] if seg.bbox else 0,
-                "tile_y":          seg.bbox[1] if seg.bbox else 0,
-                "tile_w":          (seg.bbox[2] - seg.bbox[0]) if seg.bbox else 640,
-                "tile_h":          (seg.bbox[3] - seg.bbox[1]) if seg.bbox else 640,
-                "gdino_confidence": 0.0,
-                "vlm_confidence":  round(float(verify.get("confidence", 0.0)), 4),
-                "vlm_reason":      "",
-                "vlm_report":      verify.get("report", {}),
-            }
-            new_det_ids.append(det_id)
-
-        _recenter_on_detections(new_det_ids)
-        _build_map()
-
-        dot = f'<span style="color:{color};font-size:13px">&#9679;</span>'
-        if new_det_ids:
-            reply = (
-                f"{dot} {len(new_det_ids)} anomaly/anomalies confirmed. "
-                f"Query: <i>{message}</i>"
-            )
-        else:
-            reply = (
-                f"{dot} No confirmed anomalies for: <i>{message}</i>. "
-                f"CLIP found candidates but VLM did not confirm."
-            )
-        return user_bubble, _msg_html(reply)
-
-    except Exception as exc:
-        logger.error("Anomaly query failed: %s", exc, exc_info=True)
-        return user_bubble, _msg(f"⚠️  Anomaly detection error: {exc}", "sys")
+# _handle_anomaly_query moved to ai/query_handlers.py as handle_anomaly_query
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes — query
 # ─────────────────────────────────────────────────────────────────────────────
 
 @rt("/query", methods=["POST"])
-async def query(message: str):  # noqa — signature only for illustration
-    from ai.detection_pipeline import run_detection_pipeline
- 
+async def query(message: str):
+
     if not message.strip():
         return ""
- 
+
     user_bubble = _msg(message, "user")
- 
+
     if not _state["ingested"] and db.row_count() == 0:
         return user_bubble, _msg("⚠️  No imagery indexed yet. Upload images first.", "sys")
- 
+
     _state["ingested"]   = True
     _state["last_query"] = message
     mid = _state.get("mission_id")
     if mid:
         mission_mgr.update(mid, scene_context=message)
- 
+
     color = _MARKER_COLORS[_state["query_color_idx"] % len(_MARKER_COLORS)]
     _state["query_color_idx"] += 1
- 
+
     classified = intent_clf.classify(message)
     intent     = classified.params.intent
     logger.info(
         "Intent: %s | conf=%.2f | %s", intent, classified.confidence, classified.reasoning
     )
- 
+
     mission = _state.get("mission") or _get_active_mission()
     if mission and not mission.allows(intent):
         allowed = ", ".join(mission.allowed_intents)
@@ -2444,124 +2244,26 @@ async def query(message: str):  # noqa — signature only for illustration
                 "sys",
             ),
         )
- 
+
     # ── anomaly_detection ─────────────────────────────────────────────────────
     if intent == "anomaly_detection":
-        return _handle_anomaly_query(
-            message, classified.params, color, user_bubble, mission
+        det_ids, reply_text, use_html = handle_anomaly_query(
+            message, classified.params, color, analyst, _main_get_search_lib(), db
         )
- 
-    # ── object_detection — new v2 6-stage pipeline ────────────────────────────
+        return user_bubble, (_msg_html(reply_text) if use_html else _msg(reply_text, "sys"))
+
+    # ── object_detection ─────────────────────────────────────────────────────
     params: ObjectDetectionParams = classified.params
- 
-    all_tiles = db.get_all_tiles()
-    if not all_tiles:
-        return user_bubble, _msg("⚠️  No tiles in index. Upload imagery first.", "sys")
- 
-    actual_alt_m = _state.get("mean_alt_m", 100.0)
- 
-    tracks = run_detection_pipeline(
-        params           = params,
-        all_tiles        = all_tiles,
-        original_query   = message,
-        analyst          = analyst,
-        # SAM segementation is currently disabled in the pipeline due to SAM center-point prompting on nadir aerial imagery doesn't work reliably. 
-        # Re-enable when you find a Replicate model that accepts bounding box prompts directly.
-        # To enable: sam_segmentor = _get_segmentor() if getattr(settings, "REPLICATE_API_KEY", "") else None
-        sam_segmentor    = None, 
-        api_key          = getattr(settings, "REPLICATE_API_KEY", ""),
-        model_version    = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
-        timeout_s        = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
-        actual_alt_m     = actual_alt_m,
-        color            = color,
-    )
- 
-    new_det_ids: list[str] = []
-    det_crops: dict = _state.setdefault("det_crops", {})
-    for track in tracks:
-        det_id = uuid.uuid4().hex[:10]
-        best   = track.best
+    tracks, err = handle_object_detection(message, params, color, analyst, db)
+    if err:
+        return user_bubble, _msg(err, "sys")
 
-        img_urls = []
-        for det in track.detections:
-            if id(det) not in det_crops:
-                tile_candidate = {
-                    "parent_path": det.parent_path,
-                    "tile_x": det.tile_x, "tile_y": det.tile_y,
-                    "tile_w": det.tile_w, "tile_h": det.tile_h,
-                }
-                url, disk_path = _annotate_and_save(tile_candidate, det.bbox_tile, best.label)
-                det_crops[id(det)] = disk_path
-            else:
-                url = None
-            if url:
-                img_urls.append(url)
+    new_det_ids = commit_tracks(tracks, color)
+    flush_to_map(new_det_ids, tracks, color)
 
-        report_summary = ""
-        if best.vlm_report:
-            parts = [f"{k}: {v}" for k, v in best.vlm_report.items() if v]
-            report_summary = " · ".join(parts[:3])
-
-        _state["detections"][det_id] = {
-            "lat":              track.lat,
-            "lon":              track.lon,
-            "label":            best.label,
-            "color":            color,
-            "confirmed":        True,
-            "img_urls":         img_urls,
-            "is_multiangle":    len(track.detections) > 1,
-            "source_count":     len(track.detections),
-            "gsd":              "-",
-            "bbox":             best.bbox_tile,
-            "source":           Path(best.parent_path).name,
-            "parent_path":      best.parent_path,
-            "tile_x":           best.tile_x,
-            "tile_y":           best.tile_y,
-            "tile_w":           best.tile_w,
-            "tile_h":           best.tile_h,
-            "gdino_confidence": round(best.confidence, 4),
-            "vlm_confidence":   round(getattr(best, "vlm_confidence", 0.0), 4),
-            "vlm_reason":       getattr(best, "vlm_reason", ""),
-            "vlm_report":       best.vlm_report,
-            "track_id":         track.track_id,
-            "trajectory": [
-                {
-                    "lat":              d.lat,
-                    "lon":              d.lon,
-                    "source":           Path(d.parent_path).name,
-                    "tile_x":           d.tile_x,
-                    "tile_y":           d.tile_y,
-                    "tile_w":           d.tile_w,
-                    "tile_h":           d.tile_h,
-                    "bbox":             d.bbox_tile,
-                    "gdino_confidence": round(d.confidence, 4),
-                    "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
-                    "vlm_reason":       getattr(d, "vlm_reason", ""),
-                    "detection_image":  det_crops.get(id(d), ""),
-                }
-                for d in track.detections
-            ],
-            "is_moving":        getattr(track, "_speed_ms", 0.0) > 1.0,
-            "speed_ms":         round(getattr(track, "_speed_ms", 0.0), 2),
-        }
-        new_det_ids.append(det_id)
-        n_frames = len(set(d.parent_path for d in track.detections))
-        logger.info(
-            "Track %s | %s | LAT %.6f LON %.6f | %d frame(s)",
-            track.track_id, track.label, track.lat, track.lon, n_frames,
-        )
- 
-    _recenter_on_detections(new_det_ids)
-    _save_tracks(tracks, color)          # ← writes tracks.json for PolyLines
-    _build_map()
- 
-    paths = _state.get("mission_paths")
-    if paths:
-        _save_detections(paths.detections)
- 
     dot_solid  = f'<span style="color:{color};font-size:13px">&#9679;</span>'
     dot_hollow = f'<span style="color:{color};font-size:13px">&#9675;</span>'
- 
+
     if tracks:
         n        = len(tracks)
         n_frames = len(set(d.parent_path for t in tracks for d in t.detections))
@@ -2575,7 +2277,7 @@ async def query(message: str):  # noqa — signature only for illustration
             f"<i>{message}</i>. "
             f"Try a more specific query or check that imagery is uploaded."
         )
- 
+
     return user_bubble, _msg_html(reply)
 
 
@@ -2777,165 +2479,30 @@ def _bg_detect_callback(
 ) -> None:
     """
     Run detection pipeline stages on background (seen) tiles.
-
-    Called by BackgroundDetectionWorker in its daemon thread.  Any confirmed
-    detections are appended to the session accumulator and the tracker is
-    re-run so the map eventually reflects objects on all tiles.
+    Called by BackgroundDetectionWorker in its daemon thread.
     """
-    import time as _time
-    from pathlib import Path as _Path
-
     if not tiles:
+        _novelty_tracker.mark_processed(tiles)
         return
 
     try:
-        from ai.detection_pipeline import (
-            run_detector_stage, cross_tile_nms,
-            sam_refine_stage, vlm_verify_stage,
-            geolocate_stage, track_stage,
+        all_tracks, _ = stream_detect_and_commit(
+            tiles        = tiles,
+            params       = params,
+            definition   = definition,
+            color        = color,
+            actual_alt_m = actual_alt_m,
+            analyst      = analyst,
         )
-
-        logger.info("BG detect: %d tiles", len(tiles))
-
-        # Task 6: use enriched GDINO classes if configured
-        from config import settings as _settings
-        _gdino_classes = params.yolo_classes
-        if getattr(_settings, "GDINO_ENRICHED_QUERY", True):
-            _enriched = getattr(params, "gdino_classes", [])
-            if _enriched:
-                _gdino_classes = _enriched
-
-        raw = run_detector_stage(
-            tiles         = tiles,
-            classes       = _gdino_classes,
-            confidence    = params.yolo_confidence,
-            api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
-            model_version = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
-            timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
-        )
-        if not raw:
-            return
-
-        candidates = cross_tile_nms(raw)
-        candidates = [
-            d for d in candidates
-            if (d.bbox_tile[2] - d.bbox_tile[0]) >= settings.DETECTION_MIN_BBOX_PX
-            and (d.bbox_tile[3] - d.bbox_tile[1]) >= settings.DETECTION_MIN_BBOX_PX
-        ]
-        if not candidates:
-            return
-
-        # Task 1: cap per tile
-        from collections import defaultdict as _dd
-        _max = getattr(settings, "MAX_CANDIDATES_PER_TILE", 8)
-        _buckets: dict = _dd(list)
-        for _d in candidates:
-            _buckets[(_d.parent_path, _d.tile_x, _d.tile_y)].append(_d)
-        _capped = []
-        for _b in _buckets.values():
-            _b.sort(key=lambda _x: _x.confidence, reverse=True)
-            _capped.extend(_b[:_max])
-        candidates = _capped
-
-        candidates = sam_refine_stage(candidates, params.shape_priors, actual_alt_m, None)
-        if not candidates:
-            return
-
-        confirmed = vlm_verify_stage(candidates, params, definition, analyst)
-        if not confirmed:
-            return
-
-        confirmed = geolocate_stage(confirmed)
-        if not confirmed:
-            return
-
-        # Accumulate into the session-wide confirmed list
-        _state.setdefault("stream_confirmed", []).extend(confirmed)
-        logger.info("BG detect: +%d confirmed | session total %d",
-                     len(confirmed), len(_state["stream_confirmed"]))
-
-        # Re-run tracker on full temporal history
-        all_tracks = track_stage(_state["stream_confirmed"], color=color)
-
-        # Update detection state (same logic as foreground path)
-        _state["detections"] = {}
-        _bg_crops: dict = _state.setdefault("det_crops", {})
-        for track in all_tracks:
-            best          = track.best
-            det_id        = f"{track.label}_{track.track_id}"
-            _img_urls_bg  = []
-            for _bd in track.detections:
-                if id(_bd) not in _bg_crops:
-                    try:
-                        _u_bg, _disk_bg = _annotate_and_save(
-                            {"parent_path": _bd.parent_path,
-                             "tile_x": _bd.tile_x, "tile_y": _bd.tile_y,
-                             "tile_w": _bd.tile_w, "tile_h": _bd.tile_h},
-                            _bd.bbox_tile, best.label,
-                        )
-                        _bg_crops[id(_bd)] = _disk_bg
-                    except Exception:
-                        _u_bg = None
-                else:
-                    _u_bg = None
-                if _u_bg:
-                    _img_urls_bg.append(_u_bg)
-            _state["detections"][det_id] = {
-                "lat":              track.lat,
-                "lon":              track.lon,
-                "label":            track.label,
-                "color":            color,
-                "confirmed":        True,
-                "img_urls":         _img_urls_bg,
-                "is_multiangle":    len(track.detections) > 1,
-                "source_count":     len(track.detections),
-                "gsd":              "-",
-                "bbox":             best.bbox_tile,
-                "source":           _Path(best.parent_path).name,
-                "parent_path":      best.parent_path,
-                "tile_x":           best.tile_x,
-                "tile_y":           best.tile_y,
-                "tile_w":           best.tile_w,
-                "tile_h":           best.tile_h,
-                "gdino_confidence": round(best.confidence, 4),
-                "vlm_confidence":   round(getattr(best, "vlm_confidence", 0.0), 4),
-                "vlm_reason":       getattr(best, "vlm_reason", ""),
-                "vlm_report":       best.vlm_report,
-                "track_id":         track.track_id,
-                "trajectory": [
-                    {
-                        "lat":              d.lat,
-                        "lon":              d.lon,
-                        "source":           _Path(d.parent_path).name,
-                        "tile_x":           d.tile_x,
-                        "tile_y":           d.tile_y,
-                        "tile_w":           d.tile_w,
-                        "tile_h":           d.tile_h,
-                        "bbox":             d.bbox_tile,
-                        "gdino_confidence": round(d.confidence, 4),
-                        "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
-                        "vlm_reason":       getattr(d, "vlm_reason", ""),
-                        "detection_image":  _bg_crops.get(id(d), ""),
-                    }
-                    for d in track.detections
-                ],
-                "is_moving":        getattr(track, "_speed_ms", 0.0) > 1.0,
-                "speed_ms":         round(getattr(track, "_speed_ms", 0.0), 2),
-            }
-
-        # Rebuild map for background results
-        _save_tracks(all_tracks, color)
-        _build_map()
-        paths = _state.get("mission_paths")
-        if paths:
-            _save_detections(paths.detections)
-        _state["_stream_updates_pending"] = True
-        logger.info("BG map updated: %d track(s)", len(all_tracks))
+        if all_tracks:
+            # No recenter for background path (pass [] for new_det_ids)
+            flush_to_map([], all_tracks, color)
+            _state["_stream_updates_pending"] = True
+            logger.info("BG map updated: %d track(s)", len(all_tracks))
 
     except Exception as exc:
         logger.error("BG detection error: %s", exc, exc_info=True)
 
-    # Mark background tiles as processed in the novelty tracker
     _novelty_tracker.mark_processed(tiles)
 
 
@@ -3076,171 +2643,54 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
         if not foreground:
             return
 
-        raw = run_detector_stage(
-            tiles         = foreground,
-            classes       = getattr(params, "gdino_classes", []) or params.yolo_classes
-                            if getattr(settings, "GDINO_ENRICHED_QUERY", True) and getattr(params, "gdino_classes", [])
-                            else params.yolo_classes,
-            confidence    = params.yolo_confidence,
-            api_key       = getattr(settings, "REPLICATE_API_KEY", ""),
-            model_version = getattr(settings, "DETECTOR_REPLICATE_MODEL", ""),
-            timeout_s     = getattr(settings, "DETECTOR_TIMEOUT_S", 180),
+        all_tracks, new_det_ids = stream_detect_and_commit(
+            tiles        = foreground,
+            params       = params,
+            definition   = m.definition,
+            color        = color,
+            actual_alt_m = actual_alt_m,
+            analyst      = analyst,
         )
-        if not raw:
+
+        if not all_tracks:
             return
 
-        candidates = cross_tile_nms(raw)
-        candidates = [
-            d for d in candidates
-            if (d.bbox_tile[2] - d.bbox_tile[0]) >= settings.DETECTION_MIN_BBOX_PX
-            and (d.bbox_tile[3] - d.bbox_tile[1]) >= settings.DETECTION_MIN_BBOX_PX
-        ]
-        if not candidates:
-            return
+        # Auto-zoom map to detection area (unconditional — not throttled)
+        _recenter_on_detections(new_det_ids)
 
-        # Task 1: cap per tile by GDINO confidence
-        from collections import defaultdict as _fdd
-        _fmax = getattr(settings, "MAX_CANDIDATES_PER_TILE", 8)
-        _fbuckets: dict = _fdd(list)
-        for _fd in candidates:
-            _fbuckets[(_fd.parent_path, _fd.tile_x, _fd.tile_y)].append(_fd)
-        _fcapped = []
-        for _fb in _fbuckets.values():
-            _fb.sort(key=lambda _x: _x.confidence, reverse=True)
-            _fcapped.extend(_fb[:_fmax])
-        candidates = _fcapped
+        # Queue a chat notification for new multi-frame tracks
+        multi = [t for t in all_tracks if len(t.detections) > 1]
+        if multi:
+            ts_str  = datetime.now().strftime("%H:%M")
+            entries = ", ".join(
+                f"{t.label} ({t.speed_ms:.1f} m/s, {len(t.detections)} frames)"
+                for t in sorted(multi, key=lambda t: -len(t.detections))[:3]
+            )
+            chat_html = (
+                f'<div class="msg sys">'
+                f'<span class="msg-time">{ts_str}</span>'
+                f'<div class="msg-bubble">📡 Streaming detection: {entries}</div>'
+                f'</div>'
+            )
+            _state.setdefault("stream_chat_queue", []).append(chat_html)
 
-        candidates = sam_refine_stage(
-            candidates, params.shape_priors, actual_alt_m, None,
-        )
-        if not candidates:
-            return
-
-        confirmed = vlm_verify_stage(candidates, params, m.definition, analyst)
-        if not confirmed:
-            return
-
-        confirmed = geolocate_stage(confirmed)
+        # ── throttled map rebuild ──────────────────────────────────────────────────
+        now = _time.time()
+        if now - _state.get("_stream_map_ts", 0.0) >= _MAP_INTERVAL_S:
+            _state["_stream_map_ts"] = now
+            _save_tracks(all_tracks, color)
+            _build_map()
+            p2 = _state.get("mission_paths")
+            if p2:
+                _save_detections(p2.detections)
+            _state["_stream_updates_pending"] = True
+            logger.info(
+                "Stream map updated: %d track(s) | %d total detection(s)",
+                len(all_tracks), len(_state["detections"]),
+            )
 
     except Exception as exc:
-        logger.error("Stream detection error (%s): %s", jpeg_path.name, exc)
-        return
-
-    if not confirmed:
-        return
-
-    # ── accumulate across ALL frames of the session ────────────────────────────
-    _state.setdefault("stream_confirmed", []).extend(confirmed)
-    logger.info(
-        "Frame %s: +%d confirmed | session total %d",
-        jpeg_path.name, len(confirmed), len(_state["stream_confirmed"]),
-    )
-
-    # ── re-run tracker on full temporal history ────────────────────────────────
-    all_tracks = track_stage(_state["stream_confirmed"], color=color)
-
-    # ── update detections state — REPLACE not accumulate ──────────────────────
-    _state["detections"] = {}
-    _stream_crops: dict = _state.setdefault("det_crops", {})
-    new_det_ids = []
-    for track in all_tracks:
-        best   = track.best
-        det_id = f"{track.label}_{track.track_id}"
-        _img_urls = []
-        for _sd in track.detections:
-            if id(_sd) not in _stream_crops:
-                try:
-                    _u, _disk = _annotate_and_save(
-                        {"parent_path": _sd.parent_path,
-                         "tile_x": _sd.tile_x, "tile_y": _sd.tile_y,
-                         "tile_w": _sd.tile_w, "tile_h": _sd.tile_h},
-                        _sd.bbox_tile, best.label,
-                    )
-                    _stream_crops[id(_sd)] = _disk
-                except Exception:
-                    _u = None
-            else:
-                _u = None
-            if _u:
-                _img_urls.append(_u)
-        _state["detections"][det_id] = {
-            "lat":              track.lat,
-            "lon":              track.lon,
-            "label":            track.label,
-            "color":            color,
-            "confirmed":        True,
-            "img_urls":         _img_urls,
-            "is_multiangle":    len(track.detections) > 1,
-            "source_count":     len(track.detections),
-            "gsd":              "-",
-            "bbox":             best.bbox_tile,
-            "source":           _Path(best.parent_path).name,
-            "parent_path":      best.parent_path,
-            "tile_x":           best.tile_x,
-            "tile_y":           best.tile_y,
-            "tile_w":           best.tile_w,
-            "tile_h":           best.tile_h,
-            "gdino_confidence": round(best.confidence, 4),
-            "vlm_confidence":   round(getattr(best, "vlm_confidence", 0.0), 4),
-            "vlm_reason":       getattr(best, "vlm_reason", ""),
-            "vlm_report":       best.vlm_report,
-            "track_id":         track.track_id,
-            "trajectory": [
-                {
-                    "lat":              d.lat,
-                    "lon":              d.lon,
-                    "source":           _Path(d.parent_path).name,
-                    "tile_x":           d.tile_x,
-                    "tile_y":           d.tile_y,
-                    "tile_w":           d.tile_w,
-                    "tile_h":           d.tile_h,
-                    "bbox":             d.bbox_tile,
-                    "gdino_confidence": round(d.confidence, 4),
-                    "vlm_confidence":   round(getattr(d, "vlm_confidence", 0.0), 4),
-                    "vlm_reason":       getattr(d, "vlm_reason", ""),
-                    "detection_image":  _stream_crops.get(id(d), ""),
-                }
-                for d in track.detections
-            ],
-            "is_moving":        getattr(track, "_speed_ms", 0.0) > 1.0,
-            "speed_ms":         round(getattr(track, "_speed_ms", 0.0), 2),
-        }
-        new_det_ids.append(det_id)
-
-    # Auto-zoom map to detection area (same as regular query path)
-    _recenter_on_detections(new_det_ids)
-
-    # Queue a chat notification for new multi-frame tracks
-    multi = [t for t in all_tracks if len(t.detections) > 1]
-    if multi:
-        ts_str  = datetime.now().strftime("%H:%M")
-        entries = ", ".join(
-            f"{t.label} ({t.speed_ms:.1f} m/s, {len(t.detections)} frames)"
-            for t in sorted(multi, key=lambda t: -len(t.detections))[:3]
-        )
-        chat_html = (
-            f'<div class="msg sys">'
-            f'<span class="msg-time">{ts_str}</span>'
-            f'<div class="msg-bubble">📡 Streaming detection: {entries}</div>'
-            f'</div>'
-        )
-        _state.setdefault("stream_chat_queue", []).append(chat_html)
-
-    # ── throttled map rebuild ──────────────────────────────────────────────────
-    now = _time.time()
-    if now - _state.get("_stream_map_ts", 0.0) >= _MAP_INTERVAL_S:
-        _state["_stream_map_ts"] = now
-        _save_tracks(all_tracks, color)   # upserts — no prior unlink needed
-        _build_map()
-        p2 = _state.get("mission_paths")
-        if p2:
-            _save_detections(p2.detections)
-        _state["_stream_updates_pending"] = True
-        logger.info(
-            "Stream map updated: %d track(s) | %d total detection(s)",
-            len(all_tracks), len(_state["detections"]),
-        )
-
+        logger.error("Stream frame error (%s): %s", jpeg_path.name, exc, exc_info=True)
 
 def _stream_on_analyse():
     """
@@ -3259,11 +2709,7 @@ def _stream_on_analyse():
     from ai.detection_pipeline import track_stage
     all_tracks = track_stage(confirmed, color=color)
     if all_tracks:
-        _save_tracks(all_tracks, color)
-        _build_map()
-        paths = _state.get("mission_paths")
-        if paths:
-            _save_detections(paths.detections)
+        flush_to_map([], all_tracks, color)
         logger.info(
             "Stream on_analyse flush: %d track(s) | %d detection(s)",
             len(all_tracks), len(_state["detections"]),

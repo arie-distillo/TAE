@@ -324,6 +324,7 @@ app, rt = fast_app(
         Theme.slate.headers(),
         Link(rel="stylesheet",
              href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"),
+        Script(src="https://cdn.jsdelivr.net/npm/hls.js@latest"),
         _CSS,
         _JS,
     ),
@@ -734,7 +735,29 @@ def _video_panel() -> FT:
         has_resize=True,
     )
  
- 
+# ─────────────────────────────────────────────────────────────────────────────
+# Monitor panel  (debug: raw video/stream without detection overlays)
+# ─────────────────────────────────────────────────────────────────────────────
+def _monitor_panel() -> FT:
+    body = [
+        Div(
+            Div("No active video or stream.", cls="video-empty"),
+            id="monitor-panel-inner",
+            cls="video-panel-inner",
+            hx_get="/monitor_panel",
+            hx_trigger="load",
+            hx_swap="innerHTML",
+        ),
+    ]
+    return _panel(
+        panel_id="tae-monitor-panel",
+        icon_cls="fas fa-tv",
+        panel_icon_cls="pi-monitor",
+        title="Monitor",
+        body=body,
+        has_resize=True,
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Frame / detection panel  (replaces old .img-panel + _image_panel_empty)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -816,6 +839,7 @@ def _panel_toolbar() -> FT:
         _pill("Map",    "tae-map-panel",   "map-marked-alt"),
         _pill("Chat",   "tae-chat-panel",  "crosshairs"),
         _pill("Video",  "tae-video-panel", "video"),
+        _pill("Monitor", "tae-monitor-panel", "tv"),
         _pill("Frame",  "tae-frame-panel",  "search-location"),
         _pill("Detect", "tae-det-panel",    "bullseye"),
         cls="nav-pill",
@@ -872,6 +896,7 @@ def _index_page(build_map_fn, state: dict) -> tuple:
             _map_panel(),
             _chat_panel(),
             _video_panel(),
+            _monitor_panel(),
             _frame_panel(hidden=True),
             _det_panel(),
             cls="tae-workspace",
@@ -1544,6 +1569,73 @@ def video_panel_content():
             ),
             cls="timeline-wrap",
         ),
+    )
+
+@rt("/monitor_panel")
+def monitor_panel_content():
+    """HTMX: Monitor panel — raw video/stream, no detection overlays (debug)."""
+    st          = stream_mgr.status()
+    video_files = _state.get("video_files", [])
+    paths       = _state.get("mission_paths")
+
+    # ── Case 1: live stream running and HLS playlist ready ───────────────────
+    if st["running"] and st.get("hls_ready"):
+        ts = int(time.time() * 1000)
+        return (
+            Div(
+                Span("Monitor — HLS Stream",
+                     style="font-family:var(--font-head);font-size:13px;font-weight:700;"
+                           "color:#f87171;letter-spacing:.06em"),
+                cls="video-panel-header",
+            ),
+            Div(
+                NotStr(
+                    f'<video id="monitor-video" controls autoplay muted playsinline'
+                    f' style="width:100%;display:block;max-height:280px;'
+                    f'object-fit:contain;background:#000"></video>'
+                    f'<script>'
+                    f'(function(){{'
+                    f'  var v=document.getElementById("monitor-video");'
+                    f'  var src="/hls/stream.m3u8?_={ts}";'
+                    f'  if(typeof Hls!=="undefined"&&Hls.isSupported()){{'
+                    f'    var h=new Hls({{lowLatencyMode:true}});'
+                    f'    h.loadSource(src); h.attachMedia(v);'
+                    f'  }}else if(v.canPlayType("application/vnd.apple.mpegurl")){{'
+                    f'    v.src=src;'
+                    f'  }}'
+                    f'}})();'
+                    f'</script>'
+                ),
+                cls="video-wrap",
+            ),
+        )
+
+    # ── Case 2: uploaded video file ───────────────────────────────────────────
+    if video_files and paths:
+        vfile = video_files[0]
+        return (
+            Div(
+                Span(f"Monitor — {vfile[:30]}",
+                     style="font-family:var(--font-head);font-size:13px;font-weight:700;"
+                           "color:var(--blue);letter-spacing:.06em"),
+                cls="video-panel-header",
+            ),
+            Div(
+                NotStr(
+                    f'<video id="monitor-video" controls preload="metadata"'
+                    f' src="/serve_video?filename={vfile}"'
+                    f' style="width:100%;display:block;max-height:280px;'
+                    f'object-fit:contain;background:#000">'
+                    f'Your browser does not support HTML5 video.</video>'
+                ),
+                cls="video-wrap",
+            ),
+        )
+
+    # ── Case 3: nothing to show yet ───────────────────────────────────────────
+    return Div(
+        "No active video or stream. Upload a video or start a live stream.",
+        cls="video-empty",
     )
 
 

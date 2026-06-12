@@ -42,9 +42,17 @@ Options
     --fps N          Target processing frame rate (default: native, capped at 30)
     --scale F        Resize factor for CV processing (default 0.5 = half-res).
                      Annotation video is always written at full resolution.
-    --mode {mog2,diff}
+    --mode {mog2,diff,flow}
                      mog2 (default): MOG2 adaptive threshold on warped diff.
                      diff: plain absolute diff on warped frames.
+                     flow: Gunnar-Farneback dense optical flow residual.
+                           Best for oblique shots with 3-D structures (buildings,
+                           cranes): measures actual pixel velocity and subtracts
+                           the camera-motion component, leaving only independently
+                           moving objects. Parallax residuals from a 50 m crane at
+                           80 m AGL, 5 m/s pan ≈ 1.8 px/frame vs a bird at 5 m/s
+                           ≈ 2.9 px/frame — cleanly separable at 2 px threshold.
+                           ~3-5× slower than diff; use --fps 10 to compensate.
     --persist N      Consecutive matched frames before a track is confirmed
                      (default 3).
     --min-object M   Minimum object dimension in metres (default 0.5 — person).
@@ -166,6 +174,31 @@ MAX_ASPECT_RATIO      = 8.0       # reject very elongated blobs (wires, shadows)
 MOG2_HISTORY          = 150       # frames to build background model
 MOG2_VAR_THRESHOLD    = 20.0      # per-pixel variance threshold
 
+# Dense optical flow (Gunnar-Farneback) — used by mode=flow
+#
+# Flow measures actual pixel VELOCITY; subtracting the homography-predicted
+# (camera-motion) component leaves only object-independent motion.
+# Elevated static structures (cranes, buildings) produce parallax residuals
+# of only ≈ v_camera × height/altitude px/frame — much smaller than a moving
+# object's residual — allowing the threshold to separate them cleanly.
+#
+# FLOW_THRESHOLD_PX : minimum residual flow magnitude (pixels/frame at proc
+#   resolution) to classify a pixel as "moving".  Physics check:
+#     50 m crane, 80 m alt, 5 m/s pan, 5.8 cm/px GSD, 30 fps
+#       → parallax residual ≈ (5 × 50/80) / 0.058 / 30 ≈ 1.8 px/frame
+#     Bird at 5 m/s
+#       → flow residual ≈ 5 / 0.058 / 30 ≈ 2.9 px/frame
+#   Default 2.0 px suppresses crane residuals while flagging fast birds.
+#   Lower (1.5) catches slower movers; higher (3.0) reduces false positives
+#   in very windy conditions.  Tune with --flow-threshold.
+FLOW_PYR_SCALE     = 0.5    # pyramid downscale per level
+FLOW_LEVELS        = 3      # pyramid depth — handles up to 2^3 = 8× displacement
+FLOW_WINSIZE       = 9      # averaging window; smaller = less spatial blur on small blobs
+FLOW_ITERATIONS    = 3      # iterations per pyramid level
+FLOW_POLY_N        = 5      # polynomial neighbourhood size (5 or 7)
+FLOW_POLY_SIGMA    = 1.2    # Gaussian s.d. for polynomial smoothing
+DEFAULT_FLOW_THRESHOLD_PX = 2.0   # residual flow threshold (px/frame, proc-res)
+
 # Morphological cleanup kernel (applied to foreground mask)
 MORPH_KSIZE           = 3
 
@@ -177,10 +210,70 @@ RANSAC_THRESH_PX      = 3.0       # RANSAC inlier pixel threshold
 MIN_INLIERS           = 8         # minimum inliers to trust the homography
 
 # Tracker
-DEFAULT_PERSIST       = 3         # consecutive hits to confirm a track
+DEFAULT_PERSIST       = 3         # consecutive hits to confirm a track (base)
 ORPHAN_FRAMES         = 6         # consecutive misses before retiring a track
 MATCH_DIST_M          = 6.0       # real-world match gate radius (metres)
 MATCH_DIST_PX_FALLBACK = 50       # pixel fallback when GSD unavailable
+
+# Dynamic persist — discriminates real movers from parallax residuals.
+#
+# Core idea: real moving objects (birds, vehicles) produce coherent tracks
+# that persist across many frames.  Parallax residuals from fast camera
+# motion are short-lived: they appear at world-fixed depth edges and vanish
+# when the camera sweeps past or slows.  Rather than suppressing entire frames
+# (which would blind the system during fast pans), we raise the confirmation
+# threshold when the scene is moving fast.  A residual lasting 3-5 frames
+# never reaches the higher bar; a bird present for 20+ frames always does.
+#
+# Separately, a minimum-displacement check rejects the remaining residual class:
+# fixed-world-point artefacts that can appear at the SAME pixel location for
+# many frames during a constant-speed pan.  These have near-zero track
+# displacement in the warped frame; a real moving object has nonzero velocity.
+#
+# DEFAULT_MAX_SCENE_SPEED : scene translation (px/frame at proc resolution)
+#   above which extra persist frames are added.  15 px/frame ≈ 0.9 m/s ground
+#   speed at 5.8 cm/px GSD.  Tune with --max-scene-speed.
+#
+# PERSIST_SPEED_STEP : px/frame of excess scene speed that adds 1 extra frame.
+#   Default 5 → +1 frame per extra 5 px/frame.  At 30 px/frame excess (drone
+#   moving ~2.6 m/s above threshold): +6 frames (total persist = 3+6 = 9).
+#
+# MIN_DISPLACEMENT_M : minimum real-world displacement (metres) a track must
+#   show before it can be confirmed.  0 = no check (default).  Set to e.g. 0.5
+#   to require half a metre of movement — filters stationary residuals while
+#   allowing slow vehicles.  Tune with --min-displacement.
+DEFAULT_MAX_SCENE_SPEED  = 15.0   # px/frame → onset of dynamic persist
+PERSIST_SPEED_STEP       = 5.0    # px/frame excess per +1 extra persist frame
+MAX_EXTRA_PERSIST        = 10     # cap on additional frames
+DEFAULT_MIN_DISPLACEMENT = 0.0    # metres; 0 = disabled
+
+# World-fixed point filter — uses DJI telemetry to test whether a track
+# is consistent with a STATIC world location.
+#
+# Algorithm: triangulate the track's best-estimate geo position from its
+# N-frame observation history (mean lat/lon), then re-project that position
+# into the CURRENT camera frame and compare to the actual blob position.
+#
+#   reprojection error ≈ 0    → camera motion explains all pixel motion
+#                            → world-fixed point (parallax residual) → suppress
+#
+#   reprojection error large  → blob moved independently of camera
+#                            → genuine mover → show
+#
+# WF_MIN_FRAMES: minimum hits before the test is reliable.  With N=20
+#   frames at 30 fps (0.67 s), a 5 m/s bird accumulates ~3.3 m of travel,
+#   placing its mean position 1.65 m from its current position → reprojection
+#   error ≈ 28 px (at 5.8 cm/px GSD), well above WF_THRESHOLD_PX.
+#   A static world point has reprojection error ≈ centroid noise ≈ 2–4 px.
+#
+# WF_RETEST_EVERY: re-run the test every N hits after the first classification
+#   so that a previously-static object (parked vehicle) that begins to move
+#   is eventually un-suppressed.
+#
+# WF_THRESHOLD_PX: at processing resolution.  Below → world-fixed → suppress.
+WF_MIN_FRAMES    = 20    # minimum track hits before world-fixed test is valid
+WF_RETEST_EVERY  = 15    # re-test every N additional hits after first result
+WF_THRESHOLD_PX  = 10.0  # reprojection error (px, proc-res) separating static vs. mover
 
 # Annotation colours  (BGR)
 COL_PENDING   = (0, 200, 255)     # yellow  — seen but not yet confirmed
@@ -226,7 +319,168 @@ def sky_boundary_row(gimbal_pitch_deg: float, frame_h_px: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ego-motion compensation
+# Geo-projection helpers  (inline mirror of SpatialEngine from core/spatial.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def frame_corners(
+    lat: float, lon: float,
+    alt_m: float, gimbal_yaw_deg: float,
+    img_w: int, img_h: int,
+    sensor_w_mm: float, focal_mm: float,
+) -> tuple:
+    """
+    Compute the WGS84 ground-plane corners (nw, ne, se, sw) of a camera frame.
+    Mirrors SpatialEngine.compute_footprint() — same math, no class dependency.
+
+    Assumes flat-earth, nadir projection (pitch = -90°); yaw rotates footprint.
+    Consistent with how TAE uses compute_footprint() throughout.
+
+    Returns
+    -------
+    (nw, ne, se, sw) where each is a (lat, lon) tuple.
+    """
+    ground_w = alt_m * sensor_w_mm / focal_mm
+    # Derive sensor height from aspect ratio (assumes square pixels)
+    ground_h = ground_w * (img_h / img_w)
+    hw, hh   = ground_w / 2, ground_h / 2
+
+    # Corners in local NED frame — matches spatial.py sign convention exactly
+    corners_ned = np.array([
+        [ hh, -hw],   # NW: +north, -east
+        [ hh,  hw],   # NE: +north, +east
+        [-hh,  hw],   # SE: -north, +east
+        [-hh, -hw],   # SW: -north, -east
+    ])
+
+    yr = math.radians(gimbal_yaw_deg)
+    R  = np.array([[math.cos(yr), -math.sin(yr)],
+                   [math.sin(yr),  math.cos(yr)]])
+    rot = (R @ corners_ned.T).T
+
+    m_lat = 111320.0
+    m_lon = 111320.0 * math.cos(math.radians(lat))
+    corners = [(lat + n / m_lat, lon + e / m_lon) for n, e in rot]
+    return tuple(corners)   # (nw, ne, se, sw)
+
+
+def pixel_to_geo(
+    cx: float, cy: float,
+    img_w: int, img_h: int,
+    nw: tuple, ne: tuple, se: tuple, sw: tuple,
+) -> tuple:
+    """
+    Bilinear interpolation of a pixel position to WGS84 (lat, lon).
+    Mirrors SpatialEngine._pixel_to_wgs84().
+    """
+    u   = cx / img_w
+    v   = cy / img_h
+    lat = ((1 - v) * ((1 - u) * nw[0] + u * ne[0]) +
+                v   * ((1 - u) * sw[0] + u * se[0]))
+    lon = ((1 - v) * ((1 - u) * nw[1] + u * ne[1]) +
+                v   * ((1 - u) * sw[1] + u * se[1]))
+    return lat, lon
+
+
+def geo_to_pixel(
+    lat_t: float, lon_t: float,
+    img_w: int, img_h: int,
+    nw: tuple, ne: tuple, se: tuple, sw: tuple,
+    max_iter: int = 12,
+    tol:      float = 1e-9,
+) -> tuple:
+    """
+    Inverse bilinear interpolation: WGS84 (lat, lon) → pixel (cx, cy).
+    Uses Newton's method; typically converges to machine precision in 3–4 steps.
+
+    Works for any convex quadrilateral, including the yaw-rotated footprints
+    produced by frame_corners().
+    """
+    u, v = 0.5, 0.5   # initial guess: centre of frame
+
+    for _ in range(max_iter):
+        # Forward mapping at current (u, v)
+        lat_f = ((1 - v) * ((1 - u) * nw[0] + u * ne[0]) +
+                      v   * ((1 - u) * sw[0] + u * se[0]))
+        lon_f = ((1 - v) * ((1 - u) * nw[1] + u * ne[1]) +
+                      v   * ((1 - u) * sw[1] + u * se[1]))
+
+        # Jacobian  ∂(lat, lon) / ∂(u, v)
+        dlat_du = (1 - v) * (ne[0] - nw[0]) + v * (se[0] - sw[0])
+        dlat_dv = (1 - u) * (sw[0] - nw[0]) + u * (se[0] - ne[0])
+        dlon_du = (1 - v) * (ne[1] - nw[1]) + v * (se[1] - sw[1])
+        dlon_dv = (1 - u) * (sw[1] - nw[1]) + u * (se[1] - ne[1])
+
+        dlat = lat_t - lat_f
+        dlon = lon_t - lon_f
+
+        det = dlat_du * dlon_dv - dlat_dv * dlon_du
+        if abs(det) < 1e-20:
+            break
+
+        # Newton step  (Cramer's rule)
+        du = ( dlon_dv * dlat - dlat_dv * dlon) / det
+        dv = (-dlon_du * dlat + dlat_du * dlon) / det
+        u += du
+        v += dv
+
+        if abs(du) < tol and abs(dv) < tol:
+            break
+
+    return u * img_w, v * img_h
+
+
+def world_fixed_reprojection_error(
+    track,
+    footprint: tuple,   # (nw, ne, se, sw) at FULL resolution for current frame
+    full_w: int,
+    full_h: int,
+    scale:  float,
+) -> float:
+    """
+    Estimate the reprojection error for the hypothesis
+    "this track is a static world-fixed point."
+
+    Algorithm
+    ---------
+    1. Mean of all geo observations in track.geo_history
+       → best-estimate world position (lat_est, lon_est) assuming static.
+    2. Project (lat_est, lon_est) into the CURRENT frame using current footprint
+       → predicted pixel (cx_pred, cy_pred) at processing resolution.
+    3. Euclidean distance between predicted and actual current centroid.
+
+    Interpretation
+    --------------
+    Small error (< WF_THRESHOLD_PX):
+        Camera motion fully explains the blob's pixel trajectory.
+        The blob is a world-fixed point (building edge, crane top, terrain).
+        → suppress.
+
+    Large error (≥ WF_THRESHOLD_PX):
+        The blob has moved independently of the camera between its first
+        observed position and its current position.
+        → genuine mover — confirm and show.
+
+    Requires at least WF_MIN_FRAMES geo observations to be meaningful.
+    Returns float('inf') when geo_history is empty.
+    """
+    if not track.geo_history:
+        return float("inf")
+
+    # Triangulate: simple mean of all geolocated observations
+    n       = len(track.geo_history)
+    lat_est = sum(g[0] for g in track.geo_history) / n
+    lon_est = sum(g[1] for g in track.geo_history) / n
+
+    nw, ne, se, sw = footprint
+
+    # Re-project estimated world position into current frame (full resolution)
+    cx_full, cy_full = geo_to_pixel(lat_est, lon_est, full_w, full_h, nw, ne, se, sw)
+
+    # Scale to processing resolution and compare to actual centroid
+    cx_pred = cx_full * scale
+    cy_pred = cy_full * scale
+
+    return math.hypot(track.cx - cx_pred, track.cy - cy_pred)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_homography(
@@ -347,6 +601,91 @@ def foreground_mog2(
     return mask
 
 
+def _expected_flow_from_H(
+    H: np.ndarray,
+    shape: tuple,
+) -> np.ndarray:
+    """
+    Compute the dense optical flow field that a purely camera-induced motion
+    would produce, given homography H (maps prev-frame pixels → curr-frame).
+
+    For every pixel (x, y) in prev, H tells us where it lands in curr.
+    The expected flow vector is simply that landing point minus the origin:
+        flow_expected(x, y) = H(x, y) − (x, y)
+
+    Uses cv2.perspectiveTransform for vectorised computation.
+
+    Returns
+    -------
+    np.ndarray, shape (h, w, 2), dtype float32
+        flow_expected[:,:,0] = dx  (horizontal expected displacement)
+        flow_expected[:,:,1] = dy  (vertical   expected displacement)
+    """
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    pts    = np.stack([xx, yy], axis=-1).astype(np.float32).reshape(-1, 1, 2)
+    mapped = cv2.perspectiveTransform(pts, H).reshape(h, w, 2)
+    expected = np.empty((h, w, 2), dtype=np.float32)
+    expected[:, :, 0] = mapped[:, :, 0] - xx
+    expected[:, :, 1] = mapped[:, :, 1] - yy
+    return expected
+
+
+def foreground_flow(
+    prev_gray:    np.ndarray,
+    curr_gray:    np.ndarray,
+    H:            Optional[np.ndarray],
+    threshold_px: float,
+) -> np.ndarray:
+    """
+    Dense optical flow residual foreground mask.
+
+    Algorithm
+    ---------
+    1. Compute Gunnar-Farneback dense optical flow (prev → curr): measures the
+       true per-pixel motion in the image, unaffected by illumination or
+       auto-exposure differences that fool frame differencing.
+    2. Compute the flow that camera motion alone would produce (from H).
+    3. Subtract: residual = actual_flow − camera_flow.
+    4. Threshold the residual magnitude.
+
+    Why this beats frame-differencing for oblique shots with 3-D structure
+    -----------------------------------------------------------------------
+    Frame differencing lights up the *silhouette* of every elevated structure
+    (building, crane) — the entire edge — creating large blobs because the
+    warp cannot perfectly align texture across depth discontinuities.
+
+    Optical flow residual instead measures *how fast each pixel moves* relative
+    to what the camera motion predicts.  A 50 m crane at 80 m altitude with a
+    5 m/s pan has a parallax residual of ≈ (5 × 50/80) / GSD / fps ≈ 1.8 px/frame.
+    A bird at 5 m/s has ≈ 5 / GSD / fps ≈ 2.9 px/frame.  Threshold at 2.0 px
+    separates them cleanly.  A static ground-plane point has 0 residual.
+
+    Parameters
+    ----------
+    H            : 3×3 homography (prev → curr), or None (no compensation).
+    threshold_px : residual magnitude below which a pixel is background.
+                   Set via --flow-threshold; see FLOW_THRESHOLD_PX for guidance.
+    """
+    flow_actual = cv2.calcOpticalFlowFarneback(
+        prev_gray, curr_gray,
+        flow       = None,
+        pyr_scale  = FLOW_PYR_SCALE,
+        levels     = FLOW_LEVELS,
+        winsize    = FLOW_WINSIZE,
+        iterations = FLOW_ITERATIONS,
+        poly_n     = FLOW_POLY_N,
+        poly_sigma = FLOW_POLY_SIGMA,
+        flags      = 0,
+    )   # (h, w, 2) — (dx, dy) per pixel
+
+    residual = (flow_actual - _expected_flow_from_H(H, prev_gray.shape)
+                if H is not None else flow_actual)
+
+    magnitude = np.sqrt(residual[:, :, 0] ** 2 + residual[:, :, 1] ** 2)
+    return (magnitude > threshold_px).astype(np.uint8) * 255
+
+
 def clean_mask(mask: np.ndarray) -> np.ndarray:
     """Morphological open (remove noise) then close (fill holes)."""
     k = cv2.getStructuringElement(
@@ -366,17 +705,25 @@ def detect_blobs(
     min_area:   float,
     max_area:   float,
     max_aspect: float = MAX_ASPECT_RATIO,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     """
     Extract connected components from the foreground mask and apply
     physics-derived area + aspect-ratio gates.
 
-    Returns a list of blob dicts:
-        {"cx": float, "cy": float, "bbox": (x,y,w,h), "area": float}
+    Returns
+    -------
+    (blobs, n_raw)
+        blobs  : list of {"cx", "cy", "bbox", "area"} dicts that passed all gates
+        n_raw  : total connected components before any gating (excludes background)
+
+    n_raw - len(blobs) = blobs silently discarded by area / aspect gate.
+    A large gap here (e.g. 200 raw, 0 passed) means the area gate is too tight
+    for the objects of interest — lower --min-object or increase --max-object.
     """
     mask = clean_mask(mask)
 
     n, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    n_raw = n - 1   # exclude background label
 
     blobs: list[dict] = []
     for i in range(1, n):   # label 0 is background
@@ -399,7 +746,7 @@ def detect_blobs(
             "area": area,
         })
 
-    return blobs
+    return blobs, n_raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,14 +756,16 @@ def detect_blobs(
 @dataclass
 class MotionTrack:
     """Mutable state for one tracked motion blob."""
-    track_id:   int
-    cx:         float         # centroid x at processing resolution
-    cy:         float         # centroid y at processing resolution
-    bbox:       tuple         # (x, y, w, h) at processing resolution
-    hit_count:  int  = 1
-    miss_count: int  = 0
-    confirmed:  bool = False
-    history:    list = field(default_factory=list)   # list of (cx, cy)
+    track_id:    int
+    cx:          float         # centroid x at processing resolution
+    cy:          float         # centroid y at processing resolution
+    bbox:        tuple         # (x, y, w, h) at processing resolution
+    hit_count:   int  = 1
+    miss_count:  int  = 0
+    confirmed:   bool = False
+    suppressed:  bool = False  # True = classified as world-fixed → hidden from output
+    history:     list = field(default_factory=list)    # (cx, cy) per hit
+    geo_history: list = field(default_factory=list)    # (lat, lon) per hit
 
     def match_and_update(self, blob: dict) -> None:
         self.cx        = blob["cx"]
@@ -456,12 +805,28 @@ class MotionTracker:
 
     def update(
         self,
-        blobs: list[dict],
-        frame_idx: int = 0,
+        blobs:              list[dict],
+        frame_idx:          int   = 0,
+        effective_persist:  int   = 0,    # 0 = use self.persist
+        min_displacement_px: float = 0.0, # 0 = disabled
     ) -> list[MotionTrack]:
         """
         Associate blobs to tracks; return all currently alive tracks.
+
+        effective_persist:
+            Override the base persist threshold for this frame.  Used to raise
+            the confirmation bar during fast camera motion so that short-lived
+            parallax residuals (3–5 frames) never reach the threshold while a
+            real moving object (20+ frames) still does.
+
+        min_displacement_px:
+            Minimum Euclidean distance a track's centroid must have moved from
+            its origin before it can be confirmed.  Filters fixed-world-point
+            residuals that appear at a constant pixel location during a
+            steady-speed camera pan (zero velocity in the warped frame).
+            0.0 = disabled (default; always confirm at persist threshold).
         """
+        persist = effective_persist if effective_persist > 0 else self.persist
         unmatched = list(range(len(blobs)))
 
         for track in self._tracks:
@@ -478,13 +843,23 @@ class MotionTracker:
 
             if best_i is not None:
                 track.match_and_update(blobs[best_i])
-                if track.hit_count >= self.persist:
-                    track.confirmed = True
+                if track.hit_count >= persist:
+                    if min_displacement_px > 0 and len(track.history) >= 2:
+                        # Displacement from first recorded position to current
+                        dx = track.history[-1][0] - track.history[0][0]
+                        dy = track.history[-1][1] - track.history[0][1]
+                        if math.hypot(dx, dy) >= min_displacement_px:
+                            track.confirmed = True
+                        # else: keep accumulating — track will confirm once it moves enough
+                    else:
+                        track.confirmed = True
                 unmatched.remove(best_i)
             else:
                 track.mark_miss()
 
-        # Spawn new tracks for unmatched blobs
+        # Always spawn new tracks for unmatched blobs.
+        # Discrimination of real objects vs. residuals is handled by effective_persist
+        # and min_displacement_px, not by suppressing spawning.
         for bi in unmatched:
             b = blobs[bi]
             t = MotionTrack(
@@ -594,16 +969,19 @@ def interpolate_telem(frames: list, ms: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def annotate(
-    frame:      np.ndarray,
-    tracks:     list[MotionTrack],
-    scale:      float,
-    frame_idx:  int,
-    frame_ms:   int,
-    alt_m:      float,
-    gsd_cm:     float,
-    n_inliers:  int,
-    mode:       str,
-    warp_ok:    bool,
+    frame:             np.ndarray,
+    tracks:            list[MotionTrack],
+    scale:             float,
+    frame_idx:         int,
+    frame_ms:          int,
+    alt_m:             float,
+    gsd_cm:            float,
+    n_inliers:         int,
+    mode:              str,
+    warp_ok:           bool,
+    scene_speed:       float = 0.0,
+    fg_fraction:       float = 0.0,
+    effective_persist: int   = 3,
 ) -> np.ndarray:
     """
     Draw bounding boxes, track trails, and HUD onto a full-resolution copy.
@@ -615,7 +993,11 @@ def annotate(
     trail_n  = 12   # history points to draw per track
 
     for t in tracks:
+        if t.suppressed:
+            continue                  # world-fixed residual — don't draw
+
         x, y, w, h = t.bbox
+
         fx  = int(x * inv_s);  fy  = int(y * inv_s)
         fw  = int(w * inv_s);  fh  = int(h * inv_s)
         col = COL_CONFIRMED if t.confirmed else COL_PENDING
@@ -651,13 +1033,14 @@ def annotate(
                 cv2.line(out, pts[i - 1], pts[i], fade_col, 1)
 
     # ── HUD overlay ──────────────────────────────────────────────────────────
-    warp_str   = f"inliers={n_inliers}" if warp_ok else "WARP FAIL"
-    hud_lines  = [
+    warp_str = f"inliers={n_inliers}  spd={scene_speed:.1f}px" if warp_ok else "WARP FAIL"
+    n_visible    = sum(1 for t in tracks if not t.suppressed and t.confirmed)
+    n_suppressed = sum(1 for t in tracks if t.suppressed)
+    hud_lines = [
         f"frame {frame_idx:05d}   t={frame_ms/1000:.2f}s   mode={mode}",
         f"alt {alt_m:.0f}m   gsd {gsd_cm:.1f} cm/px",
-        f"warp {warp_str}",
-        f"tracks: {len(tracks)} alive   "
-        f"{sum(t.confirmed for t in tracks)} confirmed",
+        f"warp {warp_str}   fg={fg_fraction*100:.1f}%   persist={effective_persist}f",
+        f"tracks: {len(tracks)} alive   {n_visible} movers   {n_suppressed} suppressed",
     ]
     for i, line in enumerate(hud_lines):
         y_pos = 22 + i * 22
@@ -688,8 +1071,14 @@ def build_args() -> argparse.Namespace:
                    help="Target processing frame rate (default: native, ≤30)")
     p.add_argument("--scale", type=float, default=0.5,
                    help="Processing resolution scale factor")
-    p.add_argument("--mode", choices=["mog2", "diff"], default="mog2",
-                   help="Foreground extraction mode")
+    p.add_argument("--mode", choices=["mog2", "diff", "flow"], default="mog2",
+                   help="Foreground extraction mode. "
+                        "mog2: MOG2 on motion-compensated diff (robust to illumination). "
+                        "diff: plain warped-frame absolute diff (fastest). "
+                        "flow: Gunnar-Farneback dense optical flow residual (best for "
+                        "oblique shots with 3-D structures — eliminates parallax residuals "
+                        "from buildings/cranes that flood mog2 and diff with false blobs). "
+                        "Default: %(default)s.")
     p.add_argument("--persist", type=int, default=DEFAULT_PERSIST,
                    help="Frames required to confirm a track")
     p.add_argument("--min-object", type=float, default=DEFAULT_MIN_OBJECT_M,
@@ -713,6 +1102,24 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--max-frames", type=int, default=None,
                    dest="max_frames",
                    help="Stop after N source frames (for quick tests)")
+    p.add_argument("--max-scene-speed", type=float, default=DEFAULT_MAX_SCENE_SPEED,
+                   dest="max_scene_speed",
+                   help="Scene translation (px/frame at proc resolution) above which "
+                        "extra persist frames are added. Default %(default).0f px. "
+                        "Lower = stricter during slower pans.")
+    p.add_argument("--flow-threshold", type=float, default=DEFAULT_FLOW_THRESHOLD_PX,
+                   dest="flow_threshold",
+                   help="Residual optical flow magnitude threshold in px/frame (proc-res) "
+                        "for --mode flow.  Pixels below this are background; above = mover. "
+                        "Physics guide: parallax from a 50 m crane at 80 m AGL, 5 m/s pan "
+                        "≈ 1.8 px/frame; a 5 m/s bird ≈ 2.9 px/frame.  "
+                        "Default %(default).1f px.  Lower (1.5) catches slower movers; "
+                        "higher (3.0) reduces false positives in turbulent conditions.")
+    p.add_argument("--min-displacement", type=float, default=DEFAULT_MIN_DISPLACEMENT,
+                   dest="min_displacement",
+                   help="Minimum real-world displacement (metres) a track must show "
+                        "before it is confirmed. 0 = disabled (default). "
+                        "E.g. 0.5 rejects fixed-world residuals during steady pans.")
     return p.parse_args()
 
 
@@ -804,9 +1211,9 @@ def main() -> None:
 
     # Diagnostics
     warp_fail_count  = 0
-    total_blob_count = 0
+    total_blob_count = 0          # blobs that passed the area/aspect gate
+    total_raw_count  = 0          # all connected components before gating
     seen_track_ids:  set[int] = set()     # IDs that have been confirmed at least once
-
     # ── Main loop ─────────────────────────────────────────────────────────────
     try:
         while True:
@@ -847,15 +1254,18 @@ def main() -> None:
             gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
             # ── Ego-motion compensation ────────────────────────────────────────
-            fg_mask:   Optional[np.ndarray] = None
-            warp_ok    = False
-            n_inliers  = 0
+            fg_mask:    Optional[np.ndarray] = None
+            warp_ok     = False
+            n_inliers   = 0
+            scene_speed = 0.0   # translation magnitude from H (px/frame)
 
             if prev_gray is not None:
                 H, n_inliers = estimate_homography(prev_gray, gray, sky_row=sky_row)
 
                 if H is not None:
                     warp_ok     = True
+                    # Translation component of H gives scene speed in px/frame
+                    scene_speed = math.hypot(float(H[0, 2]), float(H[1, 2]))
                     warped_prev = warp_frame(prev_gray, H, (proc_h, proc_w))
                 else:
                     # Homography failed — fall back to identity (no compensation).
@@ -867,16 +1277,58 @@ def main() -> None:
                 # ── Foreground mask ────────────────────────────────────────────
                 if args.mode == "mog2":
                     fg_mask = foreground_mog2(mog2, warped_prev, gray)
+                elif args.mode == "flow":
+                    # Dense optical flow residual — measures actual pixel velocity,
+                    # not texture difference.  Subtracts the camera-motion component
+                    # (from H) leaving only object-independent motion.  Significantly
+                    # cleaner than diff/mog2 for oblique shots with tall structures.
+                    fg_mask = foreground_flow(
+                        prev_gray, gray,
+                        H            = H if warp_ok else None,
+                        threshold_px = args.flow_threshold,
+                    )
                 else:  # diff
                     fg_mask = foreground_diff(warped_prev, gray)
+
+            # ── Stability gate ─────────────────────────────────────────────────
+            # Measure foreground density and scene speed (kept for HUD display).
+            # Neither suppresses spawning — instead they inform the dynamic-persist
+            # threshold below, which is the actual discrimination mechanism.
+            fg_fraction = 0.0
+            if fg_mask is not None:
+                fg_fraction = float(np.count_nonzero(fg_mask)) / fg_mask.size
+
+            # Dynamic persist: how many consecutive hits to require before confirming.
+            # Base: args.persist.  Bonus: +1 for every PERSIST_SPEED_STEP px/frame
+            # that scene_speed exceeds args.max_scene_speed, capped at MAX_EXTRA_PERSIST.
+            # A parallax residual typically lasts only 2–5 frames; a bird or vehicle
+            # lasts far longer, so raising the bar during fast motion discriminates them.
+            speed_excess    = max(0.0, scene_speed - args.max_scene_speed)
+            extra_persist   = min(int(speed_excess / PERSIST_SPEED_STEP), MAX_EXTRA_PERSIST)
+            effective_persist = args.persist + extra_persist
+
+            # Minimum displacement in pixels (physics-derived from GSD).
+            # Rejects fixed-world-point residuals that appear at the same pixel
+            # location for many frames during a constant-speed pan (velocity ≈ 0
+            # in the warped frame).  0 = disabled when args.min_displacement == 0.
+            min_disp_px = (
+                args.min_displacement / gsd_m
+                if args.min_displacement > 0 and gsd_m > 0
+                else 0.0
+            )
 
             # ── Blob detection + tracking ─────────────────────────────────────
             tracks: list[MotionTrack] = []
 
             if fg_mask is not None:
-                blobs = detect_blobs(fg_mask, min_area, max_area)
+                blobs, n_raw = detect_blobs(fg_mask, min_area, max_area)
                 total_blob_count += len(blobs)
-                tracks = tracker.update(blobs, frame_idx)
+                total_raw_count  += n_raw
+                tracks = tracker.update(
+                    blobs, frame_idx,
+                    effective_persist=effective_persist,
+                    min_displacement_px=min_disp_px,
+                )
 
                 # Log first confirmation of each track
                 for t in tracker.confirmed:
@@ -905,11 +1357,84 @@ def main() -> None:
                 # First frame — no foreground, still advance tracker state
                 tracker.update([], frame_idx)
 
+            # ── Geo-history population + world-fixed filter ───────────────────
+            # Requires DJI telemetry.  Skipped silently when not available.
+            #
+            # For each track matched this frame: geolocate its current centroid
+            # and append (lat, lon) to track.geo_history.  Once WF_MIN_FRAMES
+            # observations have accumulated, project the mean geo position back
+            # into the current camera frame and measure the reprojection error.
+            # Low error → blob is a world-fixed residual → suppress it.
+            # High error → blob is moving independently → keep it.
+
+            # 1. Compute current frame footprint (full-res, for geo-projection)
+            current_footprint: Optional[tuple] = None
+            if has_telem and telem is not None and telem.alt_m > 0:
+                try:
+                    gimbal_yaw = getattr(telem, "gimbal_yaw", 0.0)
+                    current_footprint = frame_corners(
+                        lat=telem.lat, lon=telem.lon,
+                        alt_m=telem.alt_m,
+                        gimbal_yaw_deg=gimbal_yaw,
+                        img_w=full_w, img_h=full_h,
+                        sensor_w_mm=args.sensor_w, focal_mm=args.focal,
+                    )
+                except Exception:
+                    current_footprint = None
+
+            if current_footprint is not None:
+                nw_c, ne_c, se_c, sw_c = current_footprint
+
+                # 2. Append geo observation for every track hit this frame
+                for track in tracks:
+                    if len(track.geo_history) < track.hit_count:
+                        # Track was matched this frame — geolocate centroid
+                        cx_full = track.cx / args.scale
+                        cy_full = track.cy / args.scale
+                        lat_b, lon_b = pixel_to_geo(
+                            cx_full, cy_full,
+                            full_w, full_h,
+                            nw_c, ne_c, se_c, sw_c,
+                        )
+                        track.geo_history.append((lat_b, lon_b))
+
+                # 3. World-fixed test: run at WF_MIN_FRAMES, then every WF_RETEST_EVERY
+                for track in tracks:
+                    n_geo = len(track.geo_history)
+                    if n_geo < WF_MIN_FRAMES:
+                        continue
+                    if not (n_geo == WF_MIN_FRAMES or
+                            (n_geo - WF_MIN_FRAMES) % WF_RETEST_EVERY == 0):
+                        continue
+
+                    reproj_err = world_fixed_reprojection_error(
+                        track, current_footprint, full_w, full_h, args.scale
+                    )
+                    was_suppressed = track.suppressed
+                    track.suppressed = (reproj_err < WF_THRESHOLD_PX)
+
+                    if track.suppressed and not was_suppressed:
+                        log.debug(
+                            "  ○ Track T%d suppressed (world-fixed) "
+                            "reproj=%.1fpx  hits=%d",
+                            track.track_id, reproj_err, track.hit_count,
+                        )
+                    elif was_suppressed and not track.suppressed:
+                        log.info(
+                            "  ↑ Track T%d un-suppressed (now moving) "
+                            "reproj=%.1fpx  hits=%d",
+                            track.track_id, reproj_err, track.hit_count,
+                        )
+
+            # Count suppressed tracks for summary
+            suppressed_this_frame = sum(1 for t in tracks if t.suppressed)
+
             # ── Annotate + write ──────────────────────────────────────────────
             annotated = annotate(
                 frame, tracks, args.scale,
                 frame_idx, frame_ms, alt_m, gsd_cm,
                 n_inliers, args.mode, warp_ok,
+                scene_speed, fg_fraction, effective_persist,
             )
             writer.write(annotated)
 
@@ -930,10 +1455,15 @@ def main() -> None:
             if proc_count % 100 == 0:
                 elapsed = time.time() - t_start
                 pct     = 100.0 * frame_idx / max(total_frames, 1)
+                gate_pct = (
+                    100.0 * (total_raw_count - total_blob_count) / max(total_raw_count, 1)
+                )
                 log.info(
                     "  [%5.1f%%]  frame %d  elapsed %.0fs  "
-                    "confirmed tracks so far: %d",
-                    pct, frame_idx, elapsed, len(seen_track_ids),
+                    "blobs raw/gated: %d/%d (%.0f%% filtered)  confirmed tracks: %d",
+                    pct, frame_idx, elapsed,
+                    total_raw_count, total_blob_count, gate_pct,
+                    len(seen_track_ids),
                 )
 
     finally:
@@ -945,23 +1475,64 @@ def main() -> None:
     # ─────────────────────────────────────────────────────────────────────────
     # Summary
     # ─────────────────────────────────────────────────────────────────────────
-    elapsed = time.time() - t_start
+    elapsed  = time.time() - t_start
     warp_pct = 100.0 * warp_fail_count / max(proc_count - 1, 1)
+    gate_filtered     = total_raw_count - total_blob_count
+    gate_filtered_pct = 100.0 * gate_filtered / max(total_raw_count, 1)
+
+    all_conf = tracker.all_confirmed_ever
+    n_suppressed_ever = sum(1 for t in all_conf if t.suppressed)
+    n_visible_movers  = sum(1 for t in all_conf if not t.suppressed)
 
     log.info("━" * 60)
     log.info("Finished in %.1f s", elapsed)
     log.info("Source frames read : %d  (processed: %d)", frame_idx, proc_count)
     log.info("Warp failures      : %d / %d frames  (%.1f%%)",
              warp_fail_count, max(proc_count - 1, 1), warp_pct)
-    log.info("Total blobs        : %d", total_blob_count)
+    log.info("Blobs raw          : %d  (before area/aspect gate)", total_raw_count)
+    log.info("Blobs passed gate  : %d  (%.0f%% filtered out)",
+             total_blob_count, gate_filtered_pct)
     log.info("Confirmed tracks   : %d", len(seen_track_ids))
+    if has_telem:
+        log.info("  World-fixed (suppressed) : %d", n_suppressed_ever)
+        log.info("  Genuine movers (visible) : %d", n_visible_movers)
+    else:
+        log.info("  (world-fixed filter disabled — no telemetry)")
 
-    # Per-track table
-    all_conf = tracker.all_confirmed_ever
-    if all_conf:
+    # Diagnose common "nothing detected" situations explicitly
+    if n_visible_movers == 0 and has_telem:
+        if len(seen_track_ids) > 0:
+            log.warning(
+                "  ⚠ %d confirmed tracks, but all classified as world-fixed. "
+                "If genuine movers are expected: lower --wf-threshold (currently %.0f px) "
+                "or ensure telemetry alt/yaw are correct.",
+                len(seen_track_ids), WF_THRESHOLD_PX,
+            )
+        elif total_raw_count == 0:
+            log.warning("  ⚠ No blobs reached detect_blobs() at all — "
+                        "check warp failures or try --mode diff")
+        elif gate_filtered_pct > 90:
+            log.warning(
+                "  ⚠ %.0f%% of blobs were filtered by the area gate "
+                "(%d raw → %d passed). Try: --min-object %.2f",
+                gate_filtered_pct, total_raw_count, total_blob_count,
+                args.min_object / 2,
+            )
+        else:
+            log.warning("  ⚠ Blobs detected but no track reached persist=%d. "
+                        "Try --persist 2 or check for noisy warp.",
+                        args.persist)
+
+    if args.save_crops and n_visible_movers == 0:
+        log.warning("  ⚠ --save-crops was set but no visible-mover crops were saved.")
+
+    # Per-track table (confirmed movers only)
+    visible_movers = [t for t in all_conf if not t.suppressed]
+    if visible_movers:
         log.info("")
+        log.info("  Genuine movers (reprojection error ≥ %.0f px):", WF_THRESHOLD_PX)
         log.info("  %-6s  %-8s  %-8s", "Track", "Hits", "Misses")
-        for t in sorted(all_conf, key=lambda x: x.track_id):
+        for t in sorted(visible_movers, key=lambda x: x.track_id):
             log.info("  T%-5d  %-8d  %-8d", t.track_id, t.hit_count, t.miss_count)
 
     log.info("")
@@ -969,28 +1540,36 @@ def main() -> None:
 
     # Summary JSON
     summary = {
-        "video":            str(args.video),
-        "mode":             args.mode,
-        "scale":            args.scale,
-        "persist_frames":   args.persist,
-        "sensor_w_mm":      args.sensor_w,
-        "focal_mm":         args.focal,
-        "min_object_m":     args.min_object,
-        "max_object_m":     args.max_object,
-        "src_fps":          src_fps,
-        "effective_fps":    eff_fps,
-        "has_telemetry":    has_telem,
-        "frames_total":     frame_idx,
-        "frames_processed": proc_count,
-        "warp_failures":    warp_fail_count,
-        "warp_failure_pct": round(warp_pct, 1),
-        "total_blobs":      total_blob_count,
-        "confirmed_tracks": len(seen_track_ids),
+        "video":                str(args.video),
+        "mode":                 args.mode,
+        "scale":                args.scale,
+        "persist_frames":       args.persist,
+        "wf_min_frames":        WF_MIN_FRAMES,
+        "wf_threshold_px":      WF_THRESHOLD_PX,
+        "sensor_w_mm":          args.sensor_w,
+        "focal_mm":             args.focal,
+        "min_object_m":         args.min_object,
+        "max_object_m":         args.max_object,
+        "src_fps":              src_fps,
+        "effective_fps":        eff_fps,
+        "has_telemetry":        has_telem,
+        "frames_total":         frame_idx,
+        "frames_processed":     proc_count,
+        "warp_failures":        warp_fail_count,
+        "warp_failure_pct":     round(warp_pct, 1),
+        "blobs_raw":            total_raw_count,
+        "blobs_passed_gate":    total_blob_count,
+        "blobs_gate_filtered":  gate_filtered,
+        "blobs_gate_filtered_pct": round(gate_filtered_pct, 1),
+        "confirmed_tracks":     len(seen_track_ids),
+        "suppressed_tracks":    n_suppressed_ever,
+        "visible_movers":       n_visible_movers,
         "track_details": [
             {
-                "id":     t.track_id,
-                "hits":   t.hit_count,
-                "misses": t.miss_count,
+                "id":         t.track_id,
+                "hits":       t.hit_count,
+                "misses":     t.miss_count,
+                "suppressed": t.suppressed,
             }
             for t in sorted(all_conf, key=lambda x: x.track_id)
         ],

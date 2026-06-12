@@ -70,6 +70,6 @@
 
 
 ### Geospatial
-- [x] Need to have retry on detector (Grounding DINO via Replicate) calls - fix for _run_detector_on_tile in ai/detection_pipeline.py  (see Claude)
+- [v] Need to have retry on detector (Grounding DINO via Replicate) calls - fix for _run_detector_on_tile in ai/detection_pipeline.py  (see Claude)
 
 

@@ -339,8 +339,11 @@ html, body {
 .send-btn:hover { background: #89b4fa; }
  
 /* ── Video panel ──────────────────────────────────────────────────────────── */
-#tae-video-panel { top: 20px; right: 20px; width: 480px; height: 300px; }
- 
+# AFTER
+#tae-video-panel   { top: 20px; right: 20px; width: 480px; height: 300px; }
+#tae-monitor-panel { top: 340px; left: 700px; width: 480px; height: 320px; display: none; }
+.pi-monitor { background: linear-gradient(135deg, #7c3aed, #a855f7); }
+              
 .video-placeholder {
   display: flex;
   flex-direction: column;

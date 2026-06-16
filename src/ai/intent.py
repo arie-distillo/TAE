@@ -115,11 +115,19 @@ class ObjectDetectionParams(BaseModel):
     # "find all animals" → ["cow", "horse", "sheep", "goat", "dog", "deer", "bird"]
     # "find red vehicle" → ["car", "truck", "van", "pickup"]
     # "find people"      → ["person", "human", "pedestrian"]
-    yolo_classes: list[str] = Field(
+    object_classes: list[str] = Field(
         description=(
             "Specific, visually grounded YOLO-World class names derived from the query. "
             "Use concrete visual categories, not abstract collective nouns. "
             "Maximum 8 terms."
+        )
+    )
+    canonical_label: str = Field(
+        description=(
+            "Single generic noun encompassing all object_classes — used for cross-frame tracking. "
+            "Must group all object_classes under one term so detections of the same physical object "
+            "are linked regardless of which specific subtype the detector assigns. "
+            "Examples: 'vehicles'→'vehicle', 'cow,horse,sheep'→'animal', 'person'→'person'."
         )
     )
 
@@ -127,7 +135,7 @@ class ObjectDetectionParams(BaseModel):
     clip_query: str = Field(
         description=(
             "Semantic search string for CLIP tile retrieval. "
-            "May be broader or more descriptive than yolo_classes. "
+            "May be broader or more descriptive than object_classes. "
             "Aerial context prefix will be added automatically."
         )
     )
@@ -180,7 +188,7 @@ class ObjectDetectionParams(BaseModel):
     )
 
     @property
-    def yolo_confidence(self) -> float:
+    def object_confidence(self) -> float:
         return settings.DETECTION_CONFIDENCE[self.expected_difficulty]
 
 
@@ -248,7 +256,8 @@ class _FlatIntent(BaseModel):
     reasoning:          str
 
     # object_detection fields
-    yolo_classes:               list[str] = Field(default_factory=list)
+    object_classes:               list[str] = Field(default_factory=list)
+    canonical_label:            str       = ""
     clip_query:                 str       = ""
     vlm_verification_criteria:  str       = ""
     vlm_reporting_fields:       list[str] = Field(default_factory=list)
@@ -311,6 +320,16 @@ object_classes
   "people" → ["person"]
   "livestock" → ["cow", "horse", "sheep", "goat", "pig"]
   Maximum 8 specific terms.
+
+canonical_label
+  A single generic noun that covers ALL object_classes — used for cross-frame tracking.
+  All detections in a query share this label so the tracker links them regardless
+  of which specific subtype the detector assigns to any given frame.
+  "find vehicles" → object_classes=["car","truck","van","suv",...], canonical_label="vehicle"
+  "find livestock" → object_classes=["cow","horse","sheep","goat"], canonical_label="animal"
+  "find people"    → object_classes=["person"],                     canonical_label="person"
+  "find buildings" → object_classes=["house","building","shed"],    canonical_label="building"
+  Use the singular form. Never use a object_classes value directly unless it is already the generic term.
 
 clip_query
   Broader semantic description for CLIP retrieval. Can be more descriptive.
@@ -386,7 +405,8 @@ def _classify_keywords(user_query: str) -> ClassifiedQuery:
 
     # Default: object_detection
     params = ObjectDetectionParams(
-        yolo_classes              = [user_query],
+        object_classes              = [user_query],
+        canonical_label           = user_query,   # keyword fallback: query IS the canonical label
         clip_query                = user_query,
         vlm_verification_criteria = f"Confirm the target matches: {user_query}",
         vlm_reporting_fields      = ["description", "count", "location_in_frame"],
@@ -476,7 +496,8 @@ class IntentClassifier:
                 diff = "medium"
 
             params = ObjectDetectionParams(
-                yolo_classes              = flat.yolo_classes or [flat.clip_query],
+                object_classes              = flat.object_classes or [flat.clip_query],
+                canonical_label           = flat.canonical_label or (flat.object_classes[0] if flat.object_classes else "object"),
                 clip_query                = flat.clip_query,
                 vlm_verification_criteria = flat.vlm_verification_criteria,
                 vlm_reporting_fields      = flat.vlm_reporting_fields or ["description"],

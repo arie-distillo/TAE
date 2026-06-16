@@ -90,6 +90,8 @@ class Detection:
     detection_image: str    = ""        # abs path to crop saved under DATA_DIR/detections/
     vlm_confidence:  float  = 0.0       # 0–1 score from VLM (confirmed detections only)
     vlm_reason:      str    = ""        # brief confirmation rationale (confirmed only)
+    canonical_label: str   = ""   # intent-level generic label; used by track_stage for grouping
+
 
 
 @dataclass
@@ -558,6 +560,7 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
         for det, result in zip(tile_dets, results):
             if result.get("confirmed"):
                 det.confirmed = True
+                det.canonical_label = getattr(params, "canonical_label", "") or det.label
                 det.vlm_report = result.get("report", {})
                 det.vlm_confidence = float(result.get("confidence", 0.0))
                 det.vlm_reason     = result.get("reason", "")
@@ -787,11 +790,12 @@ def track_stage(confirmed: list, color: str = "#4ade80") -> list:
     # Attach timestamps; detections from the same frame share the same ts
     for det in confirmed:
         det._ts_ms = _frame_ts_ms(det)
- 
+
     by_label: dict[str, list] = defaultdict(list)
     for det in confirmed:
-        by_label[det.label.lower()].append(det)
- 
+        group_key = (det.canonical_label or det.label).lower()
+        by_label[group_key].append(det)
+
     all_tracks: list = []
  
     for label, dets in by_label.items():
@@ -886,7 +890,7 @@ def run_detection_pipeline(
     logger.info(
         "Detection pipeline | query=%r | classes=%s | confidence=%.3f | "
         "tiles=%d | alt=%.0fm",
-        original_query, params.yolo_classes, params.yolo_confidence,
+        original_query, params.object_classes, params.object_confidence,
         len(all_tiles), actual_alt_m,
     )
 
@@ -894,7 +898,7 @@ def run_detection_pipeline(
         logger.warning("No tiles — aborted")
         return []
 
-    _cstats.start_run(original_query, params.yolo_confidence)
+    _cstats.start_run(original_query, params.object_confidence)
 
     # CLIP pre-filter (easy/medium only)
     # Threshold lowered from 20→4 so this fires during per-frame streaming
@@ -904,7 +908,7 @@ def run_detection_pipeline(
         try:
             from core.services import get_search_lib
             lib   = get_search_lib()
-            q_str = "aerial drone nadir overhead view: " + " ".join(params.yolo_classes)
+            q_str = "aerial drone nadir overhead view: " + " ".join(params.object_classes)
             q_vec = np.array(lib.encode_text(q_str), dtype=np.float32)
             q_vec /= np.linalg.norm(q_vec) + 1e-9
             vecs   = np.array([t["vector"] for t in all_tiles], dtype=np.float32)
@@ -927,8 +931,8 @@ def run_detection_pipeline(
     # Stage 1
     raw = run_detector_stage(
         tiles=tiles,
-        classes=params.yolo_classes,
-        confidence=params.yolo_confidence,
+        classes=params.object_classes,
+        confidence=params.object_confidence,
         api_key=api_key,
         model_version=model_version,
         timeout_s=timeout_s,

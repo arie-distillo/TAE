@@ -2730,7 +2730,7 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
         logger.info(
             "Stream detect: %s | %d fg + %d bg tiles | %s",
             jpeg_path.name, len(foreground), len(background),
-            params.yolo_classes,
+            params.object_classes,
         )
 
         # Queue background tiles for deferred processing

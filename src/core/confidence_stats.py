@@ -10,7 +10,7 @@ writes them to DATA_DIR/<mission>/detections/ as:
 Usage (called from run_detection_pipeline in detection_pipeline.py):
 
     from core import confidence_stats as _cstats
-    _cstats.start_run(original_query, params.yolo_confidence)
+    _cstats.start_run(original_query, params.object_confidence)
     ...
     _cstats.record_gdino_detections(raw_dets)
     _cstats.record_nms_result(raw_dets, nms_kept_dets)

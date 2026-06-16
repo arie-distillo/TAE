@@ -305,18 +305,18 @@ def stream_detect_and_commit(
     kw = pipeline_call_kwargs(color, actual_alt_m)
 
     # GDINO enriched classes when Tasks 5/6 are active
-    gdino_classes = params.yolo_classes
+    gdino_classes = params.object_classes
     if getattr(settings, "GDINO_ENRICHED_QUERY", True):
         enriched = getattr(params, "gdino_classes", [])
         if enriched:
             gdino_classes = enriched
 
-    _cstats.open_stream_run(definition, params.yolo_confidence)
+    _cstats.open_stream_run(definition, params.object_confidence)
 
     raw = run_detector_stage(
         tiles         = tiles,
         classes       = gdino_classes,
-        confidence    = params.yolo_confidence,
+        confidence    = params.object_confidence,
         api_key       = kw["api_key"],
         model_version = kw["model_version"],
         timeout_s     = kw["timeout_s"],

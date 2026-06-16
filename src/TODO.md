@@ -12,7 +12,7 @@
 - [v] Missions
   - [v] mission CRUD in UI
   - [v] databases / directories per mission
-- [] The Intent model extands a user query to addional terms (e.g `car` into [`vehicle`, `car`, `truck`, `SUV`). As a result, G-Dino may detect same object on different frames once as a `car` and once as a `SUV` which hurts tracking
+- [v] The Intent model extands a user query to addional terms. As a result, G-Dino may detect same object on different frames once as a `car` and once as a `SUV` which hurts tracking
 
 ### Refactoring
 - [-] Split into two services - on-edge server and cloud server
@@ -33,6 +33,7 @@
   - [v] anomaly detection intent
   - [] moving object intent
 - [v] persistent queries
+- [] VLM should confirm tracks, to keep "same" object instance as a track, and break a candiadet track of different object instances
   
 ### Python libraries to manipulate / seacrh geo object
 - [>] see Gemini chat
@@ -64,9 +65,10 @@
 
 ### Cleanup
 - [] code duplication in `_bg_detect_callback` `_stream_on_frame_telem` and `run_detection_pipeline`
-- [] replace all `yolo_` with `detector_`
+- [v] replace all `yolo_` with `object_`
 - [] migrate the map renderer to read from detections.json (as you suggested) so we can reitire tracks.json
 - [] two different usages of term   `segment` - (1) image segmentation with SAM2, and (2) video segmentations. Confusing
+
 
 
 ### Geospatial

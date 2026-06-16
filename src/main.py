@@ -68,6 +68,14 @@ for _wf in ("watchfiles", "watchfiles.main"):
     logging.getLogger(_wf).setLevel(logging.WARNING)
 logger = logging.getLogger("TAE-UI")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+class _SuppressPollingRoutes(logging.Filter):
+    _SUPPRESS = ("/stream/updates",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(p in msg for p in self._SUPPRESS)
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressPollingRoutes())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global singletons

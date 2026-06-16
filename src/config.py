@@ -66,9 +66,18 @@ class Settings(BaseSettings):
     # ── AI — Object detection ───────────────────────────────────────────────
     DETECTION_MIN_BBOX_PX: int = 8   # minimum detection bounding box side length in pixels
     DETECTION_CONFIDENCE: dict[str, float] = {
-        "easy":   0.03,   # large, visually distinctive objects (buildings, vehicles)
-        "medium": 0.03,   # medium objects with moderate camouflage (cows in grass)
+        "easy":   0.30,   # large, visually distinctive objects (buildings, vehicles)
+        "medium": 0.20,   # medium objects with moderate camouflage (cows in grass)
         "hard":   0.03,   # small or highly camouflaged (people, stones, prone animals)
+    }
+    # VLM calibration priors, derived from the DETECTION_CONFIDENCE thresholds for each difficulty.
+    # caution_confirm_below: if gdino_conf < this, VLM should be extra sceptical before confirming.
+    # caution_reject_above:  if gdino_conf > this, VLM should require clear counter-evidence before rejecting.
+    # Tune these relative to DETECTION_CONFIDENCE: confirm-below ≈ 1.5× threshold, reject-above ≈ 2× threshold.
+    VLM_CONFIRMATION_GUIDANCE: dict[str, dict] = {
+        "easy":   {"caution_confirm_below": 0.30, "caution_reject_above": 0.50},
+        "medium": {"caution_confirm_below": 0.20, "caution_reject_above": 0.40},
+        "hard":   {"caution_confirm_below": 0.05, "caution_reject_above": 0.08},
     }
 
 

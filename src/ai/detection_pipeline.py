@@ -537,17 +537,22 @@ def vlm_verify_stage(candidates, params, original_query, analyst):
             return []
 
         batch_input = [
-            {"label": d.label, "bbox": d.bbox_tile}
+            {"label": d.label, "bbox": d.bbox_tile, "confidence": d.confidence}
             for d in tile_dets
         ]
+        _guidance = getattr(settings, "VLM_CONFIRMATION_GUIDANCE", {}).get(
+            getattr(params, "expected_difficulty", "medium"), {}
+        )
         results = analyst.verify_detections_batch(
-            tile_img       = tile_img,
-            detections     = batch_input,
-            criteria       = params.vlm_verification_criteria,
-            report_fields  = params.vlm_reporting_fields,
-            original_query = original_query,
-            colour_hint    = params.colour_hint,
-            size_qualifier = params.size_qualifier,
+            tile_img              = tile_img,
+            detections            = batch_input,
+            criteria              = params.vlm_verification_criteria,
+            report_fields         = params.vlm_reporting_fields,
+            original_query        = original_query,
+            colour_hint           = params.colour_hint,
+            size_qualifier        = params.size_qualifier,
+            caution_confirm_below = _guidance.get("caution_confirm_below"),
+            caution_reject_above  = _guidance.get("caution_reject_above"),
         )
         confirmed = []
         for det, result in zip(tile_dets, results):

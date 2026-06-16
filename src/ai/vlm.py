@@ -200,23 +200,44 @@ def _build_verify_prompt(
     )
 
 def _build_batch_verify_prompt(
-    label_hints:    list[str],    # ["house", "road", "building", ...]
-    bboxes:         list[list],   # [[x1,y1,x2,y2], ...]  tile-local px
-    criteria:       str,
-    report_fields:  list[str],
-    original_query: str,
-    img_w: int, img_h: int,
+    label_hints:           list[str],
+    bboxes:                list[list],
+    criteria:              str,
+    report_fields:         list[str],
+    original_query:        str,
+    img_w: int, img_h:     int,
+    confidences:           list[float] | None = None,
+    caution_confirm_below: float | None = None,
+    caution_reject_above:  float | None = None,
 ) -> str:
     candidates_desc = "\n".join(
         f"  {i}: label='{label_hints[i]}' bbox={bboxes[i]}"
+        + (f" gdino_conf={confidences[i]:.2f}" if confidences else "")
         for i in range(len(bboxes))
     )
     field_schema = ", ".join(f'"{f}"' for f in report_fields)
+
+    # Build calibration block only when both thresholds and confidence scores are available
+    if confidences and caution_confirm_below is not None and caution_reject_above is not None:
+        conf_guidance = (
+            f"\nDETECTOR CONFIDENCE GUIDANCE\n"
+            f"Each candidate carries gdino_conf: the score from Grounding DINO, a specialized object detector.\n"
+            f"- gdino_conf < {caution_confirm_below:.2f} → weak detector signal; "
+            f"apply extra scrutiny before confirming — do not confirm on ambiguous visual evidence alone.\n"
+            f"- gdino_conf > {caution_reject_above:.2f} → strong detector signal; "
+            f"require clear visual counter-evidence before rejecting.\n"
+            f"- Otherwise → neutral; let visual evidence alone determine the decision.\n"
+            f"This is a calibration prior. If visual evidence clearly contradicts the detector, trust your eyes.\n"
+        )
+    else:
+        conf_guidance = ""
+
     return (
         f"You are analyzing a UAV nadir (top-down) aerial tile.\n"
         f"Image size: {img_w}×{img_h} pixels. 0,0 is top-left.\n"
         f"Original query: \"{original_query}\"\n\n"
-        f"VERIFICATION CRITERIA\n{criteria}\n\n"
+        f"VERIFICATION CRITERIA\n{criteria}\n"
+        f"{conf_guidance}\n"
         f"The following {len(bboxes)} candidate detection(s) are marked on this tile:\n"
         f"{candidates_desc}\n\n"
         f"For EACH candidate, decide: confirmed or rejected.\n"
@@ -392,13 +413,15 @@ class TacticalAnalyst:
 
     def verify_detections_batch(
         self,
-        tile_img:       np.ndarray,      # full tile BGR array
-        detections:     list[dict],      # [{"label": str, "bbox": [x1,y1,x2,y2]}, ...]
-        criteria:       str,
-        report_fields:  list[str],
-        original_query: str,
-        colour_hint:    str | None = None,
-        size_qualifier: str | None = None,
+        tile_img:              np.ndarray,
+        detections:            list[dict],
+        criteria:              str,
+        report_fields:         list[str],
+        original_query:        str,
+        colour_hint:           str | None = None,
+        size_qualifier:        str | None = None,
+        caution_confirm_below: float | None = None,
+        caution_reject_above:  float | None = None,
     ) -> list[dict]:
         """
         Validate ALL detections on a tile in a single VLM call.
@@ -424,13 +447,21 @@ class TacticalAnalyst:
         annotated, vlm_bboxes = _context_crop_upscale(annotated, all_bboxes)
         h, w                  = annotated.shape[:2]   # actual dims after crop+upscale
 
+        confs = (
+            [d["confidence"] for d in detections]
+            if detections and "confidence" in detections[0]
+            else None
+        )
         prompt = _build_batch_verify_prompt(
-            label_hints    = [d["label"] for d in detections],
-            bboxes         = vlm_bboxes,   # remapped to crop-local coordinates
-            criteria       = criteria,
-            report_fields  = report_fields,
-            original_query = original_query,
-            img_w = w, img_h = h,          # match the actual image the VLM receives
+            label_hints           = [d["label"] for d in detections],
+            bboxes                = vlm_bboxes,
+            criteria              = criteria,
+            report_fields         = report_fields,
+            original_query        = original_query,
+            img_w = w, img_h = h,
+            confidences           = confs,
+            caution_confirm_below = caution_confirm_below,
+            caution_reject_above  = caution_reject_above,
         )
         
         try:
@@ -445,6 +476,7 @@ class TacticalAnalyst:
 
         try:
             clean   = re.sub(r"^```json\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+            clean   = re.sub(r"^\s*>+\s*", "", clean)   # strip leading > emitted by some providers
             results = json.loads(clean)
             # Normalise: ensure one entry per detection, keyed by index
             out = [{"confirmed": False, "reason": "missing", "report": {}}] * len(detections)

@@ -147,6 +147,14 @@ try:
 except ImportError:
     _HAS_TAE = False
 
+# ── OpenAI / OpenRouter (for optional VLM classification stage) ────────────────
+try:
+    import base64 as _b64
+    from openai import OpenAI as _OpenAI
+    _HAS_OPENAI = True
+except ImportError:
+    _HAS_OPENAI = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -199,6 +207,54 @@ FLOW_POLY_N        = 5      # polynomial neighbourhood size (5 or 7)
 FLOW_POLY_SIGMA    = 1.2    # Gaussian s.d. for polynomial smoothing
 DEFAULT_FLOW_THRESHOLD_PX = 2.0   # residual flow threshold (px/frame, proc-res)
 
+# Isolation gate — proximity exclusion filter
+#
+# Observation: construction activity (crane jibs, excavators, concrete pumps,
+# clustered workers) produces MULTIPLE simultaneous blobs within 1–5 m of each
+# other.  A lone flying object (bird, UAV) produces a SINGLE isolated blob with
+# no neighbours within 10–15 m.
+#
+# The gate discards any blob that has at least one other blob within
+# ISOLATION_RADIUS_M metres.  Only truly isolated blobs reach the tracker.
+#
+# Tradeoffs accepted (evaluated before implementation):
+#   ✗ Bird flocks dismissed (user-acknowledged)
+#   ✗ Single isolated workers / parked vehicles also pass (acceptable for bird use-case)
+#   ✗ Bird flying near a building edge may be suppressed (mitigated by flow mode reducing
+#       building-edge blobs to near-zero)
+#   ✓ Works well for the primary use-case: single bird over a busy construction site
+#
+# Physics guide (at proc-scale 0.5 from 4K, GSD≈5.8 cm/px, alt≈80 m):
+#   5 m  → 86 px  — kills adjacent machine-part pairs, two workers walking side-by-side
+#  10 m  → 172 px — kills workers 5–10 m apart, most crane-tip clusters
+#  15 m  → 258 px — conservative; may clip bird flying near building edge
+#
+# Default: 0.0 (disabled).  Enable with --isolation-radius.
+DEFAULT_ISOLATION_RADIUS_M = 0.0
+
+# Maximum ground-range filter
+#
+# The flat-earth nadir footprint model (frame_corners / pixel_to_geo) breaks
+# completely for objects far from the drone nadir — especially in oblique shots
+# where the camera looks toward the horizon.  Pixels in the upper frame project
+# to locations thousands of metres from the nadir; the variance formula then
+# runs on nonsensical coordinates and classifies city-skyline buildings as
+# "movers" despite being obviously static.
+#
+# This filter computes the horizontal distance from the drone's GPS position
+# to each blob's ground projection.  Blobs beyond MAX_RANGE_M are suppressed
+# immediately — the flat-earth model is invalid at those distances, so they
+# can never be reliably geolocated or classified.
+#
+# Physics guide (80 m AGL, oblique camera):
+#   300 m → cuts pixels beyond ~75° from vertical  (safe for most construction pits)
+#   500 m → cuts pixels beyond ~81° from vertical  (keeps wide construction zones)
+#   800 m → cuts pixels beyond ~84° from vertical  (very conservative)
+#   City skyline in this footage: 1000–5000 m → suppressed at any of the above
+#
+# Default: 0 (disabled).  Enable with --max-range.
+DEFAULT_MAX_RANGE_M = 0.0
+
 # Morphological cleanup kernel (applied to foreground mask)
 MORPH_KSIZE           = 3
 
@@ -247,37 +303,79 @@ PERSIST_SPEED_STEP       = 5.0    # px/frame excess per +1 extra persist frame
 MAX_EXTRA_PERSIST        = 10     # cap on additional frames
 DEFAULT_MIN_DISPLACEMENT = 0.0    # metres; 0 = disabled
 
-# World-fixed point filter — uses DJI telemetry to test whether a track
-# is consistent with a STATIC world location.
+# World-fixed point filter — uses DJI telemetry to identify blobs that are
+# static in the world regardless of their altitude above ground.
 #
-# Algorithm: triangulate the track's best-estimate geo position from its
-# N-frame observation history (mean lat/lon), then re-project that position
-# into the CURRENT camera frame and compare to the actual blob position.
+# Algorithm (world-frame variance test)
+# ──────────────────────────────────────
+# For a blob tracked across N frames, we have for each frame i:
+#   G_i = ground-plane geo projection of the blob pixel (from footprint)
+#   C_i = camera position (lat, lon, alt)  ← from DJI telemetry
 #
-#   reprojection error ≈ 0    → camera motion explains all pixel motion
-#                            → world-fixed point (parallax residual) → suppress
+# At candidate altitude h, the blob's inferred WORLD position is:
+#   W(h, i) = C_i + (G_i - C_i) × (alt_i - h) / alt_i
 #
-#   reprojection error large  → blob moved independently of camera
-#                            → genuine mover → show
+# This is a linear interpolation between camera and ground along the ray.
+# For a WORLD-FIXED object at true height h*:
+#   W(h*, i) ≈ same world point for all i  →  variance ≈ 0
 #
-# WF_MIN_FRAMES: minimum hits before the test is reliable.  With N=20
-#   frames at 30 fps (0.67 s), a 5 m/s bird accumulates ~3.3 m of travel,
-#   placing its mean position 1.65 m from its current position → reprojection
-#   error ≈ 28 px (at 5.8 cm/px GSD), well above WF_THRESHOLD_PX.
-#   A static world point has reprojection error ≈ centroid noise ≈ 2–4 px.
+# For a MOVING object (bird) at altitude h_bird:
+#   W(h_bird, i) changes each frame as the bird moves  →  variance > 0
 #
-# WF_RETEST_EVERY: re-run the test every N hits after the first classification
-#   so that a previously-static object (parked vehicle) that begins to move
-#   is eventually un-suppressed.
+# We scan h from 0 to 0.95 × alt and take the MINIMUM variance.
+# A small minimum means no matter what altitude is assumed, the object
+# is world-fixed.  A large minimum means the object moves in the world.
 #
-# WF_THRESHOLD_PX: at processing resolution.  Below → world-fixed → suppress.
-WF_MIN_FRAMES    = 20    # minimum track hits before world-fixed test is valid
+# Why this is correct for ALL flight directions (including parallel to camera):
+#   The camera position C_i changes each frame via telemetry.  Even if the
+#   bird flies in the same direction as the camera, the same pixel maps to
+#   a different world coordinate in each frame because C_i has moved.
+#   The only true degeneracy is v_bird = v_camera exactly — zero relative
+#   motion — which is physically undetectable by any single-camera method.
+#
+# WF_THRESHOLD_M : minimum variance (metres) that separates static from moving.
+#   Simulation with realistic noise (GPS 0.5m σ, pixel 3px):
+#     Static crane at 50m  →  min variance ≈ 0.2–0.4 m
+#     Bird at 5 m/s        →  min variance ≈ 0.7–1.0 m
+#     Bird at 3 m/s        →  min variance ≈ 0.5–0.7 m
+#   Default 0.4 m gives clean separation for birds at ≥ 3 m/s.
+#   Known edge case — undetectable by this method:
+#     A bird flying *directly toward* the camera creates a degenerate altitude
+#     h_deg = alt × v_bird/(v_cam + v_bird) + v_cam × h_bird/(v_cam + v_bird)
+#     at which its apparent world position is constant, indistinguishable from a
+#     static structure at that height.  This is a fundamental single-camera
+#     observability limit (relative motion ≈ 0 in the degenerate projection).
+#     Any lateral velocity component breaks the degeneracy.
+WF_MIN_FRAMES    = 8     # minimum track hits before test is valid; 64% of tracks
+                          # never reached 20 — 8 hits (0.27s) exposes ~78% of tracks
 WF_RETEST_EVERY  = 15    # re-test every N additional hits after first result
-WF_THRESHOLD_PX  = 10.0  # reprojection error (px, proc-res) separating static vs. mover
+WF_N_SCAN        = 60    # number of altitude candidates in the h-scan
+WF_THRESHOLD_M   = 0.4   # world-space RMS spread (metres); below = world-fixed
+
+# VLM classification stage (optional post-processing, --vlm-classify)
+#
+# After the video is fully processed, confirmed visible_movers are passed to
+# Qwen2.5-VL (via OpenRouter) for semantic classification.  The VLM is asked to
+# distinguish genuine independently-moving objects (birds, vehicles) from false
+# alarms caused by camera parallax over static structures (buildings, cranes).
+#
+# Triggered once per track at first confirmation, grouped into batches of
+# VLM_MAX_DET_PER_CALL detections per API call to keep response within token limits.
+# A snapshot frame is saved every VLM_SNAPSHOT_INTERVAL processed frames; each
+# batch is sent with the snapshot closest to the tracks' confirmation times.
+#
+# Requires:  pip install openai
+#            OPENROUTER_API_KEY env var  (or --vlm-api-key)
+VLM_MODEL              = "qwen/qwen-2.5-vl-72b-instruct"  # same as TAE
+VLM_SNAPSHOT_INTERVAL  = 90    # save one frame every N processed frames (~3 s at 30 fps)
+VLM_MAX_DET_PER_CALL   = 25    # max detections per API call (token budget)
+VLM_MAX_TOKENS         = 2048  # response token budget (≈80 per confirmed + 20 per rejected)
+VLM_SNAP_LONG_EDGE     = 1280  # resize snapshot to this long edge before sending
 
 # Annotation colours  (BGR)
 COL_PENDING   = (0, 200, 255)     # yellow  — seen but not yet confirmed
 COL_CONFIRMED = (50, 220, 50)     # green   — confirmed track
+COL_ISOLATED  = (255, 220, 0)     # bright cyan-yellow — confirmed AND isolated (primary target)
 COL_HUD       = (240, 240, 240)   # white   — HUD text
 COL_HUD_SHD   = (20, 20, 20)     # dark    — HUD text shadow
 
@@ -363,6 +461,133 @@ def frame_corners(
     return tuple(corners)   # (nw, ne, se, sw)
 
 
+def oblique_frame_corners(
+    lat: float, lon: float,
+    alt_m: float, gimbal_yaw_deg: float, gimbal_pitch_deg: float,
+    img_w: int, img_h: int,
+    sensor_w_mm: float, focal_mm: float,
+) -> Optional[tuple]:
+    """
+    Compute the ground-plane intersections of the four image corner rays
+    for an oblique camera at ANY gimbal pitch (including nadir).
+
+    The nadir frame_corners() assumes pitch = −90° and produces a rectangle
+    ±(alt × sensor/focal)/2 around the drone.  For an oblique shot at −30°
+    to −45° pitch, this is completely wrong: the true footprint is a deep
+    trapezoid that extends hundreds of metres forward and has very different
+    aspect ratios near vs. far.  Using the wrong footprint means pixel_to_geo
+    gives nonsense coordinates for any object more than ~56 m from nadir.
+
+    This function traces the actual 3-D ray from the camera through each
+    image corner and intersects it with the ground plane (z = 0).
+
+    Camera convention
+    -----------------
+    gimbal_pitch_deg :
+      −90 = nadir (pointing straight down)
+      −45 = 45° below horizontal (looking diagonally forward-down)
+        0 = horizontal
+    gimbal_yaw_deg   : clockwise from north (0 = camera looking north)
+
+    Returns
+    -------
+    (nw, ne, se, sw) as (lat, lon) tuples in image-corner order
+    (TL, TR, BR, BL), which matches the bilinear convention expected by
+    pixel_to_geo.  Returns None if any corner ray points above horizontal
+    (i.e., the camera is so shallow that part of the image shows sky).
+    """
+    f_px = focal_mm / sensor_w_mm * img_w   # focal length in pixels
+
+    P = math.radians(gimbal_pitch_deg)       # −π/2 = nadir
+    Y = math.radians(gimbal_yaw_deg)
+
+    # Camera axes expressed in world ENU (x = east, y = north, z = up)
+    # Optical axis (camera z, pointing forward/down):
+    cz_e =  math.cos(P) * math.sin(Y)   # east  (0 at nadir)
+    cz_n =  math.cos(P) * math.cos(Y)   # north (0 at nadir)
+    cz_u =  math.sin(P)                 # up    (−1 at nadir ← pointing down)
+
+    # Image-right axis (camera x):
+    cx_e =  math.cos(Y)
+    cx_n = -math.sin(Y)
+    cx_u =  0.0
+
+    # Image-down axis (camera y = optical × right, in right-hand sense):
+    cy_e = cz_n * cx_u - cz_u * cx_n   # = sin(P) · sin(Y)
+    cy_n = cz_u * cx_e - cz_e * cx_u   # = sin(P) · cos(Y)
+    cy_u = cz_e * cx_n - cz_n * cx_e   # = −cos(P)
+
+    m_lat = 111320.0
+    m_lon = 111320.0 * math.cos(math.radians(lat))
+
+    # Image corners in order (TL, TR, BR, BL) = bilinear (nw, ne, se, sw)
+    ground_pts = []
+    for pu, pv in ((0, 0), (img_w, 0), (img_w, img_h), (0, img_h)):
+        # Normalised image-plane offsets
+        rx = (pu - img_w / 2.0) / f_px
+        ry = (pv - img_h / 2.0) / f_px
+
+        # Ray direction in world ENU
+        r_e = rx * cx_e + ry * cy_e + cz_e
+        r_n = rx * cx_n + ry * cy_n + cz_n
+        r_u = rx * cx_u + ry * cy_u + cz_u
+
+        if r_u >= 0.0:         # ray pointing up or horizontal → no ground hit
+            return None
+        t   = -alt_m / r_u    # t > 0 since r_u < 0
+        ge  = t * r_e          # metres east  of drone nadir
+        gn  = t * r_n          # metres north of drone nadir
+        ground_pts.append((lat + gn / m_lat, lon + ge / m_lon))
+
+    return tuple(ground_pts)   # (nw, ne, se, sw)
+
+
+def pixel_ground_range(
+    cx: float, cy: float,
+    img_w: int, img_h: int,
+    alt_m: float,
+    gimbal_yaw_deg: float, gimbal_pitch_deg: float,
+    sensor_w_mm: float, focal_mm: float,
+) -> float:
+    """
+    Compute the horizontal ground distance (metres) from the camera nadir
+    to the ground intersection of the ray through pixel (cx, cy).
+
+    Unlike pixel_to_geo (bilinear within the footprint box), this uses the
+    true perspective ray, giving correct distances for oblique cameras at
+    any pixel — including near-horizon pixels that project thousands of
+    metres from nadir.
+
+    Returns float('inf') if the ray points above horizontal (sky pixels).
+    Used by the --max-range gate to suppress far-field blobs.
+    """
+    f_px = focal_mm / sensor_w_mm * img_w
+    P    = math.radians(gimbal_pitch_deg)
+    Y    = math.radians(gimbal_yaw_deg)
+
+    cz_e =  math.cos(P) * math.sin(Y)
+    cz_n =  math.cos(P) * math.cos(Y)
+    cz_u =  math.sin(P)
+
+    cx_e =  math.cos(Y);  cx_n = -math.sin(Y);  cx_u = 0.0
+
+    cy_e = cz_n * cx_u - cz_u * cx_n
+    cy_n = cz_u * cx_e - cz_e * cx_u
+    cy_u = cz_e * cx_n - cz_n * cx_e
+
+    rx = (cx - img_w / 2.0) / f_px
+    ry = (cy - img_h / 2.0) / f_px
+
+    r_e = rx * cx_e + ry * cy_e + cz_e
+    r_n = rx * cx_n + ry * cy_n + cz_n
+    r_u = rx * cx_u + ry * cy_u + cz_u
+
+    if r_u >= 0.0:
+        return float("inf")          # ray above horizontal → sky pixel
+    t = -alt_m / r_u
+    return math.hypot(t * r_e, t * r_n)   # metres from nadir
+
+
 def pixel_to_geo(
     cx: float, cy: float,
     img_w: int, img_h: int,
@@ -429,60 +654,107 @@ def geo_to_pixel(
     return u * img_w, v * img_h
 
 
-def world_fixed_reprojection_error(
+def world_fixed_variance_test(
     track,
-    footprint: tuple,   # (nw, ne, se, sw) at FULL resolution for current frame
-    full_w: int,
-    full_h: int,
-    scale:  float,
-) -> float:
+    n_scan: int = WF_N_SCAN,
+) -> tuple[float, float]:
     """
-    Estimate the reprojection error for the hypothesis
-    "this track is a static world-fixed point."
+    Test whether this track is consistent with a static world point at ANY altitude.
 
-    Algorithm
-    ---------
-    1. Mean of all geo observations in track.geo_history
-       → best-estimate world position (lat_est, lon_est) assuming static.
-    2. Project (lat_est, lon_est) into the CURRENT frame using current footprint
-       → predicted pixel (cx_pred, cy_pred) at processing resolution.
-    3. Euclidean distance between predicted and actual current centroid.
+    For each candidate altitude h (scanned 0 → 0.95 × camera alt):
 
-    Interpretation
-    --------------
-    Small error (< WF_THRESHOLD_PX):
-        Camera motion fully explains the blob's pixel trajectory.
-        The blob is a world-fixed point (building edge, crane top, terrain).
-        → suppress.
+        W(h, i) = C_i + (G_i − C_i) × (alt_i − h) / alt_i
 
-    Large error (≥ WF_THRESHOLD_PX):
-        The blob has moved independently of the camera between its first
-        observed position and its current position.
-        → genuine mover — confirm and show.
+    where C_i is the camera position in frame i (from telemetry) and G_i is
+    the ground-plane geo projection of the blob pixel.  W(h, i) is the world
+    position the blob WOULD have if it were at height h in frame i.
 
-    Requires at least WF_MIN_FRAMES geo observations to be meaningful.
-    Returns float('inf') when geo_history is empty.
+    A world-FIXED object at true height h*:
+        W(h*, i) ≈ same point for all i  →  spatial variance ≈ 0
+
+    A moving object (bird, vehicle):
+        W(h_obj, i) changes each frame regardless of h  →  variance > 0
+
+    We take the MINIMUM variance across all scanned h values.  This
+    automatically finds the correct altitude without any prior knowledge,
+    and correctly handles elevated structures (cranes, buildings) that the
+    previous flat-ground reprojection test incorrectly classified as movers.
+
+    Direction independence: because camera position C_i changes each frame
+    via telemetry, even a bird flying parallel to the camera maps to a
+    different world coordinate each frame → variance > 0.  There is no
+    parallel-motion degeneracy in this formulation.
+
+    Parameters
+    ----------
+    track   : MotionTrack with geo_history and camera_history populated.
+    n_scan  : number of altitude candidates (coarse phase); 60 gives ~1m
+              resolution at 80m altitude.
+
+    Returns
+    -------
+    (min_variance_m, best_h_m)
+        min_variance_m  RMS world-space positional spread (metres) at best h.
+        best_h_m        altitude (m) that minimises the variance.
     """
-    if not track.geo_history:
-        return float("inf")
+    n_geo = len(track.geo_history)
+    n_cam = len(track.camera_history)
+    if n_geo < WF_MIN_FRAMES or n_cam < WF_MIN_FRAMES:
+        return float("inf"), 0.0
 
-    # Triangulate: simple mean of all geolocated observations
-    n       = len(track.geo_history)
-    lat_est = sum(g[0] for g in track.geo_history) / n
-    lon_est = sum(g[1] for g in track.geo_history) / n
+    n = min(n_geo, n_cam)
+    geos = track.geo_history[-n:]      # list of (lat_g, lon_g)
+    cams = track.camera_history[-n:]   # list of (lat_c, lon_c, alt_c)
 
-    nw, ne, se, sw = footprint
+    # ENU reference: first camera position
+    lat_ref, lon_ref, _ = cams[0]
+    m_lat = 111320.0
+    m_lon = 111320.0 * math.cos(math.radians(lat_ref))
 
-    # Re-project estimated world position into current frame (full resolution)
-    cx_full, cy_full = geo_to_pixel(lat_est, lon_est, full_w, full_h, nw, ne, se, sw)
+    # Pre-convert to local ENU metres — avoids repeated trig in the inner loop
+    cam_E  = [(lo - lon_ref) * m_lon for _, lo, _ in cams]
+    cam_N  = [(la - lat_ref) * m_lat for la, _, _ in cams]
+    gnd_E  = [(lo - lon_ref) * m_lon for _, lo    in geos]
+    gnd_N  = [(la - lat_ref) * m_lat for la, _    in geos]
+    alts   = [alt_c                  for _, _, alt_c in cams]
+    alt_max = max(alts)
 
-    # Scale to processing resolution and compare to actual centroid
-    cx_pred = cx_full * scale
-    cy_pred = cy_full * scale
+    def variance_at_h(h: float) -> float:
+        """RMS 2-D positional spread of W(h, i) across all frames."""
+        Es, Ns = [], []
+        for Ce, Cn, Ge, Gn, alt_c in zip(cam_E, cam_N, gnd_E, gnd_N, alts):
+            if alt_c <= h or alt_c <= 0:
+                continue
+            frac = (alt_c - h) / alt_c
+            Es.append(Ce + (Ge - Ce) * frac)
+            Ns.append(Cn + (Gn - Cn) * frac)
+        if len(Es) < 3:
+            return float("inf")
+        em = sum(Es) / len(Es);  nm = sum(Ns) / len(Ns)
+        vE = sum((e - em) ** 2 for e in Es) / len(Es)
+        vN = sum((n_i - nm) ** 2 for n_i in Ns) / len(Ns)
+        return math.sqrt(vE + vN)
 
-    return math.hypot(track.cx - cx_pred, track.cy - cy_pred)
+    # ── Coarse scan ────────────────────────────────────────────────────────────
+    h_max   = alt_max * 0.95
+    h_step  = h_max / max(n_scan - 1, 1)
+    coarse  = sorted((variance_at_h(h_step * i), h_step * i) for i in range(n_scan))
+    best_v, best_h = coarse[0]
+
+    # ── Fine scan (±1 step around best coarse point, 20 sub-steps) ───────────
+    lo = max(0.0, best_h - h_step)
+    hi = min(h_max, best_h + h_step)
+    fine_step = (hi - lo) / 20
+    for k in range(21):
+        h_f = lo + fine_step * k
+        v_f = variance_at_h(h_f)
+        if v_f < best_v:
+            best_v, best_h = v_f, h_f
+
+    return best_v, best_h
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-
 def estimate_homography(
     prev_gray:  np.ndarray,
     curr_gray:  np.ndarray,
@@ -749,8 +1021,48 @@ def detect_blobs(
     return blobs, n_raw
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Motion tracker (temporal consistency gate)
+def apply_isolation_gate(
+    blobs:     list[dict],
+    radius_px: float,
+) -> list[dict]:
+    """
+    Proximity exclusion filter: discard any blob that has at least one
+    other blob within radius_px pixels (Euclidean centroid distance).
+
+    Only blobs with NO neighbour within the radius pass — i.e. blobs that
+    appear in isolation in the current frame.
+
+    Rationale
+    ---------
+    Construction machinery, clustered workers, and crane assemblies generate
+    *multiple* simultaneous blobs within 1–10 m of each other.  A lone flying
+    object (bird, UAV) generates a *single* blob with no nearby companions.
+    Discarding clustered blobs removes the bulk of construction-site false
+    positives without touching isolated targets.
+
+    Parameters
+    ----------
+    blobs     : list of blob dicts with 'cx' and 'cy' keys (proc-resolution).
+    radius_px : exclusion radius in pixels.  0 or negative → no filtering.
+
+    Returns
+    -------
+    Subset of blobs where every surviving blob has no neighbour within radius_px.
+    Order is preserved.
+    """
+    if radius_px <= 0 or len(blobs) < 2:
+        return blobs
+
+    isolated: list[dict] = []
+    for i, b in enumerate(blobs):
+        has_neighbour = any(
+            i != j and
+            math.hypot(b["cx"] - other["cx"], b["cy"] - other["cy"]) <= radius_px
+            for j, other in enumerate(blobs)
+        )
+        if not has_neighbour:
+            isolated.append(b)
+    return isolated
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -764,8 +1076,17 @@ class MotionTrack:
     miss_count:  int  = 0
     confirmed:   bool = False
     suppressed:  bool = False  # True = classified as world-fixed → hidden from output
+    is_isolated: bool = True   # True = no other confirmed track within isolation radius
     history:     list = field(default_factory=list)    # (cx, cy) per hit
-    geo_history: list = field(default_factory=list)    # (lat, lon) per hit
+    geo_history: list = field(default_factory=list)    # (lat_g, lon_g) per hit — ground projection
+    camera_history: list = field(default_factory=list) # (lat_c, lon_c, alt_c) per hit — camera pos
+    # Diagnostics populated by world_fixed_variance_test
+    wf_variance_m: float = -1.0   # minimum world-frame variance (m); -1 = not yet tested
+    wf_best_h_m:   float = -1.0   # altitude (m) that minimised variance
+    suppressed_by: str   = ""     # "world_fixed" | "range" | "vlm" | ""
+    # VLM classification support
+    confirm_frame_idx:  int   = -1   # frame index when this track was first confirmed
+    confirm_bbox_full:  tuple = ()   # full-res bbox (x,y,w,h) at confirmation
 
     def match_and_update(self, blob: dict) -> None:
         self.cx        = blob["cx"]
@@ -982,6 +1303,7 @@ def annotate(
     scene_speed:       float = 0.0,
     fg_fraction:       float = 0.0,
     effective_persist: int   = 3,
+    isolation_radius_px: float = 0.0,
 ) -> np.ndarray:
     """
     Draw bounding boxes, track trails, and HUD onto a full-resolution copy.
@@ -1001,6 +1323,10 @@ def annotate(
         fx  = int(x * inv_s);  fy  = int(y * inv_s)
         fw  = int(w * inv_s);  fh  = int(h * inv_s)
         col = COL_CONFIRMED if t.confirmed else COL_PENDING
+        # Isolated confirmed tracks get a brighter cyan highlight so the
+        # operator can immediately spot lone flyers among clustered detections.
+        if t.confirmed and t.is_isolated and isolation_radius_px > 0:
+            col = COL_ISOLATED
         thk = 2 if t.confirmed else 1
 
         cv2.rectangle(out, (fx, fy), (fx + fw, fy + fh), col, thk)
@@ -1036,11 +1362,13 @@ def annotate(
     warp_str = f"inliers={n_inliers}  spd={scene_speed:.1f}px" if warp_ok else "WARP FAIL"
     n_visible    = sum(1 for t in tracks if not t.suppressed and t.confirmed)
     n_suppressed = sum(1 for t in tracks if t.suppressed)
+    n_isolated   = sum(1 for t in tracks if not t.suppressed and t.confirmed and t.is_isolated)
+    isolation_str = (f"  isolated={n_isolated}" if isolation_radius_px > 0 else "")
     hud_lines = [
         f"frame {frame_idx:05d}   t={frame_ms/1000:.2f}s   mode={mode}",
         f"alt {alt_m:.0f}m   gsd {gsd_cm:.1f} cm/px",
         f"warp {warp_str}   fg={fg_fraction*100:.1f}%   persist={effective_persist}f",
-        f"tracks: {len(tracks)} alive   {n_visible} movers   {n_suppressed} suppressed",
+        f"tracks: {len(tracks)} alive   {n_visible} movers   {n_suppressed} suppressed{isolation_str}",
     ]
     for i, line in enumerate(hud_lines):
         y_pos = 22 + i * 22
@@ -1099,6 +1427,16 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--save-crops", action="store_true",
                    dest="save_crops",
                    help="Save confirmed-track crops to _crops/ directory")
+    p.add_argument("--vlm-classify", action="store_true", dest="vlm_classify",
+                   help="Run a VLM pass after video processing.  Sends confirmed visible "
+                        "movers to Qwen2.5-VL (via OpenRouter) to distinguish genuine movers "
+                        "(birds, vehicles) from false alarms on static structures (buildings, "
+                        "cranes, scaffolding).  Makes ~5–10 API calls for a 16 s clip.  "
+                        "Requires: pip install openai  and  OPENROUTER_API_KEY env var "
+                        "(or --vlm-api-key).")
+    p.add_argument("--vlm-api-key", type=str, default=None, dest="vlm_api_key",
+                   help="OpenRouter API key for --vlm-classify.  "
+                        "Defaults to OPENROUTER_API_KEY env var.")
     p.add_argument("--max-frames", type=int, default=None,
                    dest="max_frames",
                    help="Stop after N source frames (for quick tests)")
@@ -1107,6 +1445,16 @@ def build_args() -> argparse.Namespace:
                    help="Scene translation (px/frame at proc resolution) above which "
                         "extra persist frames are added. Default %(default).0f px. "
                         "Lower = stricter during slower pans.")
+    p.add_argument("--wf-threshold", type=float, default=WF_THRESHOLD_M,
+                   dest="wf_threshold",
+                   help="World-frame variance threshold (metres) for the world-fixed "
+                        "filter.  Tracks whose minimum positional variance across all "
+                        "scanned altitudes is below this are classified as world-fixed "
+                        "(parallax residuals from static structures) and suppressed. "
+                        "Lower → suppress more aggressively; higher → miss fewer movers. "
+                        "Physics guide: GPS noise 0.5m σ gives static-structure variance "
+                        "≈ 0.2–0.35 m; birds at ≥ 3 m/s give ≥ 0.5 m. "
+                        "Default %(default).2f m.")
     p.add_argument("--flow-threshold", type=float, default=DEFAULT_FLOW_THRESHOLD_PX,
                    dest="flow_threshold",
                    help="Residual optical flow magnitude threshold in px/frame (proc-res) "
@@ -1115,12 +1463,245 @@ def build_args() -> argparse.Namespace:
                         "≈ 1.8 px/frame; a 5 m/s bird ≈ 2.9 px/frame.  "
                         "Default %(default).1f px.  Lower (1.5) catches slower movers; "
                         "higher (3.0) reduces false positives in turbulent conditions.")
+    p.add_argument("--isolation-radius", type=float, default=DEFAULT_ISOLATION_RADIUS_M,
+                   dest="isolation_radius",
+                   help="Proximity exclusion radius in metres.  Any blob that has at least "
+                        "one other blob within this distance is discarded before tracking. "
+                        "Rationale: construction machinery produces CLUSTERS of simultaneous "
+                        "blobs; a lone bird produces ONE isolated blob.  0 = disabled (default). "
+                        "Recommended for bird detection over a busy construction site: 5–10 m. "
+                        "Physics at GSD≈5.8 cm/px (80 m alt): "
+                        "5 m → 86 px, 10 m → 172 px.  Tradeoff: also dismisses single "
+                        "isolated workers/vehicles and birds flying near structure edges.")
+    p.add_argument("--max-range", type=float, default=DEFAULT_MAX_RANGE_M,
+                   dest="max_range",
+                   help="Maximum ground-range (metres from camera nadir) for blob acceptance. "
+                        "Blobs whose flat-earth ground projection falls beyond this distance "
+                        "are suppressed immediately — the nadir footprint model is invalid "
+                        "at those distances, especially for oblique shots where the city "
+                        "skyline or horizon appears in the upper frame. "
+                        "0 = disabled (default). "
+                        "Recommended for oblique urban shots: 300–500 m. "
+                        "Physics: at 80 m AGL, 500 m range corresponds to pixels beyond "
+                        "~81° from vertical; city skyline at 1–5 km is cleanly suppressed.")
     p.add_argument("--min-displacement", type=float, default=DEFAULT_MIN_DISPLACEMENT,
                    dest="min_displacement",
                    help="Minimum real-world displacement (metres) a track must show "
                         "before it is confirmed. 0 = disabled (default). "
                         "E.g. 0.5 rejects fixed-world residuals during steady pans.")
     return p.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VLM classification helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _vlm_motion_prompt(detections: list[dict], frame_w: int, frame_h: int) -> str:
+    """
+    Build a prompt asking the VLM to classify each numbered detection as a
+    genuine independently-moving object or a false alarm on a static structure.
+
+    The model sees a drone video frame with numbered green bounding boxes already
+    drawn on it, plus this text description of each box.
+    """
+    cands = "\n".join(
+        f"  {d['index']}: bbox=[{d['bbox'][0]},{d['bbox'][1]},"
+        f"{d['bbox'][2]},{d['bbox'][3]}]"
+        for d in detections
+    )
+    return (
+        f"You are analyzing an aerial drone video frame (oblique camera, not nadir).\n"
+        f"Frame size: {frame_w}×{frame_h} px.  Top-left is (0,0).\n\n"
+        f"A motion detector found the following candidate regions, drawn as numbered\n"
+        f"green boxes on the frame.  MANY ARE FALSE ALARMS caused by camera movement\n"
+        f"over static structures (buildings, cranes, scaffolding, rooftops, trees).\n\n"
+        f"Candidates:\n{cands}\n\n"
+        f"For EACH candidate decide:\n"
+        f"  confirmed: true  → genuinely independently-moving object\n"
+        f"                     (flying bird, aircraft, UAV, moving vehicle, person)\n"
+        f"  confirmed: false → false alarm on a static structure\n"
+        f"                     (building edge, crane, scaffold, roof, tree, road)\n\n"
+        f"Visual discriminators:\n"
+        f"• Box overlaps or touches a visible structural element → false alarm\n"
+        f"• Box in open sky / clear airspace, no nearby structure → genuine mover\n"
+        f"• Box at the silhouette edge of a building or crane → false alarm\n"
+        f"• Isolated blob in an open area between structures → genuine mover\n\n"
+        f"Return ONLY a JSON list, one entry per candidate in index order:\n"
+        f"[\n"
+        f"  {{\"index\": 0, \"confirmed\": true,  \"confidence\": 0.9, "
+        f"\"reason\": \"isolated blob in sky\"}},\n"
+        f"  {{\"index\": 1, \"confirmed\": false, \"confidence\": 0.95}},\n"
+        f"  ...\n"
+        f"]\n"
+        f"Rules:\n"
+        f"- confirmed entries MUST include a brief reason.\n"
+        f"- rejected entries: omit reason to save tokens.\n"
+        f"- Be strict: when uncertain, reject.\n"
+        f"- No markdown, no text outside the JSON array."
+    )
+
+
+def vlm_classify_visible_movers(
+    snapshots:   list[tuple],       # (frame_idx, np.ndarray BGR snapshot at snap scale)
+    snap_scale:  float,             # snapshot_dim / full_frame_dim
+    all_tracks:  list,              # all confirmed MotionTrack objects
+    api_key:     str,
+    model:       str = VLM_MODEL,
+) -> int:
+    """
+    Classify all visible (non-suppressed) confirmed tracks using the VLM.
+
+    Each track is sent to the VLM once, in the snapshot frame closest to its
+    first confirmation.  Detections are sent in batches of VLM_MAX_DET_PER_CALL
+    per API call.  Tracks the VLM classifies as 'not confirmed' (i.e. false alarms
+    on static structures) are suppressed in-place.
+
+    Returns the number of tracks newly suppressed by VLM.
+    """
+    if not _HAS_OPENAI:
+        log.warning("VLM classify skipped — 'openai' package not installed.")
+        return 0
+    if not snapshots:
+        log.warning("VLM classify skipped — no snapshots collected.")
+        return 0
+
+    client = _OpenAI(
+        base_url = "https://openrouter.ai/api/v1",
+        api_key  = api_key,
+        default_headers = {
+            "HTTP-Referer": "https://github.com/arie-distillo/TAE",
+            "X-Title": "TAE motion test",
+        },
+    )
+
+    # Index snapshots by frame_idx for fast lookup
+    snap_by_idx = {s[0]: s[1] for s in snapshots}
+    snap_indices = sorted(snap_by_idx.keys())
+
+    def nearest_snap(frame_idx: int) -> Optional[np.ndarray]:
+        if not snap_indices:
+            return None
+        best = min(snap_indices, key=lambda s: abs(s - frame_idx))
+        return snap_by_idx[best], best
+
+    # Gather pending tracks (visible, not already VLM-processed)
+    pending = [
+        t for t in all_tracks
+        if not t.suppressed
+        and t.confirm_frame_idx >= 0
+        and t.confirm_bbox_full
+    ]
+    if not pending:
+        log.info("VLM: no visible movers with confirmation data to classify.")
+        return 0
+
+    log.info("VLM: classifying %d visible movers in batches of %d …",
+             len(pending), VLM_MAX_DET_PER_CALL)
+
+    # Group by nearest snapshot index so each batch shares a frame context
+    from collections import defaultdict
+    groups: dict[int, list] = defaultdict(list)
+    for t in pending:
+        _, sidx = nearest_snap(t.confirm_frame_idx)
+        groups[sidx].append(t)
+
+    total_suppressed = 0
+    total_calls      = 0
+
+    for sidx, group_tracks in sorted(groups.items()):
+        snap_img = snap_by_idx[sidx]
+        sh, sw   = snap_img.shape[:2]
+
+        # Sub-batch the group
+        for batch_start in range(0, len(group_tracks), VLM_MAX_DET_PER_CALL):
+            batch = group_tracks[batch_start : batch_start + VLM_MAX_DET_PER_CALL]
+
+            # Draw numbered boxes on a copy of the snapshot
+            disp = snap_img.copy()
+            detections = []
+            for det_idx, t in enumerate(batch):
+                x, y, w, h = t.confirm_bbox_full
+                # Scale full-res bbox to snapshot coords
+                x1 = int(x * snap_scale);  y1 = int(y * snap_scale)
+                x2 = int((x+w) * snap_scale); y2 = int((y+h) * snap_scale)
+                cv2.rectangle(disp, (x1, y1), (x2, y2), (50, 220, 50), 2)
+                cv2.putText(disp, str(det_idx), (x1, max(y1 - 4, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+                            cv2.LINE_AA)
+                detections.append({
+                    "index": det_idx,
+                    "track_id": t.track_id,
+                    "bbox": [x1, y1, x2, y2],
+                })
+
+            prompt  = _vlm_motion_prompt(detections, sw, sh)
+            ok, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            if not ok:
+                log.warning("VLM: failed to encode snapshot frame — skipping batch.")
+                continue
+
+            b64 = _b64.standard_b64encode(buf.tobytes()).decode()
+
+            try:
+                resp = client.chat.completions.create(
+                    model    = model,
+                    messages = [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                    max_tokens  = VLM_MAX_TOKENS,
+                    temperature = 0.1,
+                    extra_body  = {
+                        "provider": {
+                            "order": ["Together", "NovitaAI", "Nebius Token Factory"],
+                            "allow_fallbacks": True,
+                        }
+                    },
+                )
+                raw = resp.choices[0].message.content or ""
+                total_calls += 1
+            except Exception as exc:
+                log.warning("VLM API call failed (snap=%d batch=%d): %s",
+                            sidx, batch_start // VLM_MAX_DET_PER_CALL, exc)
+                continue
+
+            # Parse response
+            try:
+                import re as _re
+                clean   = _re.sub(r"^```json\s*|\s*```$", "", raw.strip(),
+                                  flags=_re.MULTILINE)
+                results = json.loads(clean)
+            except (json.JSONDecodeError, ValueError) as exc:
+                log.warning("VLM parse error: %s\nRaw: %s", exc, raw[:300])
+                continue
+
+            # Apply decisions
+            result_by_idx = {int(r.get("index", -1)): r for r in results
+                             if isinstance(r, dict)}
+            for det_idx, t in enumerate(batch):
+                r = result_by_idx.get(det_idx)
+                if r is None:
+                    log.debug("VLM: no result for T%d (index %d)", t.track_id, det_idx)
+                    continue
+                confirmed = bool(r.get("confirmed", True))
+                conf      = float(r.get("confidence", 0.5))
+                reason    = r.get("reason", "")
+                if not confirmed:
+                    t.suppressed    = True
+                    t.suppressed_by = "vlm"
+                    total_suppressed += 1
+                    log.debug("  ✗ VLM T%d suppressed (conf=%.2f)", t.track_id, conf)
+                else:
+                    log.info("  ✓ VLM T%d confirmed  conf=%.2f  %s",
+                             t.track_id, conf, reason)
+
+    log.info("VLM: %d API calls, %d tracks suppressed as artifacts.",
+             total_calls, total_suppressed)
+    return total_suppressed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1211,9 +1792,28 @@ def main() -> None:
 
     # Diagnostics
     warp_fail_count  = 0
-    total_blob_count = 0          # blobs that passed the area/aspect gate
+    total_blob_count = 0          # blobs that passed the area/aspect gate AND isolation gate
     total_raw_count  = 0          # all connected components before gating
+    total_isolation_filtered = 0  # blobs removed by isolation gate
+    total_range_suppressed   = 0  # tracks suppressed by max-range gate
+
+    # VLM snapshot buffer: (frame_idx, snapshot_BGR_img)
+    vlm_snapshots:  list[tuple] = []
+    snap_scale      = min(1.0, VLM_SNAP_LONG_EDGE / max(full_w, full_h))
     seen_track_ids:  set[int] = set()     # IDs that have been confirmed at least once
+
+    # Cumulative camera displacement from homography chain (30 Hz accuracy).
+    # The SRT telemetry is typically 1 Hz — the same lat/lon repeated for 30 frames.
+    # Raw SRT camera positions in camera_history would be a step function, making
+    # W(h, i) = C_i + (G_i − C_i)·frac compute large variance even for static
+    # world-fixed blobs (because G_i drifts while C_i is frozen).
+    # Fix: accumulate per-frame H translations to get a 30 Hz camera trajectory,
+    # then compute a refined footprint each frame from the refined camera position.
+    # Both C_i (camera_history) and G_i (geo_history) are then accurate per-frame.
+    cum_cam_delta_E = 0.0   # metres east  accumulated from H[0,2]
+    cum_cam_delta_N = 0.0   # metres north accumulated from H[1,2]
+    cam_lat_ref:  Optional[float] = None   # GPS anchor (set at first valid telem)
+    cam_lon_ref:  Optional[float] = None
     # ── Main loop ─────────────────────────────────────────────────────────────
     try:
         while True:
@@ -1267,6 +1867,15 @@ def main() -> None:
                     # Translation component of H gives scene speed in px/frame
                     scene_speed = math.hypot(float(H[0, 2]), float(H[1, 2]))
                     warped_prev = warp_frame(prev_gray, H, (proc_h, proc_w))
+
+                    # Accumulate per-frame camera displacement at 30 Hz.
+                    # H maps prev→curr; scene shifts (H[0,2], H[1,2]) px.
+                    # Camera moves OPPOSITE to scene in world space:
+                    #   scene right (H[0,2]>0) → camera moved west → ΔE<0
+                    #   scene down  (H[1,2]>0) → camera moved north → ΔN>0 (nadir)
+                    if gsd_m > 0:
+                        cum_cam_delta_E -= float(H[0, 2]) * gsd_m
+                        cum_cam_delta_N += float(H[1, 2]) * gsd_m
                 else:
                     # Homography failed — fall back to identity (no compensation).
                     # This will produce false positives on a flying drone, but
@@ -1320,10 +1929,29 @@ def main() -> None:
             # ── Blob detection + tracking ─────────────────────────────────────
             tracks: list[MotionTrack] = []
 
+            # Compute isolation radius in pixels for this frame (GSD may vary).
+            # Initialised here so annotate() always has a valid value even when
+            # fg_mask is None (first frame).
+            isolation_radius_px = (
+                args.isolation_radius / gsd_m
+                if args.isolation_radius > 0 and gsd_m > 0
+                else 0.0
+            )
+
             if fg_mask is not None:
                 blobs, n_raw = detect_blobs(fg_mask, min_area, max_area)
-                total_blob_count += len(blobs)
                 total_raw_count  += n_raw
+
+                # Isolation gate: discard blobs that have a neighbour within
+                # isolation_radius_px.  Applied before the tracker so clustered
+                # blobs never form tracks, reducing both false positives and
+                # tracker bookkeeping overhead.
+                if isolation_radius_px > 0:
+                    n_before = len(blobs)
+                    blobs = apply_isolation_gate(blobs, isolation_radius_px)
+                    total_isolation_filtered += (n_before - len(blobs))
+
+                total_blob_count += len(blobs)
                 tracks = tracker.update(
                     blobs, frame_idx,
                     effective_persist=effective_persist,
@@ -1340,6 +1968,13 @@ def main() -> None:
                             t.track_id, frame_idx,
                             alt_m, gsd_cm, t.hit_count,
                         )
+                        # Store for VLM classification
+                        t.confirm_frame_idx = frame_idx
+                        if t.bbox:
+                            x, y, w, h = t.bbox
+                            inv_s = 1.0 / args.scale
+                            t.confirm_bbox_full = (int(x*inv_s), int(y*inv_s),
+                                                   int(w*inv_s), int(h*inv_s))
                         # Save first-confirmation crop
                         if crops_dir:
                             x, y, w, h = t.bbox
@@ -1353,81 +1988,171 @@ def main() -> None:
                             if crop.size > 0:
                                 cname = crops_dir / f"T{t.track_id:04d}_f{frame_idx:05d}.jpg"
                                 cv2.imwrite(str(cname), crop)
+
+                # Periodic VLM snapshot (full frame, downsampled)
+                if args.vlm_classify and proc_count % VLM_SNAPSHOT_INTERVAL == 0:
+                    sh = int(full_h * snap_scale); sw = int(full_w * snap_scale)
+                    snap = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+                    vlm_snapshots.append((frame_idx, snap))
             else:
                 # First frame — no foreground, still advance tracker state
                 tracker.update([], frame_idx)
 
-            # ── Geo-history population + world-fixed filter ───────────────────
-            # Requires DJI telemetry.  Skipped silently when not available.
+            # ── World-frame variance filter ───────────────────────────────────
+            # Requires DJI telemetry.  Skipped silently when unavailable.
             #
-            # For each track matched this frame: geolocate its current centroid
-            # and append (lat, lon) to track.geo_history.  Once WF_MIN_FRAMES
-            # observations have accumulated, project the mean geo position back
-            # into the current camera frame and measure the reprojection error.
-            # Low error → blob is a world-fixed residual → suppress it.
-            # High error → blob is moving independently → keep it.
+            # Root cause of previous failure: SRT telemetry is ~1 Hz but video
+            # is 30 fps.  Raw telem.lat/lon in camera_history was a step function
+            # (same value repeated 30× per SRT block).  With C_i frozen while G_i
+            # drifted (blob pixel moves as camera pans), the variance formula
+            # produced multi-metre values even for static world-fixed structures.
+            #
+            # Fix: build a REFINED footprint and camera position for each frame by
+            # adding the H-accumulated displacement to the GPS anchor.  This gives
+            # both C_i and G_i at 30 Hz accuracy (homography error ≈ 6 cm over
+            # a 20-frame window, vs. 1–5 m GPS step error per SRT block).
 
-            # 1. Compute current frame footprint (full-res, for geo-projection)
+            # 1. GPS anchor — set once at first valid telemetry
+            if (cam_lat_ref is None and has_telem
+                    and telem is not None and telem.alt_m > 0
+                    and telem.lat != 0.0):
+                cam_lat_ref = telem.lat
+                cam_lon_ref = telem.lon
+
+            # 2. Refined footprint: SRT GPS anchor + H-accumulated offset
             current_footprint: Optional[tuple] = None
-            if has_telem and telem is not None and telem.alt_m > 0:
+            lat_c_refined: Optional[float] = None
+            lon_c_refined: Optional[float] = None
+
+            if (cam_lat_ref is not None and has_telem
+                    and telem is not None and telem.alt_m > 0):
                 try:
-                    gimbal_yaw = getattr(telem, "gimbal_yaw", 0.0)
-                    current_footprint = frame_corners(
-                        lat=telem.lat, lon=telem.lon,
+                    gimbal_yaw   = getattr(telem, "gimbal_yaw",   0.0)
+                    gimbal_pitch = getattr(telem, "gimbal_pitch", -90.0)
+                    m_lat_r    = 111320.0
+                    m_lon_r    = 111320.0 * math.cos(math.radians(cam_lat_ref))
+                    lat_c_refined = cam_lat_ref + cum_cam_delta_N / m_lat_r
+                    lon_c_refined = cam_lon_ref + cum_cam_delta_E / m_lon_r
+
+                    # Use oblique ray-tracing footprint when pitch is available.
+                    # This correctly maps pixels to ground for oblique cameras:
+                    #   - City skyline at 1–5 km → projects to 1–5 km from nadir ✓
+                    #   - Nearby crane at 200 m → projects to ~200 m from nadir ✓
+                    #   - Construction pit at 50 m → correct ground position ✓
+                    # The nadir frame_corners() would map everything within ±56 m,
+                    # making the range gate and world-fixed test useless for oblique shots.
+                    current_footprint = oblique_frame_corners(
+                        lat=lat_c_refined, lon=lon_c_refined,
                         alt_m=telem.alt_m,
                         gimbal_yaw_deg=gimbal_yaw,
+                        gimbal_pitch_deg=gimbal_pitch,
                         img_w=full_w, img_h=full_h,
                         sensor_w_mm=args.sensor_w, focal_mm=args.focal,
                     )
+                    # Fallback to nadir model if oblique rays don't all hit ground
+                    # (e.g., camera pitched so shallow that top of frame is sky)
+                    if current_footprint is None:
+                        current_footprint = frame_corners(
+                            lat=lat_c_refined, lon=lon_c_refined,
+                            alt_m=telem.alt_m,
+                            gimbal_yaw_deg=gimbal_yaw,
+                            img_w=full_w, img_h=full_h,
+                            sensor_w_mm=args.sensor_w, focal_mm=args.focal,
+                        )
                 except Exception:
                     current_footprint = None
 
             if current_footprint is not None:
                 nw_c, ne_c, se_c, sw_c = current_footprint
 
-                # 2. Append geo observation for every track hit this frame
+                # 3. Append geo + camera observation for every track hit this frame
                 for track in tracks:
                     if len(track.geo_history) < track.hit_count:
-                        # Track was matched this frame — geolocate centroid
                         cx_full = track.cx / args.scale
                         cy_full = track.cy / args.scale
-                        lat_b, lon_b = pixel_to_geo(
+                        lat_g, lon_g = pixel_to_geo(
                             cx_full, cy_full,
                             full_w, full_h,
                             nw_c, ne_c, se_c, sw_c,
                         )
-                        track.geo_history.append((lat_b, lon_b))
 
-                # 3. World-fixed test: run at WF_MIN_FRAMES, then every WF_RETEST_EVERY
+                        # ── Maximum ground-range gate ─────────────────────────────
+                        # Applied only during CAMERA MOTION (scene_speed > threshold).
+                        # When the camera is static, the world-fixed variance test
+                        # handles suppression correctly on its own — static objects
+                        # get zero variance and flying objects get non-zero variance.
+                        # If we apply the range gate during static periods it
+                        # incorrectly eliminates the bird (whose ray projects far past
+                        # it to the ground below).
+                        if (args.max_range > 0
+                                and scene_speed > 1.0):   # 1 px/frame ≈ 3.5 m/s
+                            dist_m = pixel_ground_range(
+                                cx_full, cy_full,
+                                full_w, full_h,
+                                telem.alt_m,
+                                getattr(telem, "gimbal_yaw",   0.0),
+                                getattr(telem, "gimbal_pitch", -90.0),
+                                args.sensor_w, args.focal,
+                            )
+                            if dist_m > args.max_range:
+                                if not track.suppressed:
+                                    track.suppressed   = True
+                                    track.suppressed_by = "range"
+                                    total_range_suppressed += 1
+                                continue   # don't append geo to history
+
+                        track.geo_history.append((lat_g, lon_g))
+                    if len(track.camera_history) < track.hit_count:
+                        track.camera_history.append(
+                            (lat_c_refined, lon_c_refined, telem.alt_m)
+                        )
+
+                # 4. World-fixed variance test: at WF_MIN_FRAMES, then every WF_RETEST_EVERY
                 for track in tracks:
-                    n_geo = len(track.geo_history)
-                    if n_geo < WF_MIN_FRAMES:
+                    n_obs = len(track.geo_history)
+                    if n_obs < WF_MIN_FRAMES:
                         continue
-                    if not (n_geo == WF_MIN_FRAMES or
-                            (n_geo - WF_MIN_FRAMES) % WF_RETEST_EVERY == 0):
+                    if not (n_obs == WF_MIN_FRAMES or
+                            (n_obs - WF_MIN_FRAMES) % WF_RETEST_EVERY == 0):
                         continue
 
-                    reproj_err = world_fixed_reprojection_error(
-                        track, current_footprint, full_w, full_h, args.scale
-                    )
-                    was_suppressed = track.suppressed
-                    track.suppressed = (reproj_err < WF_THRESHOLD_PX)
+                    min_var, best_h = world_fixed_variance_test(track)
+                    track.wf_variance_m = min_var
+                    track.wf_best_h_m   = best_h
+                    was_suppressed  = track.suppressed
+                    track.suppressed = (min_var < args.wf_threshold)
+                    if track.suppressed:
+                        track.suppressed_by = "world_fixed"
 
                     if track.suppressed and not was_suppressed:
                         log.debug(
-                            "  ○ Track T%d suppressed (world-fixed) "
-                            "reproj=%.1fpx  hits=%d",
-                            track.track_id, reproj_err, track.hit_count,
+                            "  ○ T%d world-fixed  var=%.3fm  h=%.0fm  hits=%d",
+                            track.track_id, min_var, best_h, track.hit_count,
                         )
                     elif was_suppressed and not track.suppressed:
                         log.info(
-                            "  ↑ Track T%d un-suppressed (now moving) "
-                            "reproj=%.1fpx  hits=%d",
-                            track.track_id, reproj_err, track.hit_count,
+                            "  ↑ T%d now moving   var=%.3fm  h=%.0fm  hits=%d",
+                            track.track_id, min_var, best_h, track.hit_count,
                         )
 
             # Count suppressed tracks for summary
             suppressed_this_frame = sum(1 for t in tracks if t.suppressed)
+
+            # ── Isolation status update ───────────────────────────────────────
+            # Re-evaluate is_isolated for every active confirmed track at the
+            # TRACK level each frame.  Even though isolated blobs are pre-filtered
+            # before the tracker, two tracks whose blobs were separately isolated
+            # could drift within radius of each other — this dynamic check catches it.
+            # Tracks that lose isolation (enter a cluster) are de-highlighted but
+            # not killed; they can regain isolated status if they move apart again.
+            if isolation_radius_px > 0:
+                active_conf = [t for t in tracks if t.confirmed and not t.suppressed]
+                for t in active_conf:
+                    t.is_isolated = not any(
+                        other.track_id != t.track_id and
+                        math.hypot(t.cx - other.cx, t.cy - other.cy) <= isolation_radius_px
+                        for other in active_conf
+                    )
 
             # ── Annotate + write ──────────────────────────────────────────────
             annotated = annotate(
@@ -1435,6 +2160,7 @@ def main() -> None:
                 frame_idx, frame_ms, alt_m, gsd_cm,
                 n_inliers, args.mode, warp_ok,
                 scene_speed, fg_fraction, effective_persist,
+                isolation_radius_px=isolation_radius_px,
             )
             writer.write(annotated)
 
@@ -1483,6 +2209,7 @@ def main() -> None:
     all_conf = tracker.all_confirmed_ever
     n_suppressed_ever = sum(1 for t in all_conf if t.suppressed)
     n_visible_movers  = sum(1 for t in all_conf if not t.suppressed)
+    n_isolated_ever   = sum(1 for t in all_conf if not t.suppressed and t.is_isolated)
 
     log.info("━" * 60)
     log.info("Finished in %.1f s", elapsed)
@@ -1496,17 +2223,22 @@ def main() -> None:
     if has_telem:
         log.info("  World-fixed (suppressed) : %d", n_suppressed_ever)
         log.info("  Genuine movers (visible) : %d", n_visible_movers)
+        if args.max_range > 0:
+            log.info("  Range-suppressed (>%.0fm): %d", args.max_range, total_range_suppressed)
     else:
         log.info("  (world-fixed filter disabled — no telemetry)")
+    if args.isolation_radius > 0:
+        log.info("  Isolation gate (radius=%.1f m): %d blobs pre-filtered across run",
+                 args.isolation_radius, total_isolation_filtered)
+        log.info("  Isolated confirmed tracks (primary targets): %d", n_isolated_ever)
 
     # Diagnose common "nothing detected" situations explicitly
     if n_visible_movers == 0 and has_telem:
         if len(seen_track_ids) > 0:
             log.warning(
-                "  ⚠ %d confirmed tracks, but all classified as world-fixed. "
-                "If genuine movers are expected: lower --wf-threshold (currently %.0f px) "
-                "or ensure telemetry alt/yaw are correct.",
-                len(seen_track_ids), WF_THRESHOLD_PX,
+                "  ⚠ %d confirmed tracks but all world-fixed. "
+                "Try lowering --wf-threshold (currently %.2f m).",
+                len(seen_track_ids), args.wf_threshold,
             )
         elif total_raw_count == 0:
             log.warning("  ⚠ No blobs reached detect_blobs() at all — "
@@ -1530,13 +2262,38 @@ def main() -> None:
     visible_movers = [t for t in all_conf if not t.suppressed]
     if visible_movers:
         log.info("")
-        log.info("  Genuine movers (reprojection error ≥ %.0f px):", WF_THRESHOLD_PX)
+        log.info("  Genuine movers (world-variance ≥ %.2f m):", args.wf_threshold)
         log.info("  %-6s  %-8s  %-8s", "Track", "Hits", "Misses")
         for t in sorted(visible_movers, key=lambda x: x.track_id):
             log.info("  T%-5d  %-8d  %-8d", t.track_id, t.hit_count, t.miss_count)
 
     log.info("")
     log.info("Output video  : %s", out_video)
+
+    # ── VLM classification (optional post-processing) ─────────────────────────
+    vlm_suppressed = 0
+    if args.vlm_classify:
+        api_key = args.vlm_api_key or __import__("os").environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            log.warning("VLM classify requested but no API key found.  "
+                        "Set OPENROUTER_API_KEY or use --vlm-api-key.")
+        elif not _HAS_OPENAI:
+            log.warning("VLM classify requires 'openai' package: pip install openai")
+        else:
+            log.info("━" * 60)
+            log.info("VLM classification pass …")
+            all_confirmed = tracker.all_confirmed_ever
+            vlm_suppressed = vlm_classify_visible_movers(
+                snapshots  = vlm_snapshots,
+                snap_scale = snap_scale,
+                all_tracks = all_confirmed,
+                api_key    = api_key,
+                model      = VLM_MODEL,
+            )
+            # Recount after VLM
+            n_visible_movers = sum(1 for t in all_confirmed if not t.suppressed)
+            log.info("After VLM: visible_movers=%d  vlm_suppressed=%d",
+                     n_visible_movers, vlm_suppressed)
 
     # Summary JSON
     summary = {
@@ -1545,7 +2302,7 @@ def main() -> None:
         "scale":                args.scale,
         "persist_frames":       args.persist,
         "wf_min_frames":        WF_MIN_FRAMES,
-        "wf_threshold_px":      WF_THRESHOLD_PX,
+        "wf_threshold_m":       args.wf_threshold,
         "sensor_w_mm":          args.sensor_w,
         "focal_mm":             args.focal,
         "min_object_m":         args.min_object,
@@ -1561,15 +2318,25 @@ def main() -> None:
         "blobs_passed_gate":    total_blob_count,
         "blobs_gate_filtered":  gate_filtered,
         "blobs_gate_filtered_pct": round(gate_filtered_pct, 1),
+        "isolation_radius_m":   args.isolation_radius,
+        "blobs_isolation_filtered": total_isolation_filtered,
+        "max_range_m":          args.max_range,
+        "range_suppressed":     total_range_suppressed,
         "confirmed_tracks":     len(seen_track_ids),
         "suppressed_tracks":    n_suppressed_ever,
         "visible_movers":       n_visible_movers,
+        "vlm_suppressed":       vlm_suppressed,
+        "isolated_movers":      n_isolated_ever,
         "track_details": [
             {
-                "id":         t.track_id,
-                "hits":       t.hit_count,
-                "misses":     t.miss_count,
-                "suppressed": t.suppressed,
+                "id":           t.track_id,
+                "hits":         t.hit_count,
+                "misses":       t.miss_count,
+                "suppressed":   t.suppressed,
+                "suppressed_by": t.suppressed_by,
+                "isolated":     t.is_isolated,
+                "wf_variance_m": round(t.wf_variance_m, 4) if t.wf_variance_m >= 0 else None,
+                "wf_best_h_m":   round(t.wf_best_h_m,  1) if t.wf_best_h_m  >= 0 else None,
             }
             for t in sorted(all_conf, key=lambda x: x.track_id)
         ],

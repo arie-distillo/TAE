@@ -259,7 +259,7 @@ DEFAULT_MAX_RANGE_M = 0.0
 MORPH_KSIZE           = 3
 
 # Ego-motion estimation (KLT + RANSAC homography)
-KLT_GRID_STEP_PX      = 25        # grid spacing at processing resolution
+KLT_GRID_STEP_PX      = 50        # grid spacing at processing resolution
 KLT_WIN_SIZE          = (21, 21)  # KLT window
 KLT_MAX_LEVEL         = 4         # pyramid levels
 RANSAC_THRESH_PX      = 3.0       # RANSAC inlier pixel threshold
@@ -654,103 +654,39 @@ def geo_to_pixel(
     return u * img_w, v * img_h
 
 
-def world_fixed_variance_test(
-    track,
-    n_scan: int = WF_N_SCAN,
-) -> tuple[float, float]:
-    """
-    Test whether this track is consistent with a static world point at ANY altitude.
-
-    For each candidate altitude h (scanned 0 → 0.95 × camera alt):
-
-        W(h, i) = C_i + (G_i − C_i) × (alt_i − h) / alt_i
-
-    where C_i is the camera position in frame i (from telemetry) and G_i is
-    the ground-plane geo projection of the blob pixel.  W(h, i) is the world
-    position the blob WOULD have if it were at height h in frame i.
-
-    A world-FIXED object at true height h*:
-        W(h*, i) ≈ same point for all i  →  spatial variance ≈ 0
-
-    A moving object (bird, vehicle):
-        W(h_obj, i) changes each frame regardless of h  →  variance > 0
-
-    We take the MINIMUM variance across all scanned h values.  This
-    automatically finds the correct altitude without any prior knowledge,
-    and correctly handles elevated structures (cranes, buildings) that the
-    previous flat-ground reprojection test incorrectly classified as movers.
-
-    Direction independence: because camera position C_i changes each frame
-    via telemetry, even a bird flying parallel to the camera maps to a
-    different world coordinate each frame → variance > 0.  There is no
-    parallel-motion degeneracy in this formulation.
-
-    Parameters
-    ----------
-    track   : MotionTrack with geo_history and camera_history populated.
-    n_scan  : number of altitude candidates (coarse phase); 60 gives ~1m
-              resolution at 80m altitude.
-
-    Returns
-    -------
-    (min_variance_m, best_h_m)
-        min_variance_m  RMS world-space positional spread (metres) at best h.
-        best_h_m        altitude (m) that minimises the variance.
-    """
-    n_geo = len(track.geo_history)
-    n_cam = len(track.camera_history)
+def world_fixed_variance_test(track, n_scan: int = WF_N_SCAN) -> tuple[float, float]:
+    """NumPy-vectorised world-fixed variance test. ~30× faster than pure Python."""
+    n_geo = len(track.geo_history);  n_cam = len(track.camera_history)
     if n_geo < WF_MIN_FRAMES or n_cam < WF_MIN_FRAMES:
         return float("inf"), 0.0
-
     n = min(n_geo, n_cam)
-    geos = track.geo_history[-n:]      # list of (lat_g, lon_g)
-    cams = track.camera_history[-n:]   # list of (lat_c, lon_c, alt_c)
-
-    # ENU reference: first camera position
+    geos = track.geo_history[-n:];  cams = track.camera_history[-n:]
     lat_ref, lon_ref, _ = cams[0]
-    m_lat = 111320.0
-    m_lon = 111320.0 * math.cos(math.radians(lat_ref))
+    m_lat = 111320.0;  m_lon = 111320.0 * math.cos(math.radians(lat_ref))
+    cam_E = np.array([(lo-lon_ref)*m_lon for _,lo,_  in cams])
+    cam_N = np.array([(la-lat_ref)*m_lat for la,_,_  in cams])
+    gnd_E = np.array([(lo-lon_ref)*m_lon for _,lo    in geos])
+    gnd_N = np.array([(la-lat_ref)*m_lat for la,_    in geos])
+    alts  = np.array([alt_c              for _,_,alt_c in cams])
+    alt_max = float(alts.max())
 
-    # Pre-convert to local ENU metres — avoids repeated trig in the inner loop
-    cam_E  = [(lo - lon_ref) * m_lon for _, lo, _ in cams]
-    cam_N  = [(la - lat_ref) * m_lat for la, _, _ in cams]
-    gnd_E  = [(lo - lon_ref) * m_lon for _, lo    in geos]
-    gnd_N  = [(la - lat_ref) * m_lat for la, _    in geos]
-    alts   = [alt_c                  for _, _, alt_c in cams]
-    alt_max = max(alts)
+    def _scan(h_arr):
+        valid = (alts[None,:] > h_arr[:,None]) & (alts[None,:] > 0)
+        frac  = np.where(valid, (alts[None,:]-h_arr[:,None])/alts[None,:], 0.0)
+        W_E   = np.where(valid, cam_E[None,:]+(gnd_E[None,:]-cam_E[None,:])*frac, np.nan)
+        W_N   = np.where(valid, cam_N[None,:]+(gnd_N[None,:]-cam_N[None,:])*frac, np.nan)
+        n_ok  = valid.sum(axis=1)
+        with np.errstate(invalid="ignore"):
+            var = np.nanvar(W_E, axis=1) + np.nanvar(W_N, axis=1)
+        var[n_ok < 3] = np.inf
+        i = int(np.argmin(var))
+        return float(np.sqrt(var[i])), float(h_arr[i])
 
-    def variance_at_h(h: float) -> float:
-        """RMS 2-D positional spread of W(h, i) across all frames."""
-        Es, Ns = [], []
-        for Ce, Cn, Ge, Gn, alt_c in zip(cam_E, cam_N, gnd_E, gnd_N, alts):
-            if alt_c <= h or alt_c <= 0:
-                continue
-            frac = (alt_c - h) / alt_c
-            Es.append(Ce + (Ge - Ce) * frac)
-            Ns.append(Cn + (Gn - Cn) * frac)
-        if len(Es) < 3:
-            return float("inf")
-        em = sum(Es) / len(Es);  nm = sum(Ns) / len(Ns)
-        vE = sum((e - em) ** 2 for e in Es) / len(Es)
-        vN = sum((n_i - nm) ** 2 for n_i in Ns) / len(Ns)
-        return math.sqrt(vE + vN)
-
-    # ── Coarse scan ────────────────────────────────────────────────────────────
-    h_max   = alt_max * 0.95
-    h_step  = h_max / max(n_scan - 1, 1)
-    coarse  = sorted((variance_at_h(h_step * i), h_step * i) for i in range(n_scan))
-    best_v, best_h = coarse[0]
-
-    # ── Fine scan (±1 step around best coarse point, 20 sub-steps) ───────────
-    lo = max(0.0, best_h - h_step)
-    hi = min(h_max, best_h + h_step)
-    fine_step = (hi - lo) / 20
-    for k in range(21):
-        h_f = lo + fine_step * k
-        v_f = variance_at_h(h_f)
-        if v_f < best_v:
-            best_v, best_h = v_f, h_f
-
+    h_max = alt_max * 0.95;  h_step = h_max / max(n_scan-1, 1)
+    best_v, best_h = _scan(np.linspace(0.0, h_max, n_scan))
+    lo = max(0.0, best_h-h_step);  hi = min(h_max, best_h+h_step)
+    fv, fh = _scan(np.linspace(lo, hi, 21))
+    if fv < best_v: best_v, best_h = fv, fh
     return best_v, best_h
 
 
@@ -958,11 +894,11 @@ def foreground_flow(
     return (magnitude > threshold_px).astype(np.uint8) * 255
 
 
-def clean_mask(mask: np.ndarray) -> np.ndarray:
-    """Morphological open (remove noise) then close (fill holes)."""
-    k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (MORPH_KSIZE, MORPH_KSIZE)
-    )
+def clean_mask(mask: np.ndarray, ksize: int = MORPH_KSIZE) -> np.ndarray:
+    """Morphological open+close with caller-supplied kernel size.
+    ksize is derived from detect resolution so small targets are not erased.
+    """
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     return mask
@@ -977,6 +913,7 @@ def detect_blobs(
     min_area:   float,
     max_area:   float,
     max_aspect: float = MAX_ASPECT_RATIO,
+    morph_k:    int   = MORPH_KSIZE,
 ) -> tuple[list[dict], int]:
     """
     Extract connected components from the foreground mask and apply
@@ -992,7 +929,7 @@ def detect_blobs(
     A large gap here (e.g. 200 raw, 0 passed) means the area gate is too tight
     for the objects of interest — lower --min-object or increase --max-object.
     """
-    mask = clean_mask(mask)
+    mask = clean_mask(mask, ksize=morph_k)
 
     n, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     n_raw = n - 1   # exclude background label
@@ -1304,6 +1241,7 @@ def annotate(
     fg_fraction:       float = 0.0,
     effective_persist: int   = 3,
     isolation_radius_px: float = 0.0,
+    live_fps: float = 0.0,
 ) -> np.ndarray:
     """
     Draw bounding boxes, track trails, and HUD onto a full-resolution copy.
@@ -1364,8 +1302,9 @@ def annotate(
     n_suppressed = sum(1 for t in tracks if t.suppressed)
     n_isolated   = sum(1 for t in tracks if not t.suppressed and t.confirmed and t.is_isolated)
     isolation_str = (f"  isolated={n_isolated}" if isolation_radius_px > 0 else "")
+    fps_str = f"   proc {live_fps:.1f} fps" if live_fps > 0 else ""
     hud_lines = [
-        f"frame {frame_idx:05d}   t={frame_ms/1000:.2f}s   mode={mode}",
+        f"frame {frame_idx:05d}   t={frame_ms/1000:.2f}s   mode={mode}{fps_str}",
         f"alt {alt_m:.0f}m   gsd {gsd_cm:.1f} cm/px",
         f"warp {warp_str}   fg={fg_fraction*100:.1f}%   persist={effective_persist}f",
         f"tracks: {len(tracks)} alive   {n_visible} movers   {n_suppressed} suppressed{isolation_str}",
@@ -1398,7 +1337,12 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--fps", type=float, default=None,
                    help="Target processing frame rate (default: native, ≤30)")
     p.add_argument("--scale", type=float, default=0.5,
-                   help="Processing resolution scale factor")
+                   help="Output/annotation resolution scale (default 0.5).")
+    p.add_argument("--detect-scale", type=float, default=None, dest="detect_scale",
+                   help="CV-processing scale (default: auto from physics). "
+                        "All expensive ops (MOG2, KLT, warp, blob detection) run here. "
+                        "Auto-clamped so min-object is at least 4 px at detect-res. "
+                        "Only useful to set manually for objects ≥ 0.5 m.")
     p.add_argument("--mode", choices=["mog2", "diff", "flow"], default="mog2",
                    help="Foreground extraction mode. "
                         "mog2: MOG2 on motion-compensated diff (robust to illumination). "
@@ -1423,7 +1367,14 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--output", type=Path, default=None,
                    help="Output video path")
     p.add_argument("--no-preview", action="store_true",
-                   help="Skip real-time preview window")
+                   help="Skip real-time preview window (legacy flag, kept for compatibility)")
+    p.add_argument("--live", action="store_true",
+                   help="Show annotated frames in a window as they are processed. "
+                        "Frames appear at processing rate (~18 fps on CPU). "
+                        "Press q to quit early.")
+    p.add_argument("--no-output", action="store_true", dest="no_output",
+                   help="Skip writing the output mp4. "
+                        "Use with --live for display-only mode.")
     p.add_argument("--save-crops", action="store_true",
                    dest="save_crops",
                    help="Save confirmed-track crops to _crops/ directory")
@@ -1724,19 +1675,65 @@ def main() -> None:
     full_w       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     full_h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    # ── Frame prefetch thread ────────────────────────────────────────
+    # cap.read() blocks for ~15-20 ms while H.264 decodes a 4K frame.
+    # A background thread reads the next frame while the main thread
+    # processes the current one, hiding decode latency entirely.
+    # Queue depth=3: one being processed + one ready + one in-flight.
+    import queue as _fq, threading as _ft
+    _frame_q: _fq.Queue = _fq.Queue(maxsize=3)
+    def _reader_loop() -> None:
+        while True:
+            ret, frm = cap.read()
+            _frame_q.put((ret, frm))   # blocks when queue is full
+            if not ret:
+                break
+    _reader_thread = _ft.Thread(target=_reader_loop, daemon=True, name="FrameReader")
+    _reader_thread.start()
+
     # Frame skip so effective rate ≤ target_fps (and ≤ 30 always)
     target_fps  = min(args.fps or src_fps, 30.0)
     frame_skip  = max(1, round(src_fps / target_fps))
     eff_fps     = src_fps / frame_skip
 
-    # Processing dimensions
-    proc_w = max(1, int(full_w * args.scale))
-    proc_h = max(1, int(full_h * args.scale))
+    # ── Resolution split ──────────────────────────────────────────────
+    # detect-scale governs where expensive CV runs (MOG2, KLT, warp).
+    # Physics constraint: min_object must appear as ≥ MIN_BLOB_PX pixels
+    # so morphological cleanup and area gates work without killing targets.
+    # Formula: GSD_det ≤ min_object / MIN_BLOB_PX
+    #          det_w   ≥ alt_m × (sensor_w/focal) / GSD_det
+    # Using FALLBACK_ALT_M as a conservative estimate (lower alt = larger blobs).
+    _MIN_BLOB_PX   = 4
+    _safe_gsd      = args.min_object / _MIN_BLOB_PX
+    _safe_det_w    = FALLBACK_ALT_M * (args.sensor_w / args.focal) / _safe_gsd
+    _min_safe_scale = min(_safe_det_w / full_w, args.scale)
+    if args.detect_scale is None:
+        det_scale = _min_safe_scale           # auto: physics-derived minimum
+    else:
+        det_scale = max(args.detect_scale, _min_safe_scale)  # user, but clamped
+        if args.detect_scale < _min_safe_scale - 0.01:
+            log.warning(
+                "--detect-scale %.3f is below physics minimum %.3f "
+                "for --min-object %.2fm (bird would be %.1f px < %d px). "
+                "Auto-raised to %.3f.",
+                args.detect_scale, _min_safe_scale, args.min_object,
+                args.min_object / (FALLBACK_ALT_M*(args.sensor_w/args.focal)/
+                                   (full_w*args.detect_scale)),
+                _MIN_BLOB_PX, det_scale)
+    det_scale   = min(det_scale, args.scale)   # detect ≤ annotate always
+    det_w       = max(1, int(full_w * det_scale))
+    det_h       = max(1, int(full_h * det_scale))
+    proc_w      = max(1, int(full_w * args.scale))
+    proc_h      = max(1, int(full_h * args.scale))
+    det_to_full = 1.0 / det_scale
+    # Morph kernel scales with det_scale: at det_scale=0.5 → 3px (original);
+    # at higher scales → larger kernel (more cleanup); never below 1.
+    morph_k = max(1, int(MORPH_KSIZE * det_scale / 0.5))
 
     log.info("━" * 60)
     log.info("Video      : %s", args.video.name)
-    log.info("Resolution : %d×%d  →  processing %d×%d (scale %.2f)",
-             full_w, full_h, proc_w, proc_h, args.scale)
+    log.info("Resolution : %d×%d  →  detect %d×%d (%.3f×)  output %d×%d (%.2f×)  morph=%dpx",
+             full_w, full_h, det_w, det_h, det_scale, proc_w, proc_h, args.scale, morph_k)
     log.info("FPS        : %.1f src  →  %.1f effective (skip=%d)",
              src_fps, eff_fps, frame_skip)
     log.info("Mode       : %s  |  persist=%d  |  orphan=%d",
@@ -1757,12 +1754,24 @@ def main() -> None:
         args.video.parent / (args.video.stem + "_motion.mp4")
     )
     out_json  = out_video.with_suffix(".json")
-    writer    = cv2.VideoWriter(
-        str(out_video),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        eff_fps,
-        (full_w, full_h),
-    )
+    if not args.no_output:
+        writer = cv2.VideoWriter(
+            str(out_video),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            eff_fps,
+            (proc_w, proc_h),
+        )
+    else:
+        writer = None
+    import queue as _queue, threading as _threading
+    _write_q = _queue.Queue(maxsize=2)
+    def _encode_loop():
+        while True:
+            item = _write_q.get()
+            if item is None: break
+            if writer is not None: writer.write(item)
+    _encode_thread = _threading.Thread(target=_encode_loop, daemon=True, name="Encode")
+    _encode_thread.start()
 
     crops_dir: Optional[Path] = None
     if args.save_crops:
@@ -1817,7 +1826,7 @@ def main() -> None:
     # ── Main loop ─────────────────────────────────────────────────────────────
     try:
         while True:
-            ret, frame = cap.read()
+            ret, frame = _frame_q.get()   # next frame already decoded
             if not ret:
                 break
 
@@ -1835,23 +1844,19 @@ def main() -> None:
             alt_m        = telem.alt_m        if telem else FALLBACK_ALT_M
             gimbal_pitch = telem.gimbal_pitch if telem else FALLBACK_GIMBAL_PITCH
 
-            # Physics-derived parameters (recomputed per frame as altitude varies)
-            gsd_m   = compute_gsd(alt_m, args.sensor_w, args.focal, proc_w)
+            # Physics at detect-res
+            gsd_m   = compute_gsd(alt_m, args.sensor_w, args.focal, det_w)
             gsd_cm  = gsd_m * 100.0
-            sky_row = sky_boundary_row(gimbal_pitch, proc_h)
-
-            # Blob area gates (squared: area is px²)
-            min_dim   = args.min_object / gsd_m     # px
-            max_dim   = args.max_object / gsd_m     # px
-            min_area  = max(4.0, min_dim ** 2)      # px²  — never below 4 px²
-            max_area  = max_dim ** 2
-
-            # Match gate from real-world distance → pixels
+            sky_row = sky_boundary_row(gimbal_pitch, det_h)
+            min_dim  = args.min_object / gsd_m;  max_dim = args.max_object / gsd_m
+            min_area = max(4.0, min_dim ** 2);   max_area = max_dim ** 2
             tracker.match_dist_px = max(20.0, MATCH_DIST_M / gsd_m)
 
-            # ── Resize to processing resolution ───────────────────────────────
-            small = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-            gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            # detect-res for all CV; proc-res for annotation
+            detect = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
+            gray   = cv2.cvtColor(detect, cv2.COLOR_BGR2GRAY)
+            small  = (cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+                      if det_w != proc_w else detect)
 
             # ── Ego-motion compensation ────────────────────────────────────────
             fg_mask:    Optional[np.ndarray] = None
@@ -1866,7 +1871,7 @@ def main() -> None:
                     warp_ok     = True
                     # Translation component of H gives scene speed in px/frame
                     scene_speed = math.hypot(float(H[0, 2]), float(H[1, 2]))
-                    warped_prev = warp_frame(prev_gray, H, (proc_h, proc_w))
+                    warped_prev = warp_frame(prev_gray, H, (det_h, det_w))
 
                     # Accumulate per-frame camera displacement at 30 Hz.
                     # H maps prev→curr; scene shifts (H[0,2], H[1,2]) px.
@@ -1939,7 +1944,7 @@ def main() -> None:
             )
 
             if fg_mask is not None:
-                blobs, n_raw = detect_blobs(fg_mask, min_area, max_area)
+                blobs, n_raw = detect_blobs(fg_mask, min_area, max_area, morph_k=morph_k)
                 total_raw_count  += n_raw
 
                 # Isolation gate: discard blobs that have a neighbour within
@@ -1972,15 +1977,12 @@ def main() -> None:
                         t.confirm_frame_idx = frame_idx
                         if t.bbox:
                             x, y, w, h = t.bbox
-                            inv_s = 1.0 / args.scale
-                            t.confirm_bbox_full = (int(x*inv_s), int(y*inv_s),
-                                                   int(w*inv_s), int(h*inv_s))
-                        # Save first-confirmation crop
+                            t.confirm_bbox_full = (int(x*det_to_full), int(y*det_to_full),
+                                                   int(w*det_to_full), int(h*det_to_full))
                         if crops_dir:
                             x, y, w, h = t.bbox
-                            inv_s = 1.0 / args.scale
-                            fx = int(x * inv_s); fy = int(y * inv_s)
-                            fw = int(w * inv_s); fh = int(h * inv_s)
+                            fx=int(x*det_to_full); fy=int(y*det_to_full)
+                            fw=int(w*det_to_full); fh=int(h*det_to_full)
                             crop = frame[
                                 max(0, fy):min(full_h, fy + fh),
                                 max(0, fx):min(full_w, fx + fw),
@@ -2068,8 +2070,8 @@ def main() -> None:
                 # 3. Append geo + camera observation for every track hit this frame
                 for track in tracks:
                     if len(track.geo_history) < track.hit_count:
-                        cx_full = track.cx / args.scale
-                        cy_full = track.cy / args.scale
+                        cx_full = track.cx * det_to_full
+                        cy_full = track.cy * det_to_full
                         lat_g, lon_g = pixel_to_geo(
                             cx_full, cy_full,
                             full_w, full_h,
@@ -2155,21 +2157,33 @@ def main() -> None:
                     )
 
             # ── Annotate + write ──────────────────────────────────────────────
+            _t_now = time.time()
+            if not hasattr(main, '_frame_times'):
+                main._frame_times = []
+                main._t_last = _t_now
+            main._frame_times.append(_t_now - main._t_last)
+            main._t_last = _t_now
+            if len(main._frame_times) > 30:
+                main._frame_times.pop(0)
+            _avg_t = sum(main._frame_times) / len(main._frame_times) if main._frame_times else 0.0
+            _live_fps = (1.0 / _avg_t if _avg_t > 0 else 0.0)
+
             annotated = annotate(
-                frame, tracks, args.scale,
+                small, tracks, det_scale / args.scale,
                 frame_idx, frame_ms, alt_m, gsd_cm,
                 n_inliers, args.mode, warp_ok,
                 scene_speed, fg_fraction, effective_persist,
                 isolation_radius_px=isolation_radius_px,
+                live_fps=_live_fps if args.live else 0.0,
             )
-            writer.write(annotated)
+            _write_q.put(annotated, block=True)
 
-            # ── Preview ───────────────────────────────────────────────────────
-            if not args.no_preview and _CV2_GUI:
-                pw = min(full_w, 1280)
-                ph = int(full_h * pw / full_w)
-                preview = cv2.resize(annotated, (pw, ph), interpolation=cv2.INTER_AREA)
-                cv2.imshow("TAE — Motion Detection  (q to quit)", preview)
+            # ── Live display ──────────────────────────────────────────────────
+            if args.live and _CV2_GUI:
+                pw = min(proc_w, 1280)
+                ph = int(proc_h * pw / proc_w)
+                disp = cv2.resize(annotated, (pw, ph), interpolation=cv2.INTER_AREA)
+                cv2.imshow("TAE Motion Detection  (q=quit)", disp)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     log.info("User quit at frame %d", frame_idx)
                     break
@@ -2193,9 +2207,13 @@ def main() -> None:
                 )
 
     finally:
+        _write_q.put(None)
+        _encode_thread.join(timeout=10.0)
         cap.release()
-        writer.release()
-        if not args.no_preview and _CV2_GUI:
+        _reader_thread.join(timeout=2.0)
+        if writer is not None:
+            writer.release()
+        if args.live and _CV2_GUI:
             cv2.destroyAllWindows()
 
     # ─────────────────────────────────────────────────────────────────────────

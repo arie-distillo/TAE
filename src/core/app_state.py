@@ -50,4 +50,10 @@ _state: dict = {
     "video_files":      [],   # [filename, ...] in upload order
     "frame_timestamps": {},   # {frame_name: timestamp_ms}
     "last_query":       None,
+
+    # motion detection
+    "motion_tracks":         {},    # {track_id: MotionTrack-like dict}
+    "motion_enabled":        False, # True when user has selected motion intent
+    "motion_frame_count":    0,     # frames processed by motion worker
+    "motion_last_frame":     None,  # bytes: latest annotated JPEG for Monitor panel
 }

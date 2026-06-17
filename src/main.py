@@ -40,9 +40,10 @@ from core.app_state import (
 from core.services import (
     _build_map, _optimal_zoom, _recenter_on_detections, _save_tracks,
     _load_tile, _annotate_and_save, _tile_to_static_url,
-    _extract_video_frames, _save_detections, _load_detections,
+    _extract_video_frames, _save_detections, _load_detections, _load_motion_tracks, _save_motion_tracks, 
     init as _init_services, 
 )
+from core.motion_worker import MotionDetectionWorker
 from ai.intent import (
     IntentClassifier, ObjectDetectionParams, AnomalyDetectionParams,
     ClassifiedQuery,
@@ -69,7 +70,7 @@ for _wf in ("watchfiles", "watchfiles.main"):
 logger = logging.getLogger("TAE-UI")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 class _SuppressPollingRoutes(logging.Filter):
-    _SUPPRESS = ("/stream/updates",)
+    _SUPPRESS = ("/stream/updates", "/motion/frame", "/motion/status")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -111,6 +112,7 @@ stream_mgr = StreamManager()
 # ── Streaming pipeline optimisation (Phase 1 + 2) ────────────────────────
 _novelty_tracker = TileNoveltyTracker()
 _bg_worker       = BackgroundDetectionWorker()
+_motion_worker = MotionDetectionWorker()
 
 def _main_get_search_lib():          # rename locally to be unambiguous
     global _search_lib
@@ -262,6 +264,17 @@ def _restore_state() -> None:
                 )
     except Exception as e:
         logger.warning("Could not restore detections from disk: %s", e)
+
+    # ── Restore motion tracks from disk ──────────────────────────────────
+    try:
+        paths = _state.get("mission_paths")
+        if paths and paths.motion_tracks.exists():
+            mt = _load_motion_tracks(paths.motion_tracks)
+            if mt:
+                _state["motion_tracks"] = mt
+                logger.info("Restored %d motion track(s) from disk", len(mt))
+    except Exception as e:
+        logger.warning("Could not restore motion tracks: %s", e)
 
 
 def _startup() -> None:
@@ -554,6 +567,12 @@ def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> F
                 Span("Anomaly detection"),
                 cls="intent-row",
             ),
+            Label(
+                Input(type="checkbox", name="intents", value="motion_detection",
+                    checked=("motion_detection" in intents) or None),
+                Span("Motion detection  (track all movers)"),
+                cls="intent-row",
+            ),
             Button(
                 save_label, cls="drawer-save-btn",
                 **{save_method: save_route,
@@ -746,43 +765,42 @@ def _video_panel() -> FT:
 # ─────────────────────────────────────────────────────────────────────────────
 # Monitor panel  (debug: raw video/stream without detection overlays)
 # ─────────────────────────────────────────────────────────────────────────────
-def _monitor_panel() -> FT:
-    body = [
-        Div(
-            Div("No active video or stream.", cls="video-empty"),
-            id="monitor-panel-inner",
-            cls="video-panel-inner",
-            hx_get="/monitor_panel",
-            hx_trigger="load",
-            hx_swap="innerHTML",
+def _monitor_panel(hidden: bool = True) -> FT:
+    body = Div(
+        Img(
+            id  = "monitor-frame",
+            src = "/motion/frame",
+            cls = "monitor-img",
         ),
-    ]
-    return _panel(
-        panel_id="tae-monitor-panel",
-        icon_cls="fas fa-tv",
-        panel_icon_cls="pi-monitor",
-        title="Monitor",
-        body=body,
-        has_resize=True,
+        Script(
+            "setInterval(function(){"
+            "  var img = document.getElementById('monitor-frame');"
+            "  if (img) img.src = '/motion/frame?t=' + Date.now();"
+            "}, 250);"
+        ),
+        Div(
+            Span(id="monitor-track-count", cls="monitor-stat",
+                hx_get="/motion/status",
+                hx_trigger="every 2s",
+                hx_swap="outerHTML"),
+            cls="monitor-footer",
+        ),
+        cls="monitor-body",
     )
+    p = _panel(
+        panel_id       = "tae-monitor-panel",
+        icon_cls       = "fas fa-broadcast-tower",
+        panel_icon_cls = "pi-monitor",
+        title          = "Monitor",
+        body           = body,
+        has_resize     = True,
+    )
+    if hidden:
+        p.attrs["style"] = "display:none;"
+    return p
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Frame / detection panel  (replaces old .img-panel + _image_panel_empty)
-# ─────────────────────────────────────────────────────────────────────────────
-def _image_panel_empty():
-    """
-    Kept for HTMX targets in existing routes — returns the inner content
-    that gets swapped into #tae-frame-panel .panel-body.
-    """
-    return (
-        Div(
-            I(cls="fas fa-search-location"),
-            P("Click a map marker to inspect detected objects.", cls="empty-txt"),
-            cls="empty-state",
-        ),
-    )
- 
- 
+
+
 def _frame_panel(hidden: bool = True) -> FT:
     body = Div(
         *_image_panel_empty(),
@@ -847,12 +865,15 @@ def _panel_toolbar() -> FT:
         _pill("Map",    "tae-map-panel",   "map-marked-alt"),
         _pill("Chat",   "tae-chat-panel",  "crosshairs"),
         _pill("Video",  "tae-video-panel", "video"),
-        _pill("Monitor", "tae-monitor-panel", "tv"),
         _pill("Frame",  "tae-frame-panel",  "search-location"),
         _pill("Detect", "tae-det-panel",    "bullseye"),
+        _pill("Monitor", "tae-monitor-panel", "broadcast-tower"),
         cls="nav-pill",
     )
  
+# ─────────────────────────────────────────────────────────────────────────────
+# Frame / detection panel  (replaces old .img-panel + _image_panel_empty)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _image_panel_empty() -> tuple:
     return (
@@ -904,9 +925,9 @@ def _index_page(build_map_fn, state: dict) -> tuple:
             _map_panel(),
             _chat_panel(),
             _video_panel(),
-            _monitor_panel(),
             _frame_panel(hidden=True),
             _det_panel(),
+            _monitor_panel(hidden=True),
             cls="tae-workspace",
         ),
         # Settings drawer — slides in from the right
@@ -1001,25 +1022,6 @@ def feed_drawer():
                             "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
                 style="margin-bottom:8px",
             ),
-            Div(
-                Span("GPS anchor",
-                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                           "text-transform:uppercase"),
-                Div(
-                    Input(id="stream-lat", type="number", step="any",
-                          value=str(round(lat0, 5)), placeholder="Lat",
-                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
-                                "border-radius:5px;padding:6px 8px;color:var(--text);"
-                                "font-family:var(--font-mono);font-size:11px;outline:none"),
-                    Input(id="stream-lon", type="number", step="any",
-                          value=str(round(lon0, 5)), placeholder="Lon",
-                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
-                                "border-radius:5px;padding:6px 8px;color:var(--text);"
-                                "font-family:var(--font-mono);font-size:11px;outline:none"),
-                    style="display:flex;gap:6px;margin-top:4px",
-                ),
-                style="margin-bottom:10px",
-            ),
             Button(
                 "▶  Start stream" if not has_stream else "■  Stop stream",
                 onclick="startStream(event)" if not has_stream else "stopStream()",
@@ -1103,25 +1105,6 @@ def feed_panel():
                             "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
                 style="margin-bottom:8px",
             ),
-            Div(
-                Span("GPS anchor",
-                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                           "text-transform:uppercase"),
-                Div(
-                    Input(id="stream-lat", type="number", step="any",
-                          value=str(round(lat0, 5)), placeholder="Lat",
-                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
-                                "border-radius:5px;padding:6px 8px;color:var(--text);"
-                                "font-family:var(--font-mono);font-size:11px;outline:none"),
-                    Input(id="stream-lon", type="number", step="any",
-                          value=str(round(lon0, 5)), placeholder="Lon",
-                          style="flex:1;background:var(--bg3);border:1px solid var(--border);"
-                                "border-radius:5px;padding:6px 8px;color:var(--text);"
-                                "font-family:var(--font-mono);font-size:11px;outline:none"),
-                    style="display:flex;gap:6px;margin-top:4px",
-                ),
-                style="margin-bottom:10px",
-            ),
             Button(
                 "▶  Start stream" if not has_stream else "■  Stop stream",
                 onclick="startStream(event)" if not has_stream else "stopStream()",
@@ -1199,23 +1182,6 @@ def stream_panel():
                                 "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
                     style="margin-bottom:10px",
                 ),
-                Div(
-                    Span("Anchor GPS (used when stream has no telemetry)", style="font-size:9px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase"),
-                    Div(
-                        Input(id="stream-lat", type="number", step="any",
-                              value=str(round(lat0, 5)), placeholder="Latitude",
-                              style="flex:1;background:var(--bg3);border:1px solid var(--border);"
-                                    "border-radius:5px;padding:6px 9px;color:var(--text);"
-                                    "font-family:var(--font-mono);font-size:11px;outline:none"),
-                        Input(id="stream-lon", type="number", step="any",
-                              value=str(round(lon0, 5)), placeholder="Longitude",
-                              style="flex:1;background:var(--bg3);border:1px solid var(--border);"
-                                    "border-radius:5px;padding:6px 9px;color:var(--text);"
-                                    "font-family:var(--font-mono);font-size:11px;outline:none"),
-                        style="display:flex;gap:6px;margin-top:4px",
-                    ),
-                    style="margin-bottom:12px",
-                ),
                 Button(
                     "▶ Start stream",
                     onclick="startStream(event)",
@@ -1272,7 +1238,24 @@ async def stream_start(request: Request):
         _novelty_tracker.reset()
         _bg_worker.start()
 
+        mid = _state.get("mission_id")
+        m   = mission_mgr.get(mid) if mid else None
+
         stream_mgr.start(url, lat, lon, hls_dir, frames_dir, segments_dir=segments_dir)
+
+        # Start motion worker AFTER stream_mgr so _source_telem is populated
+        mid = _state.get("mission_id")
+        m   = mission_mgr.get(mid) if mid else None
+        if m and "motion_detection" in (m.allowed_intents or []):
+            _motion_worker.start(
+                paths          = paths,
+                segments_dir   = segments_dir,
+                get_srt_frames = lambda: stream_mgr._source_telem,
+                analyst        = analyst,
+            )
+        else:
+            _state["motion_enabled"] = False
+
         _state["video_files"] = list(_state.get("video_files", []))  # keep existing
         logger.info("Stream started: url=%s lat=%s lon=%s", url, lat, lon)
         return JSONResponse({"ok": True})
@@ -1286,6 +1269,7 @@ def stream_stop():
     """Stop the live stream."""
     from starlette.responses import JSONResponse
     _bg_worker.stop()
+    _motion_worker.stop()
     stream_mgr.stop()
     from core import confidence_stats as _cstats
     _paths = _state.get("mission_paths")
@@ -1579,73 +1563,31 @@ def video_panel_content():
         ),
     )
 
-@rt("/monitor_panel")
-def monitor_panel_content():
-    """HTMX: Monitor panel — raw video/stream, no detection overlays (debug)."""
-    st          = stream_mgr.status()
-    video_files = _state.get("video_files", [])
-    paths       = _state.get("mission_paths")
+_motion_placeholder: bytes | None = None
 
-    # ── Case 1: live stream running and HLS playlist ready ───────────────────
-    if st["running"] and st.get("hls_ready"):
-        ts = int(time.time() * 1000)
-        return (
-            Div(
-                Span("Monitor — HLS Stream",
-                     style="font-family:var(--font-head);font-size:13px;font-weight:700;"
-                           "color:#f87171;letter-spacing:.06em"),
-                cls="video-panel-header",
-            ),
-            Div(
-                NotStr(
-                    f'<video id="monitor-video" controls autoplay muted playsinline'
-                    f' style="width:100%;display:block;max-height:280px;'
-                    f'object-fit:contain;background:#000"></video>'
-                    f'<script>'
-                    f'(function(){{'
-                    f'  var v=document.getElementById("monitor-video");'
-                    f'  var src="/hls/stream.m3u8?_={ts}";'
-                    f'  if(typeof Hls!=="undefined"&&Hls.isSupported()){{'
-                    f'    var h=new Hls({{lowLatencyMode:true}});'
-                    f'    h.loadSource(src); h.attachMedia(v);'
-                    f'  }}else if(v.canPlayType("application/vnd.apple.mpegurl")){{'
-                    f'    v.src=src;'
-                    f'  }}'
-                    f'}})();'
-                    f'</script>'
-                ),
-                cls="video-wrap",
-            ),
-        )
-
-    # ── Case 2: uploaded video file ───────────────────────────────────────────
-    if video_files and paths:
-        vfile = video_files[0]
-        return (
-            Div(
-                Span(f"Monitor — {vfile[:30]}",
-                     style="font-family:var(--font-head);font-size:13px;font-weight:700;"
-                           "color:var(--blue);letter-spacing:.06em"),
-                cls="video-panel-header",
-            ),
-            Div(
-                NotStr(
-                    f'<video id="monitor-video" controls preload="metadata"'
-                    f' src="/serve_video?filename={vfile}"'
-                    f' style="width:100%;display:block;max-height:280px;'
-                    f'object-fit:contain;background:#000">'
-                    f'Your browser does not support HTML5 video.</video>'
-                ),
-                cls="video-wrap",
-            ),
-        )
-
-    # ── Case 3: nothing to show yet ───────────────────────────────────────────
-    return Div(
-        "No active video or stream. Upload a video or start a live stream.",
-        cls="video-empty",
+@rt("/motion/frame")
+def motion_frame():
+    from starlette.responses import Response
+    global _motion_placeholder
+    frame_bytes = _state.get("motion_last_frame")
+    if not frame_bytes:
+        if _motion_placeholder is None:
+            import numpy as _np
+            _ok, _buf = cv2.imencode(".jpg", _np.zeros((2, 2, 3), dtype=_np.uint8))
+            _motion_placeholder = _buf.tobytes() if _ok else b""
+        frame_bytes = _motion_placeholder
+    return Response(
+        content=frame_bytes,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
     )
 
+@rt("/motion/status")
+def motion_status():
+    """HTMX fragment: track count badge for Monitor panel footer."""
+    n = len(_state.get("motion_tracks", {}))
+    fc = _state.get("motion_frame_count", 0)
+    return Span(f"{n} tracks · {fc} frames", id="monitor-track-count")
 
 @rt("/video_detections")
 def video_detections():
@@ -2435,6 +2377,9 @@ def frame_view(det_id: str, mode: str = "tile"):
     if not det:
         return P("Detection not found.", style="color:var(--danger);padding:20px")
 
+    # Sanitise for use in HTML id / CSS selector (spaces are illegal)
+    safe_id = det_id.replace(" ", "_")
+
     parent_path = det.get("parent_path")
     tx, ty = det.get("tile_x", 0), det.get("tile_y", 0)
     tw, th = det.get("tile_w", 0), det.get("tile_h", 0)
@@ -2507,7 +2452,7 @@ def frame_view(det_id: str, mode: str = "tile"):
     toggle_btn = Button(
         other_label,
         hx_get=f"/frame_view/{det_id}?mode={other_mode}",
-        hx_target=f"#fv-{det_id}",
+        hx_target=f"#fv-{safe_id}",
         hx_swap="outerHTML",
         style=("margin:8px 12px;padding:5px 14px;"
                "background:var(--bg4);border:1px solid var(--border);"
@@ -2517,7 +2462,7 @@ def frame_view(det_id: str, mode: str = "tile"):
     return Div(
         toggle_btn,
         Img(src=img_url, style="width:100%;display:block", loading="lazy") if img_url else "",
-        id=f"fv-{det_id}",
+        id=f"fv-{safe_id}",
     )
 
 
@@ -2555,6 +2500,22 @@ def _stream_on_frames(paths, lat, lon):
     _state['tile_count']  = _state.get('tile_count',  0) + tiles_ok
     _state['ingested']    = True
     logger.info('Stream (anchor): %d tiles from %d frames', tiles_ok, len(paths))
+
+    # ── feed motion worker ────────────────────────────────────────
+    if _state.get("motion_enabled"):
+        from core.video import SRTFrame as _SRTFrame
+        _alt = float(_state.get("mean_alt_m", 80.0))
+        for i, p in enumerate(paths):
+            _motion_worker.enqueue(p, _SRTFrame(
+                frame_idx    = i,
+                timestamp_ms = i * 100,
+                lat          = lat,
+                lon          = lon,
+                alt_m        = _alt,
+                gimbal_pitch = -90.0,
+                gimbal_yaw   = 0.0,
+                gimbal_roll  = 0.0,
+            ))
 
 
 def _get_active_track_positions() -> list[tuple[float, float]]:

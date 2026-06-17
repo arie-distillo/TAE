@@ -22,6 +22,7 @@ class MissionPaths:
     detections:   Path   # reserved for future use
     maps:         Path   # generated map.html
     sim_metadata: Path   # uploads/pose_metadata.json
+    motion_tracks: Path   # mission_root/motion_tracks/
 
     @classmethod
     def for_mission(cls, data_dir: str, mission_id: str) -> "MissionPaths":
@@ -34,11 +35,12 @@ class MissionPaths:
             detections   = root / "detections",
             maps         = root / "maps",
             sim_metadata = root / "uploads" / "pose_metadata.json",
+            motion_tracks = root / "motion_tracks",
         )
 
     def makedirs(self) -> None:
         for p in (self.uploads, self.lancedb, self.segments,
-                  self.detections, self.maps):
+                  self.detections, self.maps, self.motion_tracks):
             p.mkdir(parents=True, exist_ok=True)
 
 
@@ -103,6 +105,14 @@ class Settings(BaseSettings):
     # At typical survey altitudes (80–150 m AGL) with overlapping tiles, the same physical object will appear in adjacent frames within a few metres, so 22 m gives comfortable headroom without merging genuinely separate objects. 
     # Halve it to 0.0001 (~11 m) for dense urban surveys with closely spaced objects. 
     TRACKER_GEO_PROXIMITY_DEG: float = 0.0002
+
+    # ── Motion detection ─────────────────────────────────────────────────────
+    MOTION_MIN_CONTOUR_AREA:       int   = 300    # px² at native resolution
+    MOTION_BLUR_KERNEL:            int   = 5      # Gaussian blur ksize (odd int)
+    MOTION_LEARNING_RATE:          float = 0.01   # background model update rate
+    MOTION_TRACKER_GEO_PROXIMITY_DEG: float = 0.0003  # ~33 m; coarser than P2
+    MOTION_VLM_ENABLED:            bool  = False  # VLM semantic filter on/off
+    MOTION_VLM_SNAPSHOT_INTERVAL:  int   = 90     # frames between VLM calls
 
     # ── Persistent storage root ───────────────────────────────────────────────
     DATA_DIR: str = _DEFAULT_DATA_DIR

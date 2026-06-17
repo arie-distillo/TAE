@@ -278,6 +278,40 @@ def _build_map() -> None:
     except Exception as _te:
         logger.warning("Track rendering error: %s", _te)
 
+    # ── Motion track polylines  (Pipeline 1) ──────────────────────────────────
+    try:
+        if paths:
+            mt_file = paths.motion_tracks / "motion_tracks.json"
+            if mt_file.exists():
+                motion_tracks = json.loads(mt_file.read_text(encoding="utf-8"))
+                for mtrk in motion_tracks:
+                    traj  = mtrk.get("trajectory", [])
+                    color = mtrk.get("color", "#fb923c")   # amber — visually distinct from P2 blue
+                    tid   = mtrk.get("track_id", "?")
+                    label = mtrk.get("label", "mover")
+                    if len(traj) >= 2:
+                        coords = [(p["lat"], p["lon"]) for p in traj]
+                        folium.PolyLine(
+                            locations = coords,
+                            color     = color,
+                            weight    = 2,
+                            opacity   = 0.75,
+                            dash_array= "6 4",             # dashed = motion, solid = P2
+                            tooltip   = f"Motion {tid}: {label} ({len(traj)} pts)",
+                        ).add_to(m)
+                        folium.CircleMarker(
+                            location=coords[0], radius=4,
+                            color=color, fill=True, fill_opacity=0.9, weight=1,
+                            tooltip=f"Motion {tid} start",
+                        ).add_to(m)
+                        folium.CircleMarker(
+                            location=coords[-1], radius=6,
+                            color=color, fill=True, fill_opacity=1.0, weight=2,
+                            tooltip=f"Motion {tid} end ▶",
+                        ).add_to(m)
+    except Exception as _me:
+        logger.warning("Motion track rendering error: %s", _me)
+
     # ── postMessage listener — allow parent page to re-centre the map ─────────
     map_var = f"map_{m._id}"
     m.get_root().html.add_child(folium.Element(
@@ -418,6 +452,15 @@ def _save_detections(detections_path) -> None:
     except Exception as e:
         logger.warning("Could not save detections: %s", e)
 
+def _save_motion_tracks(motion_tracks_path: Path) -> None:
+    """Persist _state['motion_tracks'] to motion_tracks/motion_tracks.json."""
+    try:
+        out = motion_tracks_path / "motion_tracks.json"
+        tracks = list(_state.get("motion_tracks", {}).values())
+        out.write_text(json.dumps(tracks, indent=2), encoding="utf-8")
+        logger.info("Motion tracks saved (%d tracks)", len(tracks))
+    except Exception as exc:
+        logger.warning("Could not save motion tracks: %s", exc)
 
 def _save_tracks(tracks: list, color: str) -> None:
     """
@@ -508,4 +551,19 @@ def _load_detections(detections_path) -> dict:
     except Exception as e:
         logger.warning("Could not load detections: %s", e)
         return {}
-    
+
+def _load_motion_tracks(motion_tracks_path) -> dict:
+    """Load motion tracks from motion_tracks.json. Returns {} if absent."""
+    try:
+        mt_file = Path(motion_tracks_path) / "motion_tracks.json"
+        if not mt_file.exists():
+            return {}
+        data = json.loads(mt_file.read_text(encoding="utf-8"))
+        keyed = {t["track_id"]: t for t in data if "track_id" in t}
+        logger.info("Loaded %d motion track(s) from disk", len(keyed))
+        return keyed
+    except Exception as e:
+        logger.warning("Could not load motion tracks: %s", e)
+        return {}
+   
+

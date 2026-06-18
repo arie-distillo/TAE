@@ -38,6 +38,9 @@ from core.app_state import (
     _tile_img_cache,
 )
 
+from config import Settings
+settings = Settings()
+
 logger = logging.getLogger("TAE.Services")
 
 # ── Map tile configuration ────────────────────────────────────────────────────
@@ -278,36 +281,48 @@ def _build_map() -> None:
     except Exception as _te:
         logger.warning("Track rendering error: %s", _te)
 
-    # ── Motion track polylines  (Pipeline 1) ──────────────────────────────────
+    # ── Motion track polylines / motion detections ─────────────────────────────
     try:
-        if paths:
+        if paths and hasattr(paths, "motion_tracks"):
             mt_file = paths.motion_tracks / "motion_tracks.json"
             if mt_file.exists():
                 motion_tracks = json.loads(mt_file.read_text(encoding="utf-8"))
+                min_pts      = getattr(settings, "MOTION_MIN_TRAJ_PTS", 8)
+                show_circles = getattr(settings, "MOTION_SHOW_CIRCLES", False)
+
                 for mtrk in motion_tracks:
-                    traj  = mtrk.get("trajectory", [])
-                    color = mtrk.get("color", "#fb923c")   # amber — visually distinct from P2 blue
-                    tid   = mtrk.get("track_id", "?")
-                    label = mtrk.get("label", "mover")
-                    if len(traj) >= 2:
-                        coords = [(p["lat"], p["lon"]) for p in traj]
-                        folium.PolyLine(
-                            locations = coords,
-                            color     = color,
-                            weight    = 2,
-                            opacity   = 0.75,
-                            dash_array= "6 4",             # dashed = motion, solid = P2
-                            tooltip   = f"Motion {tid}: {label} ({len(traj)} pts)",
-                        ).add_to(m)
+                    traj = mtrk.get("trajectory", [])
+                    if len(traj) < min_pts:
+                        continue            # skip — too short to be informative
+
+                    color    = mtrk.get("map_color") or mtrk.get("color", "#fb923c")
+                    tid      = mtrk.get("track_id", "?")
+                    label    = mtrk.get("label", "mover")
+                    variance = mtrk.get("wf_variance_m", -1.0)
+                    hits     = mtrk.get("hit_count", len(traj))
+                    tip      = (f"Motion {tid}: {label}  hits={hits}  "
+                                f"var={'n/a' if variance < 0 else f'{variance:.1f}m'}")
+
+                    coords = [(p["lat"], p["lon"]) for p in traj]
+                    folium.PolyLine(
+                        locations  = coords,
+                        color      = color,
+                        weight     = 2,
+                        opacity    = 0.80,
+                        dash_array = "5 4",
+                        tooltip    = tip,
+                    ).add_to(m)
+
+                    if show_circles:
                         folium.CircleMarker(
                             location=coords[0], radius=4,
-                            color=color, fill=True, fill_opacity=0.9, weight=1,
-                            tooltip=f"Motion {tid} start",
+                            color=color, fill=True, fill_opacity=0.8, weight=1,
+                            tooltip=tip + " ▶ start",
                         ).add_to(m)
                         folium.CircleMarker(
                             location=coords[-1], radius=6,
                             color=color, fill=True, fill_opacity=1.0, weight=2,
-                            tooltip=f"Motion {tid} end ▶",
+                            tooltip=tip + " ■ end",
                         ).add_to(m)
     except Exception as _me:
         logger.warning("Motion track rendering error: %s", _me)

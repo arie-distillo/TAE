@@ -374,10 +374,24 @@ VLM_SNAP_LONG_EDGE     = 1280  # resize snapshot to this long edge before sendin
 
 # Annotation colours  (BGR)
 COL_PENDING   = (0, 200, 255)     # yellow  — seen but not yet confirmed
-COL_CONFIRMED = (50, 220, 50)     # green   — confirmed track
+COL_CONFIRMED = (50, 220, 50)     # green   — confirmed track (unused now; kept for import compat)
 COL_ISOLATED  = (255, 220, 0)     # bright cyan-yellow — confirmed AND isolated (primary target)
 COL_HUD       = (240, 240, 240)   # white   — HUD text
 COL_HUD_SHD   = (20, 20, 20)     # dark    — HUD text shadow
+
+
+def confidence_color(conf: float) -> tuple:
+    """
+    Map confidence [0, 1] to a BGR colour via HSV.
+      0.0 → red    — not yet WF-tested, or variance just above threshold
+      0.5 → yellow — moderate evidence of independent motion
+      1.0 → green  — strong mover (high WF variance, many consistent hits)
+    """
+    conf  = max(0.0, min(1.0, conf))
+    h_cv  = int(60 * conf)        # OpenCV H in [0, 180]: 0=red, 30=yellow, 60=green
+    hsv   = np.uint8([[[h_cv, 230, 215]]])
+    bgr   = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
+    return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -688,6 +702,23 @@ def world_fixed_variance_test(track, n_scan: int = WF_N_SCAN) -> tuple[float, fl
     fv, fh = _scan(np.linspace(lo, hi, 21))
     if fv < best_v: best_v, best_h = fv, fh
     return best_v, best_h
+
+
+def _wf_update_confidence(track, min_var: float, wf_threshold: float) -> None:
+    """
+    Update track.confidence after a world-fixed variance test.
+    Called only for non-suppressed tracks (suppressed tracks keep confidence 0).
+
+    Score components:
+      WF variance (65%): ramps from 0 at threshold to 1 at 3× threshold
+      Track lifetime (25%): caps at 60 frames confirmed
+      Miss penalty (10%): proportion of total life spent as misses
+    """
+    var_conf  = min(1.0, max(0.0,
+                    (min_var - wf_threshold) / max(2.0 * wf_threshold, 1e-9)))
+    hit_conf  = min(1.0, track.hit_count / 60.0)
+    miss_rate = track.miss_count / max(track.hit_count + track.miss_count, 1)
+    track.confidence = 0.65 * var_conf + 0.25 * hit_conf + 0.10 * (1.0 - miss_rate)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1021,6 +1052,7 @@ class MotionTrack:
     wf_variance_m: float = -1.0   # minimum world-frame variance (m); -1 = not yet tested
     wf_best_h_m:   float = -1.0   # altitude (m) that minimised variance
     suppressed_by: str   = ""     # "world_fixed" | "range" | "vlm" | ""
+    confidence:    float = 0.0    # [0, 1] — certainty this is a genuine mover (updated by WF test)
     # VLM classification support
     confirm_frame_idx:  int   = -1   # frame index when this track was first confirmed
     confirm_bbox_full:  tuple = ()   # full-res bbox (x,y,w,h) at confirmation
@@ -1241,12 +1273,17 @@ def annotate(
     fg_fraction:       float = 0.0,
     effective_persist: int   = 3,
     isolation_radius_px: float = 0.0,
-    live_fps: float = 0.0,
+    live_fps:            float = 0.0,
+    wf_threshold:        float = 0.5,    # used for per-track confidence colour
+    min_confidence:      float = 0.70,   # tracks below this are not drawn
 ) -> np.ndarray:
     """
     Draw bounding boxes, track trails, and HUD onto a full-resolution copy.
     All bbox / centroid coordinates are stored at processing resolution and
     scaled back to full resolution here via (1 / scale).
+
+    Only confirmed tracks with confidence ≥ min_confidence are drawn.
+    Tracks below the threshold are still tracked and written to JSON.
     """
     out      = frame.copy()
     inv_s    = 1.0 / scale
@@ -1255,23 +1292,29 @@ def annotate(
     for t in tracks:
         if t.suppressed:
             continue                  # world-fixed residual — don't draw
+        if t.confirmed and t.confidence < min_confidence:
+            continue                  # below operator confidence threshold
 
         x, y, w, h = t.bbox
 
         fx  = int(x * inv_s);  fy  = int(y * inv_s)
         fw  = int(w * inv_s);  fh  = int(h * inv_s)
-        col = COL_CONFIRMED if t.confirmed else COL_PENDING
-        # Isolated confirmed tracks get a brighter cyan highlight so the
-        # operator can immediately spot lone flyers among clustered detections.
-        if t.confirmed and t.is_isolated and isolation_radius_px > 0:
-            col = COL_ISOLATED
+
+        if t.confirmed:
+            col = confidence_color(t.confidence)
+            # High-confidence isolated tracks get the special highlight
+            if t.is_isolated and isolation_radius_px > 0 and t.confidence >= 0.4:
+                col = COL_ISOLATED
+        else:
+            col = COL_PENDING
         thk = 2 if t.confirmed else 1
 
         cv2.rectangle(out, (fx, fy), (fx + fw, fy + fh), col, thk)
 
-        # Label (confirmed only)
+        # Label: track id, hit count, confidence %  (confirmed only)
         if t.confirmed:
-            label = f"T{t.track_id}  {t.hit_count}f"
+            conf_pct = int(t.confidence * 100)
+            label = f"T{t.track_id}  {t.hit_count}f  {conf_pct}%"
             (tw, th), _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1
             )
@@ -1298,9 +1341,11 @@ def annotate(
 
     # ── HUD overlay ──────────────────────────────────────────────────────────
     warp_str = f"inliers={n_inliers}  spd={scene_speed:.1f}px" if warp_ok else "WARP FAIL"
-    n_visible    = sum(1 for t in tracks if not t.suppressed and t.confirmed)
+    n_visible    = sum(1 for t in tracks if not t.suppressed and t.confirmed
+                       and t.confidence >= min_confidence)
     n_suppressed = sum(1 for t in tracks if t.suppressed)
-    n_isolated   = sum(1 for t in tracks if not t.suppressed and t.confirmed and t.is_isolated)
+    n_isolated   = sum(1 for t in tracks if not t.suppressed and t.confirmed
+                       and t.is_isolated and t.confidence >= min_confidence)
     isolation_str = (f"  isolated={n_isolated}" if isolation_radius_px > 0 else "")
     fps_str = f"   proc {live_fps:.1f} fps" if live_fps > 0 else ""
     hud_lines = [
@@ -1378,6 +1423,13 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--save-crops", action="store_true",
                    dest="save_crops",
                    help="Save confirmed-track crops to _crops/ directory")
+    p.add_argument("--min-confidence", type=float, default=0.70,
+                   dest="min_confidence",
+                   metavar="F",
+                   help="Minimum confidence score [0–1] for a confirmed track to be "
+                        "drawn on the output video and live preview.  Tracks below this "
+                        "threshold are suppressed visually (still written to JSON).  "
+                        "Default: 0.70.  Set to 0.0 to show all confirmed movers.")
     p.add_argument("--vlm-classify", action="store_true", dest="vlm_classify",
                    help="Run a VLM pass after video processing.  Sends confirmed visible "
                         "movers to Qwen2.5-VL (via OpenRouter) to distinguish genuine movers "
@@ -1967,7 +2019,7 @@ def main() -> None:
                 for t in tracker.confirmed:
                     if t.track_id not in seen_track_ids:
                         seen_track_ids.add(t.track_id)
-                        log.info(
+                        log.debug(
                             "  ✓ Track T%d confirmed  frame=%d  "
                             "alt=%.0fm  gsd=%.1fcm  hits=%d",
                             t.track_id, frame_idx,
@@ -2109,7 +2161,14 @@ def main() -> None:
                             (lat_c_refined, lon_c_refined, telem.alt_m)
                         )
 
-                # 4. World-fixed variance test: at WF_MIN_FRAMES, then every WF_RETEST_EVERY
+                # 4. World-fixed variance test: at WF_MIN_FRAMES, then every WF_RETEST_EVERY.
+                #
+                # STICKY suppression design: WF can only suppress, never un-suppress.
+                # A track whose trajectory was ever consistent with a static elevated
+                # object is treated as a permanent parallax artefact.  The "↑ now moving"
+                # re-activation was the dominant source of false positives: 159 tracks
+                # were correctly suppressed at hits=23 (low variance) then incorrectly
+                # re-activated at hits=38 when variance oscillated above the threshold.
                 for track in tracks:
                     n_obs = len(track.geo_history)
                     if n_obs < WF_MIN_FRAMES:
@@ -2117,25 +2176,27 @@ def main() -> None:
                     if not (n_obs == WF_MIN_FRAMES or
                             (n_obs - WF_MIN_FRAMES) % WF_RETEST_EVERY == 0):
                         continue
+                    # Already suppressed by WF — no re-evaluation; suppression is final
+                    if track.suppressed and track.suppressed_by == "world_fixed":
+                        continue
 
                     min_var, best_h = world_fixed_variance_test(track)
                     track.wf_variance_m = min_var
                     track.wf_best_h_m   = best_h
-                    was_suppressed  = track.suppressed
-                    track.suppressed = (min_var < args.wf_threshold)
-                    if track.suppressed:
-                        track.suppressed_by = "world_fixed"
 
-                    if track.suppressed and not was_suppressed:
-                        log.debug(
-                            "  ○ T%d world-fixed  var=%.3fm  h=%.0fm  hits=%d",
-                            track.track_id, min_var, best_h, track.hit_count,
-                        )
-                    elif was_suppressed and not track.suppressed:
-                        log.info(
-                            "  ↑ T%d now moving   var=%.3fm  h=%.0fm  hits=%d",
-                            track.track_id, min_var, best_h, track.hit_count,
-                        )
+                    if min_var < args.wf_threshold:
+                        was_suppressed  = track.suppressed
+                        track.suppressed    = True
+                        track.suppressed_by = "world_fixed"
+                        if not was_suppressed:
+                            log.debug(
+                                "  ○ T%d world-fixed  var=%.3fm  h=%.0fm  hits=%d",
+                                track.track_id, min_var, best_h, track.hit_count,
+                            )
+                    else:
+                        # Track is a genuine mover — update confidence score
+                        _wf_update_confidence(track, min_var, args.wf_threshold)
+                    # variance ≥ threshold: track stays non-suppressed, no log
 
             # Count suppressed tracks for summary
             suppressed_this_frame = sum(1 for t in tracks if t.suppressed)
@@ -2175,6 +2236,8 @@ def main() -> None:
                 scene_speed, fg_fraction, effective_persist,
                 isolation_radius_px=isolation_radius_px,
                 live_fps=_live_fps if args.live else 0.0,
+                wf_threshold=args.wf_threshold,
+                min_confidence=args.min_confidence,
             )
             _write_q.put(annotated, block=True)
 
@@ -2276,14 +2339,16 @@ def main() -> None:
     if args.save_crops and n_visible_movers == 0:
         log.warning("  ⚠ --save-crops was set but no visible-mover crops were saved.")
 
-    # Per-track table (confirmed movers only)
+    # Per-track table (DEBUG only — use the JSON for full details)
     visible_movers = [t for t in all_conf if not t.suppressed]
     if visible_movers:
-        log.info("")
-        log.info("  Genuine movers (world-variance ≥ %.2f m):", args.wf_threshold)
-        log.info("  %-6s  %-8s  %-8s", "Track", "Hits", "Misses")
+        log.debug("  Genuine movers (world-variance ≥ %.2f m):", args.wf_threshold)
+        log.debug("  %-6s  %-8s  %-8s  %-8s  %-6s", "Track", "Hits", "Misses", "WF var", "Conf")
         for t in sorted(visible_movers, key=lambda x: x.track_id):
-            log.info("  T%-5d  %-8d  %-8d", t.track_id, t.hit_count, t.miss_count)
+            log.debug("  T%-5d  %-8d  %-8d  %-8.3f  %.0f%%",
+                      t.track_id, t.hit_count, t.miss_count,
+                      t.wf_variance_m if t.wf_variance_m >= 0 else -1,
+                      getattr(t, "confidence", 0.0) * 100)
 
     log.info("")
     log.info("Output video  : %s", out_video)
@@ -2355,6 +2420,7 @@ def main() -> None:
                 "isolated":     t.is_isolated,
                 "wf_variance_m": round(t.wf_variance_m, 4) if t.wf_variance_m >= 0 else None,
                 "wf_best_h_m":   round(t.wf_best_h_m,  1) if t.wf_best_h_m  >= 0 else None,
+                "confidence":    round(t.confidence, 3),
             }
             for t in sorted(all_conf, key=lambda x: x.track_id)
         ],

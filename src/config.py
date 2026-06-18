@@ -113,6 +113,8 @@ class Settings(BaseSettings):
     MOTION_TRACKER_GEO_PROXIMITY_DEG: float = 0.0003  # ~33 m; coarser than P2
     MOTION_VLM_ENABLED:            bool  = False  # VLM semantic filter on/off
     MOTION_VLM_SNAPSHOT_INTERVAL:  int   = 90     # frames between VLM calls
+    MOTION_MIN_TRAJ_PTS:           int  = 8       # skip tracks shorter than this — matches WF_MIN_FRAMES
+    MOTION_SHOW_CIRCLES:           bool = False   # lines only by default; True adds start/end dots
 
     # ── Persistent storage root ───────────────────────────────────────────────
     DATA_DIR: str = _DEFAULT_DATA_DIR

@@ -83,6 +83,35 @@ WF_RETEST_EVERY = 15             # re-test every N additional hits after first
 WF_N_SCAN       = 60             # altitude candidates in the h-scan
 WF_THRESHOLD_M  = 0.4            # world-space RMS spread (m); below = world-fixed
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper to interpolate telemetry for a given video timestamp (ms) from the SRT frames.
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def variance_to_color(wf_variance_m: float) -> str:
+    """
+    Map world-fixed variance to a colour encoding detection confidence.
+
+    wf_variance_m < 0  : test not yet run (< WF_MIN_FRAMES observations)
+                         → slate (unknown)
+    wf_variance_m = inf: scan returned no valid result
+                         → amber (inconclusive)
+    wf_variance_m ≥ WF_THRESHOLD_M (surviving tracks only):
+        0.4 – 2 m  → yellow  (barely above FP threshold, uncertain)
+        2   – 5 m  → orange  (likely genuine mover)
+        5   – 12 m → red     (clearly moving relative to ground)
+        > 12 m     → bright red (fast / large displacement)
+    """
+    if wf_variance_m < 0:
+        return "#94a3b8"    # slate-400   — not yet tested
+    if not math.isfinite(wf_variance_m):
+        return "#fbbf24"    # amber-400   — inconclusive scan
+    if wf_variance_m < 2.0:
+        return "#fcd34d"    # amber-300   — uncertain mover
+    if wf_variance_m < 5.0:
+        return "#fb923c"    # orange-400  — probable mover
+    if wf_variance_m < 12.0:
+        return "#ef4444"    # red-400     — confirmed mover
+    return "#dc2626"        # red-600     — fast / large mover
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MotionTrack — serialisable result unit
@@ -121,7 +150,6 @@ class MotionTrack:
     wf_best_h_m:   float = -1.0
 
     def to_dict(self) -> dict:
-        """JSON-serialisable dict for _build_map and motion_tracks.json."""
         trajectory = []
         for i, (lat, lon) in enumerate(self.geo_history):
             entry = {"lat": lat, "lon": lon}
@@ -129,12 +157,14 @@ class MotionTrack:
                 entry["ts_ms"] = self.ts_history[i]
             trajectory.append(entry)
         return {
-            "track_id":   self.track_id,
-            "label":      self.label,
-            "color":      self.color,
-            "trajectory": trajectory,
+            "track_id":      self.track_id,
+            "label":         self.label,
+            "color":         self.color,             # palette colour — Monitor panel
+            "map_color":     variance_to_color(self.wf_variance_m),  # confidence colour — map
+            "wf_variance_m": self.wf_variance_m,    # raw value for tooltip
+            "hit_count":     self.hit_count,         # for dot sizing
+            "trajectory":    trajectory,
         }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pure physics / geometry helpers  (ported from tools/test_motion.py)

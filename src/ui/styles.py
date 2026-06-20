@@ -93,6 +93,8 @@ html, body {
 }
 .upload-btn:hover { border-color: var(--blue); background: var(--blue-dim); }
 .upload-btn input[type="file"] { display: none; }
+.upload-btn-stop { border-color: #f87171; color: #fca5a5; background: #7f1d1d; }
+.upload-btn-stop:hover { border-color: #fca5a5; background: #991b1b; }
  
 .status-badge {
   display: flex;
@@ -970,6 +972,12 @@ document.addEventListener('DOMContentLoaded', function() {
   window.taeInitPanel = initPanel;
 })();
 
+  // Sync navbar stream button on page load
+  fetch('/stream/status')
+    .then(function(r){ return r.json(); })
+    .then(function(d){ _setNavStreamBtn(d.running || false); })
+    .catch(function(){ window._streamRunning = false; });
+
 }); // DOMContentLoaded
 
 
@@ -1031,34 +1039,64 @@ function openImages(detId) {
 /* Timestamp used by map-refresh query param to bust cache */
 
 // ══ Feed / Video panel helpers ═══════════════════════════════════════════════
-function openFeedPanel() {
-  showPanel('tae-video-panel');
-  htmx.ajax('GET', '/feed_panel', {target: '#video-panel', swap: 'innerHTML'});
-}
-
-function closeFeedPanel() {
-  htmx.ajax('GET', '/video_panel', {target: '#video-panel', swap: 'innerHTML'});
-}
 
 function closeVideoPanel() {
   var p = document.getElementById('tae-video-panel');
   if (p) p.style.display = 'none';
 }
 
+// ── Navbar stream button state ────────────────────────────────────────────────
+function _setNavStreamBtn(running) {
+  window._streamRunning = running;
+  var btn = document.getElementById('navbar-stream-btn');
+  if (!btn) return;
+  if (running) {
+    btn.lastChild.textContent = ' Stop';
+    btn.classList.add('upload-btn-stop');
+  } else {
+    btn.lastChild.textContent = ' Start';
+    btn.classList.remove('upload-btn-stop');
+  }
+}
+
+// ── Navbar Start/Stop click ───────────────────────────────────────────────────
+// Reads stream URL from localStorage (set when user typed in drawer).
+// Falls back to opening Mission settings if no URL is stored.
+function navStreamToggle() {
+  if (window._streamRunning) { stopStream(); return; }
+  startStream(null);
+}
+
+// Pre-populate the stream URL input in the drawer from localStorage.
+// Called via setTimeout after openDrawer's HTMX swap completes.
+function _populateDrawerStreamConfig() {
+  var url = localStorage.getItem('tae_stream_url') || '';
+  var el  = document.getElementById('stream-url');
+  if (url && el) el.value = url;
+}
+
 function startStream(event) {
-  var url = (document.getElementById('stream-url') || {}).value || '';
-  var lat = parseFloat((document.getElementById('stream-lat') || {}).value || '0');
-  var lon = parseFloat((document.getElementById('stream-lon') || {}).value || '0');
+  // Read URL from drawer input if open, else from localStorage
+  var urlEl = document.getElementById('stream-url');
+  var url = (urlEl && urlEl.value.trim()) ? urlEl.value.trim()
+          : (localStorage.getItem('tae_stream_url') || '').trim();
+
+  if (!url) {
+    // No URL anywhere — open Mission settings to configure
+    var cogBtn = document.querySelector('.mission-cog');
+    if (cogBtn) cogBtn.click();
+    return;
+  }
+
   fetch('/stream/start', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url: url, lat: lat, lon: lon})
+    body: JSON.stringify({url: url})
   }).then(function(r){return r.json();}).then(function(d){
     if (d.ok) {
+      _setNavStreamBtn(true);
+      showPanel('tae-video-panel');
       htmx.ajax('GET', '/stream/panel', {target: '#video-panel', swap: 'innerHTML'});
-      // Plain setInterval is more reliable than HTMX polling on dynamically
-      // injected divs.  Script tags inside hx-swap responses may not execute
-      // depending on HTMX version/config, so we avoid that entirely.
       if (window._streamPollId) clearInterval(window._streamPollId);
       window._streamPollId = setInterval(function() {
         fetch('/stream/updates')
@@ -1067,13 +1105,13 @@ function startStream(event) {
             if (!data.running) {
               clearInterval(window._streamPollId);
               window._streamPollId = null;
-              // Final chat message when stream ends
+              _setNavStreamBtn(false);
               var msgs = document.getElementById('tae-msgs');
               if (msgs && data.frame_count > 0) {
                 var ts = new Date().toTimeString().slice(0,5);
                 msgs.insertAdjacentHTML('beforeend',
                   '<div class="msg sys"><span class="msg-time">' + ts + '</span>' +
-                  '<div class="msg-bubble">✓ Stream complete — ' + data.frame_count + ' frames processed</div></div>');
+                  '<div class="msg-bubble">\u2713 Stream complete \u2014 ' + data.frame_count + ' frames processed</div></div>');
                 if (typeof scrollChat === 'function') scrollChat();
               }
               return;
@@ -1087,7 +1125,6 @@ function startStream(event) {
               var fc = document.getElementById('stream-frame-count');
               if (fc) fc.textContent = data.frame_count + ' frames';
             }
-            // Append any queued chat messages
             if (data.chat_html) {
               var msgs = document.getElementById('tae-msgs');
               if (msgs) {
@@ -1095,7 +1132,6 @@ function startStream(event) {
                 if (typeof scrollChat === 'function') scrollChat();
               }
             }
-            // Update status badge (shows "No index" during streaming)
             if (data.frame_count > 0) {
               document.querySelectorAll('.sdot').forEach(function(dot) {
                 dot.classList.add('active');
@@ -1104,7 +1140,7 @@ function startStream(event) {
               });
             }
           })
-          .catch(function(){});  // keep polling on transient errors
+          .catch(function(){});
       }, 2000);
     } else {
       alert('Stream error: ' + d.error);
@@ -1115,7 +1151,8 @@ function startStream(event) {
 function stopStream() {
   fetch('/stream/stop', {method:'POST'})
     .then(function(){
-      htmx.ajax('GET', '/stream/panel', {target: '#video-panel', swap: 'innerHTML'});
+      _setNavStreamBtn(false);
+      htmx.ajax('GET', '/video_panel', {target: '#video-panel', swap: 'innerHTML'});
       if (window._streamPollId) {
         clearInterval(window._streamPollId);
         window._streamPollId = null;
@@ -1364,6 +1401,8 @@ function openDrawer(missionId) {
   panel.classList.add('open');
   htmx.ajax('GET', '/missions/' + missionId + '/drawer',
     {target: '#drawer-content', swap: 'innerHTML'});
+  // Restore last-used stream URL from localStorage (skip for new missions)
+  if (missionId !== 'new') setTimeout(_populateDrawerStreamConfig, 100);
 }
 
 function closeDrawer() {

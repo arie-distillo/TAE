@@ -50,7 +50,13 @@
 - [v] frames with detection on a timeline
 - [v] video panel vs. chat panel vs. image panel - inconsistency
 - [x] have panels resizeable (and movable?). By default a large video panel takes a central place
-- [] update panels on each processed frame, independently on detections
+- [x] Today clicking on Feed button on navbar opens an input panel (within Video panel) with Upload file and Stream url option and "Start stream" button. Please reorganize this as following: (1) the feed input panel should become a part of mission configuration, but without  (2) On the navbar instead of "Feed" should be a "Start/Stop stream" button. It should say Start when video is not streaming, and should say "Stop" when video is streaming 
+- [] Sometimes (I noticed this after mission finishes) a Missions dropdown looks corrupted(attached)
+- [] Today map is updated when there are detections. Before any detections found, on when Object detection disabled the map is not being updated at all. Please ensure periodic map updates. BTW it would be good to have a more smooth visual effect of map update
+- [] Monitor panel should be visible as default 
+- [] Rename Video panel as Analysis. Restore timiline and detected objects highlogh on this panel (this worked in the past)
+- [] Some panels are being erratically resized and/or repositionned afetr certain actions. Please fix
+- [] Motion tracks on the map - (1) make tooltip more meaningful - add confidence, remove non-important data; (2) s introduce config parameter of confidence threshold (default = 70%) to show a motion track on the map
 
 ### Deployment
 - [] Runpod

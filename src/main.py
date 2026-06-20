@@ -43,7 +43,7 @@ from core.services import (
     _extract_video_frames, _save_detections, _load_detections, _load_motion_tracks, _save_motion_tracks, 
     init as _init_services, 
 )
-from core.motion_worker import MotionDetectionWorker
+from core.motion_shim import MotionDetectionWorker
 from ai.intent import (
     IntentClassifier, ObjectDetectionParams, AnomalyDetectionParams,
     ClassifiedQuery,

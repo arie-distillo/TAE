@@ -109,12 +109,40 @@ class Settings(BaseSettings):
     # ── Motion detection ─────────────────────────────────────────────────────
     MOTION_MIN_CONTOUR_AREA:       int   = 300    # px² at native resolution
     MOTION_BLUR_KERNEL:            int   = 5      # Gaussian blur ksize (odd int)
-    MOTION_LEARNING_RATE:          float = 0.01   # background model update rate
+    MOTION_LEARNING_RATE:          float = 0.02   # background model update rate (was 0.01)
     MOTION_TRACKER_GEO_PROXIMITY_DEG: float = 0.0003  # ~33 m; coarser than P2
-    MOTION_VLM_ENABLED:            bool  = False  # VLM semantic filter on/off
     MOTION_VLM_SNAPSHOT_INTERVAL:  int   = 90     # frames between VLM calls
-    MOTION_MIN_TRAJ_PTS:           int  = 8       # skip tracks shorter than this — matches WF_MIN_FRAMES
-    MOTION_SHOW_CIRCLES:           bool = False   # lines only by default; True adds start/end dots
+    MOTION_SHOW_CIRCLES:           bool  = False  # lines only by default; True adds start/end dots
+
+    # Tuned pipeline parameters — calibrated against the standalone test tool
+    # (tools/test_motion.py best-config: --persist 16 --wf-threshold 0.5
+    #  --min-object 0.2 --min-confidence 0.70)
+
+    # ── Motion pipeline  ───────────────────────────────────────────────
+    MOTION_SENSOR_W_MM:       float = 6.3
+    MOTION_FOCAL_MM:          float = 4.5
+    MOTION_MIN_OBJECT_M:      float = 0.2     # minimum object dimension gate (metres)
+    MOTION_MAX_OBJECT_M:      float = 50.0    # maximum object dimension gate (metres)
+    MOTION_ISOLATION_RADIUS_M: float = 0.0
+    MOTION_MAX_RANGE_M:        float = 0.0
+    MOTION_PERSIST_FRAMES:    int   = 16      # consecutive hits to confirm a track.
+    #                                           Must be ≥ WF_MIN_FRAMES (8) for the
+    #                                           WF pre-filter to fire at confirmation.
+    #                                           3 (old default) let parallax artefacts
+    #                                           confirm before the WF test could run.
+    MOTION_WF_THRESHOLD_M:    float = 0.5     # world-space RMS spread (m) below which
+    #                                           a track is classified as world-fixed.
+    #                                           0.4 (old default) was too lenient —
+    #                                           FP tracks with variance 0.9–1.2 m passed
+    #                                           through and scored confidence > 0.70.
+    MOTION_WF_RECOVERY_FACTOR: float = 2.0
+    MOTION_PROCESS_SCALE:     float = 0.5     # detect-resolution scale factor
+    MOTION_MIN_CONFIDENCE:    float = 0.70 # minimum confidence to show a track in
+    #                                        the Monitor panel / recorded video.
+    #                                        Tracks below this are tracked and saved
+    #                                        to JSON but not drawn on the overlay.
+    MOTION_VLM_ENABLED:            bool  = False  # VLM semantic filter on/off
+    MOTION_MIN_TRAJ_PTS:           int   = 8      # skip tracks shorter than this — matches WF_MIN_FRAMES
 
     # ── Persistent storage root ───────────────────────────────────────────────
     DATA_DIR: str = _DEFAULT_DATA_DIR

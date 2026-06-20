@@ -15,7 +15,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from core.motion import (
+from motion import (
     FALLBACK_ALT_M, FALLBACK_GIMBAL_PITCH,
     MOG2_HISTORY, MOG2_VAR_THRESHOLD, MORPH_KSIZE,
     WF_MIN_FRAMES, WF_RETEST_EVERY,

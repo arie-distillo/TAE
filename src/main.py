@@ -456,9 +456,10 @@ def _navbar(ingested: bool = False, frame_count: int = 0, mission=None) -> FT:
         Div(cls="sep"),
         Button(
             I(cls="fas fa-satellite-dish", style="font-size:11px"),
-            " Feed",
-            cls="upload-btn",
-            onclick="openFeedPanel()",
+            " Stop" if stream_mgr.running else " Start",
+            id="navbar-stream-btn",
+            cls="upload-btn" + (" upload-btn-stop" if stream_mgr.running else ""),
+            onclick="navStreamToggle()",
         ),
         Span(
             Span(cls="spinner"),
@@ -573,6 +574,63 @@ def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> F
                 Span("Motion detection  (track all movers)"),
                 cls="intent-row",
             ),
+            cls="drawer-section",
+        ),
+        Div(cls="drawer-sep"),
+        Div(
+            Span("Feed", cls="drawer-label"),
+            Label(
+                Div(
+                    I(cls="fas fa-cloud-upload-alt",
+                      style="font-size:20px;color:var(--blue);margin-bottom:5px;display:block"),
+                    Div("Drop files here or click to browse",
+                        style="font-size:11px;color:var(--muted);line-height:1.5"),
+                    Div(".mp4 + .srt  ·  .jpg / .jpeg",
+                        style="font-size:9px;color:var(--border);margin-top:2px"),
+                    style="text-align:center;padding:14px",
+                ),
+                Input(
+                    type="file", name="files", multiple=True,
+                    accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv,.srt,.SRT",
+                    hx_post="/upload",
+                    hx_target="#tae-msgs",
+                    hx_swap="beforeend",
+                    hx_encoding="multipart/form-data",
+                    hx_indicator="#upload-ind",
+                    style="display:none",
+                    **{"hx-on::after-request": "scrollChat(); refreshMap(); closeDrawer();"},
+                ),
+                style=(
+                    "display:block;cursor:pointer;border:1.5px dashed var(--border);"
+                    "border-radius:8px;transition:border-color .15s;margin-bottom:12px;"
+                ),
+            ),
+            Div(
+                Div(style="flex:1;height:1px;background:var(--border)"),
+                Span("or live stream",
+                     style="font-size:9px;color:var(--muted);padding:0 10px;white-space:nowrap"),
+                Div(style="flex:1;height:1px;background:var(--border)"),
+                style="display:flex;align-items:center;margin-bottom:10px",
+            ),
+            Div(
+                Span("RTSP / RTMP URL",
+                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
+                           "text-transform:uppercase"),
+                Input(
+                    id="stream-url", type="text",
+                    placeholder="rtsp://192.168.1.1:554/live",
+                    oninput="localStorage.setItem('tae_stream_url', this.value)",
+                    style=(
+                        "width:100%;background:var(--bg3);border:1px solid var(--border);"
+                        "border-radius:5px;padding:6px 9px;color:var(--text);"
+                        "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"
+                    ),
+                ),
+                style="margin-bottom:4px",
+            ),
+            cls="drawer-section",
+        ),
+        Div(
             Button(
                 save_label, cls="drawer-save-btn",
                 **{save_method: save_route,
@@ -580,7 +638,7 @@ def _settings_drawer_content(mission: Mission | None, is_new: bool = False) -> F
                    "hx_swap": "none",
                    "hx-on::after-request": after_save},
             ),
-            cls="drawer-section",
+            style="padding:4px 16px 12px",
         ),
         *danger,
     )
@@ -959,162 +1017,20 @@ def index():
 
 @rt("/feed_drawer")
 def feed_drawer():
-    """Settings-drawer content: file upload + live stream input."""
-    lat0, lon0 = _state["map_center"]
-    has_stream  = stream_mgr.running
-    stream_style = (
-        "width:100%;padding:7px;border-radius:5px;cursor:pointer;"
-        "font-size:12px;font-family:var(--font-mono);font-weight:700;"
-        + ("background:var(--blue-dim);color:var(--blue);border:1px solid var(--blue)"
-           if not has_stream else
-           "background:#7f1d1d;color:#fca5a5;border:1px solid #f87171")
-    )
-    return (
-        Div(
-            I(cls="fas fa-satellite-dish", style="font-size:12px;color:var(--muted)"),
-            Span("Feed", cls="drawer-title"),
-            Button("✕", cls="drawer-close", onclick="closeDrawer()"),
-            cls="drawer-header",
-        ),
-        Div(
-            Span("Upload files",
-                 style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                       "text-transform:uppercase;display:block;margin-bottom:8px"),
-            Label(
-                Div(
-                    I(cls="fas fa-cloud-upload-alt",
-                      style="font-size:22px;color:var(--blue);margin-bottom:6px;display:block"),
-                    Div("Drop files here or click to browse",
-                        style="font-size:11px;color:var(--muted);line-height:1.6"),
-                    Div(".mp4 + .srt  ·  .jpg / .jpeg",
-                        style="font-size:9px;color:var(--border);margin-top:2px"),
-                    style="text-align:center;padding:18px",
-                ),
-                Input(
-                    type="file", name="files", multiple=True,
-                    accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv,.srt,.SRT",
-                    hx_post="/upload",
-                    hx_target="#tae-msgs",
-                    hx_swap="beforeend",
-                    hx_encoding="multipart/form-data",
-                    hx_indicator="#upload-ind",
-                    style="display:none",
-                    **{"hx-on::after-request": "scrollChat(); refreshMap(); closeDrawer();"},
-                ),
-                style=(
-                    "display:block;cursor:pointer;border:1.5px dashed var(--border);"
-                    "border-radius:8px;transition:border-color .15s;"
-                    "margin-bottom:12px"
-                ),
-            ),
-            Div(style="height:1px;background:var(--border);margin:0 0 12px"),
-            Span("Or connect a live stream",
-                 style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                       "text-transform:uppercase;display:block;margin-bottom:8px"),
-            Div(
-                Span("RTSP / RTMP URL",
-                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                           "text-transform:uppercase"),
-                Input(id="stream-url", type="text",
-                      placeholder="rtsp://192.168.1.1:554/live",
-                      style="width:100%;background:var(--bg3);border:1px solid var(--border);"
-                            "border-radius:5px;padding:6px 9px;color:var(--text);"
-                            "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
-                style="margin-bottom:8px",
-            ),
-            Button(
-                "▶  Start stream" if not has_stream else "■  Stop stream",
-                onclick="startStream(event)" if not has_stream else "stopStream()",
-                style=stream_style,
-            ),
-            Span("ffmpeg must be in PATH",
-                 style="font-size:9px;color:var(--muted);margin-top:6px;display:block"),
-            cls="drawer-section",
-        ),
-    )
+    """Deprecated — feed config moved to mission settings drawer."""
+    mid = _state.get("mission_id", "new")
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(f"/missions/{mid}/drawer")
+
 
 @rt("/feed_panel")
 def feed_panel():
-    """Feed panel — unified file upload + live stream input."""
-    lat0, lon0 = _state["map_center"]
-    has_stream = stream_mgr.running
-    stream_btn_style = (
-        "width:100%;padding:7px;border-radius:5px;cursor:pointer;"
-        "font-size:12px;font-family:var(--font-mono);font-weight:700;"
-        + ("background:var(--blue-dim);color:var(--blue);border:1px solid var(--blue)"
-           if not has_stream else
-           "background:#7f1d1d;color:#fca5a5;border:1px solid #f87171")
+    """Deprecated — feed config moved to mission settings drawer."""
+    return Div(
+        Span("Feed config is now in Mission settings (⚙ cog).",
+             style="font-size:11px;color:var(--muted);padding:14px;display:block"),
     )
-    upload_label_style = (
-        "display:block;cursor:pointer;border:1.5px dashed var(--border);"
-        "border-radius:8px;transition:border-color .15s"
-    )
-    return (
-        Div(
-            Span("📡 Feed",
-                 style="font-family:var(--font-head);font-size:13px;font-weight:700;"
-                       "color:var(--blue);letter-spacing:.06em"),
-            Span("×", cls="video-panel-close", onclick="closeFeedPanel()"),
-            cls="video-panel-header",
-        ),
-        Div(
-            Div("Upload files",
-                style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                      "text-transform:uppercase;margin-bottom:8px"),
-            Label(
-                Div(
-                    I(cls="fas fa-cloud-upload-alt",
-                      style="font-size:22px;color:var(--blue);margin-bottom:6px"),
-                    Div("Drop files here or click to browse",
-                        style="font-size:11px;color:var(--muted);line-height:1.6"),
-                    Div(".mp4 + .srt  ·  .jpg / .jpeg",
-                        style="font-size:9px;color:var(--border);margin-top:2px"),
-                    style="display:flex;flex-direction:column;align-items:center;padding:18px",
-                ),
-                Input(
-                    type="file", name="files", multiple=True,
-                    accept=".jpg,.jpeg,.png,.mp4,.mov,.avi,.mkv,.srt,.SRT",
-                    hx_post="/upload",
-                    hx_target="#tae-msgs",
-                    hx_swap="beforeend",
-                    hx_encoding="multipart/form-data",
-                    hx_indicator="#upload-ind",
-                    style="display:none",
-                    **{"hx-on::after-request": "scrollChat(); refreshMap(); closeFeedPanel();"},
-                ),
-                style=upload_label_style,
-            ),
-            style="padding:14px 14px 10px",
-        ),
-        Div(
-            Div(style="flex:1;height:1px;background:var(--border)"),
-            Span("or live stream",
-                 style="font-size:9px;color:var(--muted);padding:0 10px;white-space:nowrap"),
-            Div(style="flex:1;height:1px;background:var(--border)"),
-            style="display:flex;align-items:center;padding:0 14px;margin-bottom:10px",
-        ),
-        Div(
-            Div(
-                Span("Stream URL (RTSP / RTMP)",
-                     style="font-size:9px;color:var(--muted);letter-spacing:.1em;"
-                           "text-transform:uppercase"),
-                Input(id="stream-url", type="text",
-                      placeholder="rtsp://192.168.1.1:554/live",
-                      style="width:100%;background:var(--bg3);border:1px solid var(--border);"
-                            "border-radius:5px;padding:6px 9px;color:var(--text);"
-                            "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
-                style="margin-bottom:8px",
-            ),
-            Button(
-                "▶  Start stream" if not has_stream else "■  Stop stream",
-                onclick="startStream(event)" if not has_stream else "stopStream()",
-                style=stream_btn_style,
-            ),
-            Span("ffmpeg must be in PATH",
-                 style="font-size:9px;color:var(--muted);margin-top:6px;display:block"),
-            style="padding:0 14px 14px",
-        ),
-    )
+
 
 @rt("/stream/panel")
 def stream_panel():
@@ -1170,34 +1086,19 @@ def stream_panel():
             ),
         )
     else:
-        # ── Setup form ────────────────────────────────────────────────────────
+        # ── Idle — config lives in mission settings drawer ─────────────────────
         return (
             header,
             Div(
-                Div(
-                    Span("Stream URL (RTSP / RTMP / file path)", style="font-size:9px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase"),
-                    Input(id="stream-url", type="text", placeholder="rtsp://192.168.1.1:554/live",
-                          style="width:100%;background:var(--bg3);border:1px solid var(--border);"
-                                "border-radius:5px;padding:6px 9px;color:var(--text);"
-                                "font-family:var(--font-mono);font-size:11px;outline:none;margin-top:4px"),
-                    style="margin-bottom:10px",
-                ),
-                Button(
-                    "▶ Start stream",
-                    onclick="startStream(event)",
-                    style="width:100%;padding:8px;background:var(--blue-dim);"
-                          "color:var(--blue);border:1px solid var(--blue);"
-                          "border-radius:5px;cursor:pointer;font-size:12px;"
-                          "font-family:var(--font-mono);font-weight:700",
-                ),
-                Span(
-                    "ffmpeg must be installed and reachable in PATH.",
-                    style="font-size:9px;color:var(--muted);margin-top:8px;display:block",
-                ),
-                style="padding:14px",
+                I(cls="fas fa-satellite-dish",
+                  style="font-size:28px;color:var(--muted);display:block;margin-bottom:10px"),
+                Div("Stream stopped",
+                    style="font-size:12px;color:var(--muted);margin-bottom:6px"),
+                Div("Configure URL in Mission settings (⚙), then press ▶ Start.",
+                    style="font-size:10px;color:var(--border);line-height:1.5"),
+                style="text-align:center;padding:32px 20px",
             ),
         )
-
 
 @rt("/stream/start", methods=["POST"])
 async def stream_start(request: Request):

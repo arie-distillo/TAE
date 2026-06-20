@@ -81,14 +81,26 @@ def _cfg_from_settings() -> types.SimpleNamespace:
 
 # ── MotionTrack serialization for _state storage ─────────────────────────────
 def _track_to_dict(t) -> dict:
-    """
-    Serialize a MotionTrack to the dict format _state['motion_tracks'] expects.
-    Defined here (not on MotionTrack itself) to keep motion.py TAE-agnostic.
-    """
+    # Full trajectory — all geo_history points, not just last 50.
+    # The bird's flight path spans 200+ frames; truncating to 50 shows only
+    # its final hover cluster and makes it invisible on the map.
     trajectory = [
         {"lat": lat, "lon": lon}
-        for lat, lon in t.geo_history[-50:]   # last 50 pts — map trail
+        for lat, lon in t.geo_history
     ]
+
+    # Confidence-based map color (mirrors old variance_to_color behaviour).
+    # conf=1.00 → #00cc44 green  (genuine mover — bird)
+    # conf≥0.60 → #ffaa00 amber  (probable mover)
+    # conf<0.60 → #ff6600 orange (borderline / FP — needs VLM to confirm)
+    conf = t.confidence
+    if conf >= 0.85:
+        map_color = "#00cc44"
+    elif conf >= 0.60:
+        map_color = "#ffaa00"
+    else:
+        map_color = "#ff6600"
+
     return {
         "track_id":      t.track_id,
         "hit_count":     t.hit_count,
@@ -96,9 +108,10 @@ def _track_to_dict(t) -> dict:
         "suppressed_by": t.suppressed_by,
         "confidence":    round(t.confidence, 3),
         "wf_variance_m": round(t.wf_variance_m, 4) if t.wf_variance_m >= 0 else None,
+        "map_color":     map_color,
         "trajectory":    trajectory,
     }
-    
+
 class MotionDetectionWorker:
     """
     Processes HLS video segments at full frame rate for Pipeline 1.

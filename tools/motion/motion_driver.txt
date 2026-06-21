@@ -1,0 +1,1 @@
+python motion_driver.py  "C:\Users\arie\Projects\TAE\output\tracking_test\2 cars 2m.mp4" --mode mog2 --persist 16 --wf-threshold 0.5 --no-preview

@@ -23,6 +23,9 @@
 - [v] is it useful to use Dino / Yolo?
 - [] detection of tiny objects
 
+### Motion detection
+- [] Find suitable set of parameters for "2 cars 2m.mp4" Clause `Real-time detection of moving objects`
+
 ### VLM
 - [v] would tiling help? Consider a full cycle, starting from indexing
 - [v] response quality - sometimes model returns bad "bbox" in "targets" like `[0, 0, 1000, 600] [1000, 600, 2000, 1200] [2000, 0, 3000, 600]` need to detect such casees and retry
@@ -54,6 +57,7 @@
 - [] Sometimes (I noticed this after mission finishes) a Missions dropdown looks corrupted(attached)
 - [] Today map is updated when there are detections. Before any detections found, on when Object detection disabled the map is not being updated at all. Please ensure periodic map updates. BTW it would be good to have a more smooth visual effect of map update
 - [] Monitor panel should be visible as default 
+- [] Video panel showing Stop button alonngside with Stop button on the navbar. It's a residies of a past behaviour and should be removed
 - [] Rename Video panel as Analysis. Restore timiline and detected objects highlogh on this panel (this worked in the past)
 - [] Some panels are being erratically resized and/or repositionned afetr certain actions. Please fix
 - [] Motion tracks on the map - (1) make tooltip more meaningful - add confidence, remove non-important data; (2) s introduce config parameter of confidence threshold (default = 70%) to show a motion track on the map

@@ -180,6 +180,7 @@ def _activate_mission(mission: Mission) -> None:
         "frame_timestamps": {},
         "last_query":       None,
         "det_crops":        {},   # id(Detection) → disk path of annotated crop
+        "_stream_map_centered": False,
     })
 
     db.reconnect(str(paths.lancedb))
@@ -2508,9 +2509,10 @@ def _stream_on_frame_telem(jpeg_path, srt_frame):
     _state.setdefault("frame_timestamps", {})[jpeg_path.name] = abs_ts_ms
 
     # ── update map centre on first GPS fix ─────────────────────────────────────
-    if not _state.get("map_center") or _state["map_center"] == [0.0, 0.0]:
-        _state["map_center"] = [srt_frame.lat, srt_frame.lon]
-        _state["map_zoom"]   = 16
+    if not _state.get("_stream_map_centered") and srt_frame.lat and srt_frame.lon:
+        _state["map_center"]        = [srt_frame.lat, srt_frame.lon]
+        _state["map_zoom"]          = 16
+        _state["_stream_map_centered"] = True
 
     # ── CLIP-index single frame (temp JSON → SimD3Environment → run_ingestion) ─
     meta_entry = _srt_parser.to_meta_entry(srt_frame, jpeg_path, w, h)

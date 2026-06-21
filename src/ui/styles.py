@@ -1010,11 +1010,49 @@ function scrollChat() {
   if (el) el.scrollTop = el.scrollHeight;
 }
  
+// guard prevents concurrent refreshes that create stacked iframes
+var _mapRefreshBusy = false;
+
 function refreshMap() {
-  const f = document.getElementById('tae-map-frame');
-  if (f) { const s = f.src; f.src = ''; f.src = s; }
+  if (_mapRefreshBusy) return;
+  var f = document.getElementById('tae-map-frame');
+  if (!f) return;
+  _mapRefreshBusy = true;
+  f.src = '/map?_ts=' + Date.now();
+  // Release lock once the iframe has reloaded (or after 6 s fallback)
+  var savedView = null;
+  try {
+    var iw = f.contentWindow;
+    var lm = Object.values(iw).find(
+      function(v){ return v && v._leaflet_id !== undefined && typeof v.getCenter === 'function'; });
+    if (lm) { var c = lm.getCenter(); savedView = {lat: c.lat, lng: c.lng, zoom: lm.getZoom()}; }
+  } catch(e) {}
+
+  var released = false;
+  function _release() { if (!released) { released = true; _mapRefreshBusy = false; } }
+  f.onload = function() {
+    if (savedView) {
+      try {
+        var iw2 = f.contentWindow;
+        var lm2 = Object.values(iw2).find(
+          function(v){ return v && v._leaflet_id !== undefined && typeof v.setView === 'function'; });
+        // Only restore if user was zoomed in at least as far as the new map's zoom.
+        // When the server jumps to a higher zoom (new area detected), let it show.
+        if (lm2 && savedView.zoom >= lm2.getZoom()) {
+          lm2.setView([savedView.lat, savedView.lng], savedView.zoom, {animate: false});
+        }
+      } catch(e) {}
+    }
+    _release();
+  };
+  setTimeout(_release, 6000);
 }
- 
+
+// Only refresh during active streaming — map is static when stopped
+window._bgMapRefreshId = setInterval(function() {
+  if (window._streamRunning && document.getElementById('tae-map-frame')) refreshMap();
+}, 20000);
+
 function showPanel(id) {
   const p = document.getElementById(id);
   if (!p) return;

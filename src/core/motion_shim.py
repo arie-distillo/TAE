@@ -179,6 +179,9 @@ class MotionDetectionWorker:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
         self._thread = None
+        # Final save before clearing — captures any tracks not yet persisted
+        if self._frames_processed > 0:
+            self._persist_and_rebuild()
         _state["motion_enabled"] = False
         logger.info(
             "MotionDetectionWorker stopped (%d frames processed)",
@@ -203,7 +206,7 @@ class MotionDetectionWorker:
             if len(segs) < 2:
                 continue  # need ≥ 2 to know the first is complete
 
-            for seg_path in segs[:-1]:   # all but the one ffmpeg is still writing
+            for seg_path in segs[:-1]:
                 if seg_path.name in processed_segments:
                     continue
                 try:
@@ -212,7 +215,11 @@ class MotionDetectionWorker:
                     logger.error("MotionWorker segment error %s: %s",
                                  seg_path.name, exc, exc_info=True)
                 processed_segments.add(seg_path.name)
+                # Persist after every segment so short videos don't lose tracks
+                self._persist_and_rebuild()
 
+        # Final flush: captures tracks confirmed in the last partial segment
+        self._persist_and_rebuild()
         logger.debug("MotionWorker: loop exited")
 
     # ── Segment processing ────────────────────────────────────────────────────
@@ -325,12 +332,29 @@ class MotionDetectionWorker:
 
 
     # ── Persistence ───────────────────────────────────────────────────────────
-
+    # also signals the streaming poll so the client refreshes the map
+    # derives map centre from track geo-history before rebuilding
     def _persist_and_rebuild(self) -> None:
         try:
             from core.services import _save_motion_tracks, _build_map
             if self._paths and hasattr(self._paths, "motion_tracks"):
                 _save_motion_tracks(self._paths.motion_tracks)
+
+            # Re-centre map on actual track positions rather than the default
+            # [32.08, 34.78]. Collect all geo_history points from confirmed tracks.
+            all_pts = []
+            for t in (self._processor.all_tracks_ever() if self._processor else []):
+                all_pts.extend(t.geo_history)
+            if all_pts:
+                import statistics as _st
+                _state["map_center"] = [
+                    _st.median(p[0] for p in all_pts),
+                    _st.median(p[1] for p in all_pts),
+                ]
+                _state["map_zoom"] = 17   # street-level — appropriate for motion tracks
+
             _build_map()
+            _state["_stream_updates_pending"] = True
         except Exception as exc:
             logger.warning("MotionWorker: persist/rebuild failed: %s", exc)
+        

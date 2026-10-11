@@ -1,0 +1,8 @@
+# Extras for the od_verifier experiment, on top of TAE's own requirements.txt
+open_clip_torch
+scikit-learn
+psutil
+pytest
+
+# Optional
+# openvino          # --engine openvino (CPU and Intel iGPU)

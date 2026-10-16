@@ -11,7 +11,9 @@ quality.
 """
 from __future__ import annotations
 
+import base64
 import json
+import time
 import sys
 from pathlib import Path
 
@@ -210,3 +212,133 @@ def test_prompt_building_never_uses_target_as_distractor():
     assert target_phrases(q)[0] == "a white tree"
     d = distractor_phrases(q, ["a parked car"])
     assert "a tree" not in d and "a rooftop" not in d and "a parked car" in d and "a shadow" in d
+
+
+# ── Jev (remote) and Vega (local) backends, stubbed ──────────────────────────
+
+class _FakeJevResponse:
+    def __init__(self, body: bytes): self._b = body
+    def read(self): return self._b
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def _fake_jev_server(monkeypatch, fail_first=0, record=None):
+    """urlopen stub: answers noul = redness of the sent crop; optionally fails the first N calls with 429."""
+    import urllib.request
+    import urllib.error
+    from odv.verifiers.mock import _redness
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        assert req.get_header("Typesafe-danger-zone-images") == "true"
+        assert req.get_header("Authorization") == "Bearer k"
+        body = json.loads(req.data)
+        assert body["questions"]["match"]["type"] == "noul"
+        assert body["assets"]["crop-asset"]["format"] == "jpg"
+        img = cv2.imdecode(np.frombuffer(base64.b64decode(body["assets"]["crop-asset"]["data_base64"]),
+                                         np.uint8), cv2.IMREAD_COLOR)
+        assert min(img.shape[:2]) >= 280                       # upscaled to Jev's minimum side
+        if record is not None:
+            record.append(body)
+        if calls["n"] <= fail_first:
+            raise urllib.error.HTTPError(req.full_url, 429, "slow down", {}, None)
+        p = float(np.clip(0.5 + _redness(img), 0, 1))
+        return _FakeJevResponse(json.dumps({"model": body["model"],
+                                            "answers": {"match": {"type": "noul", "noul": p}},
+                                            "usage": {"input_tokens": 300, "output_tokens": 20}}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    return calls
+
+
+def test_jev_backend_stubbed(synth, monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    sent = []
+    calls = _fake_jev_server(monkeypatch, fail_first=2, record=sent)
+    res = evaluate.main(["--data", str(synth), "--backends", "jev", "--crops", "tight20",
+                         "--limit", "40", "--latency-samples", "4", "--out", str(synth / "eval_jev")])
+    r = next(r for r in res["runs"] if r["backend"] == "jev/jev-1.14.0")
+    assert r["scorer"] == "noul" and r["n"] == 40
+    assert r["auc"] > 0.8                                      # redness tracks the synthetic labels
+    assert r["latency"]["single_p50_ms"] > 0
+    assert calls["n"] == 4 + 40 + 2                            # timing + batch + the two retried 429s
+    assert sent[0]["model"] == "jev-1.14.0"
+    assert "car, van" in sent[0]["questions"]["match"]["instructions"]
+
+
+def test_jev_backend_needs_key(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    from odv.verifiers import make_verifier
+    with pytest.raises(RuntimeError):
+        make_verifier("jev").load()
+
+
+def test_vega_backend_stubbed(synth, monkeypatch):
+    """vegaml is not installed here: a fake module with the documented decide_image() shape."""
+    import types
+    from odv.verifiers.mock import _redness
+
+    class FakeVega:
+        def decide_image(self, img, questions):
+            assert set(questions) == {"match"} and questions["match"]["type"] == "boolean"
+            arr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+            p = float(np.clip(0.5 + _redness(arr), 0, 1))
+            return {"answers": {"match": {"type": "boolean", "boolean": p, "choice": "true" if p > .5 else "false",
+                                          "abstain": abs(p - 0.5) < 0.05, "readout": "engine"}}}
+
+    loads = []
+    fake = types.ModuleType("vegaml")
+    fake.load = lambda repo=None, **kw: loads.append((repo, kw)) or FakeVega()
+    monkeypatch.setitem(sys.modules, "vegaml", fake)
+
+    res = evaluate.main(["--data", str(synth), "--backends", "vega", "vega:4b", "--crops", "tight20",
+                         "--limit", "40", "--latency-samples", "4", "--out", str(synth / "eval_vega")])
+    assert loads == [(None, {"device": "cpu"}), ("4b", {"device": "cpu"})]
+    runs = {(r["backend"], r["scorer"]) for r in res["runs"]}
+    assert ("vega/0.8b", "p_true") in runs and ("vega/4b", "p_true_confident") in runs
+    r = next(r for r in res["runs"] if r["backend"] == "vega/0.8b" and r["scorer"] == "p_true")
+    assert r["auc"] > 0.8 and r["latency"]["batched_ms_per_crop"] > 0
+
+
+def test_record_with_jev_through_tae_stages(tmp_path, monkeypatch):
+    pytest.importorskip("replicate"); pytest.importorskip("openai")
+    pytest.importorskip("pydantic_ai"); pytest.importorskip("pydantic_settings")
+    pytest.importorskip("ollama"); pytest.importorskip("tenacity")
+    monkeypatch.setenv("REPLICATE_API_KEY", "test"); monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.chdir(tmp_path)
+    import record
+    record._setup_tae(None)
+    import replicate
+    from ai.intent import IntentClassifier
+    from ai.vlm import TacticalAnalyst
+
+    class FakeClient:
+        def __init__(self, api_token=None): pass
+        def run(self, model, input):
+            return {"detections": [{"bbox": [100, 100, 140, 130], "confidence": 0.5, "label": "car"}]}
+
+    monkeypatch.setattr(replicate, "Client", FakeClient)
+    monkeypatch.setattr(TacticalAnalyst, "_analyze_openrouter", lambda self, img, fn, prompt: json.dumps(
+        [{"index": 0, "confirmed": True, "confidence": 0.8, "detected_label": "car", "reason": "ok"}]))
+    monkeypatch.setattr(IntentClassifier, "classify", lambda self, q: self._keyword_fallback(q))
+    calls = _fake_jev_server(monkeypatch)
+
+    frames = tmp_path / "frames"; frames.mkdir()
+    cv2.imwrite(str(frames / "f0.jpg"), np.full((720, 1280, 3), 90, np.uint8))
+    ds = record.main(["--frames", str(frames), "--query", "find cars", "--out", str(tmp_path / "ds"), "--jev"])
+    assert len(ds.candidates) == 6 and calls["n"] == 6
+    assert all(c.jev_p is not None for c in ds.candidates)
+    assert ds.meta["timing"]["jev_frames"] == 1 and ds.meta["jev_model"] == "jev-1.14.0"
+
+    ds2 = Dataset.load(tmp_path / "ds")
+    assert all(c.jev_p is not None for c in ds2.candidates)   # persisted and reloaded
+    # evaluate picks the recorded verdicts up as a baseline without calling Jev again
+    res = evaluate.main(["--data", str(tmp_path / "ds"), "--backends", "mock", "--crops", "ctx2",
+                         "--no-probe", "--latency-samples", "2"])
+    base = next(r for r in res["runs"] if r["backend"].startswith("jev/") and r["baseline"])
+    assert base["crop"] == "ctx2" and base["latency"]["batched_ms_per_crop"] >= 0
+    assert calls["n"] == 6

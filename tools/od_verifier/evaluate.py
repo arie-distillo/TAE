@@ -145,6 +145,18 @@ def main(argv: list[str] | None = None) -> dict:
     # Baseline that needs no verifier at all: rank by detector confidence.
     add_run("(no verifier)", "–", "detector_conf", det_conf, None, baseline=True)
 
+    # Jev verdicts recorded by record.py --jev: a remote baseline that costs no new calls here.
+    if any(c.jev_p is not None for c in cands):
+        s = np.array([np.nan if c.jev_p is None else c.jev_p for c in cands], np.float32)
+        jt = ds.meta.get("timing", {})
+        lat = None
+        if jt.get("jev_frames"):
+            n_scored = sum(1 for c in ds.candidates if c.jev_p is not None)
+            lat = {"single_p50_ms": float("nan"), "single_p95_ms": float("nan"),
+                   "batched_ms_per_crop": jt["jev_s"] * 1e3 / max(1, n_scored)}
+        add_run(f"jev/{ds.meta.get('jev_model', '?')} (recorded)", ds.meta.get("jev_crop", "?"),
+                "noul", s, lat, baseline=True)
+
     backends_info = []
     for spec in args.backends:
         print(f"\n[{spec}] loading …")

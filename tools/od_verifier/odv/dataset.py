@@ -40,6 +40,7 @@ class Candidate:
     teacher_label:  str   = ""
     teacher_reason: str   = ""
     teacher_valid:  bool  = True   # False when the VLM call errored / did not answer
+    jev_p:          float | None = None   # P(yes) from Jev when record.py ran with --jev
     gold:           bool | None = field(default=None)
 
     @property

@@ -118,6 +118,10 @@ def main(argv: list[str] | None = None) -> Dataset:
     ap.add_argument("--max-per-tile", type=int, default=None,
                     help="candidate cap per tile (default: MAX_CANDIDATES_PER_TILE or 8, as in streaming)")
     ap.add_argument("--env-file", default=None, help="path to TAE's .env (default: ./.env, src/.env, repo/.env)")
+    ap.add_argument("--jev", nargs="?", const="jev-1.14.0", default=None, metavar="MODEL",
+                    help="also score every candidate with TypeSafe Jev (remote, needs TYPESAFE_API_KEY) "
+                         "and time it per frame alongside Qwen; crops use --jev-crop")
+    ap.add_argument("--jev-crop", default="ctx2", help="crop strategy sent to Jev (default ctx2)")
     args = ap.parse_args(argv)
 
     _setup_tae(args.env_file)
@@ -162,11 +166,20 @@ def main(argv: list[str] | None = None) -> Dataset:
     ds.save_queries()
 
     analyst = TacticalAnalyst(settings.AI_PROVIDER, settings.VLM_MODEL, settings.OPENROUTER_API_KEY)
+    jev = None
+    if args.jev:
+        from odv.crops import make_crop
+        from odv.verifiers.jev import JevVerifier
+        jev = JevVerifier(model=args.jev)
+        jev.load()                                   # fails early without TYPESAFE_API_KEY
+        ds.meta["jev_model"] = args.jev
+        ds.meta["jev_crop"] = args.jev_crop
     max_per_tile = args.max_per_tile or getattr(settings, "MAX_CANDIDATES_PER_TILE", 8)
     min_px = settings.DETECTION_MIN_BBOX_PX
 
     done = set(ds.meta.setdefault("frames_done", {}).setdefault(qid, []))
     timing = ds.meta.setdefault("timing", {"frames": 0, "tiles": 0, "detector_s": 0.0, "vlm_s": 0.0})
+    timing.setdefault("jev_s", 0.0); timing.setdefault("jev_frames", 0)
     ds.meta["detector_model"] = settings.DETECTOR_REPLICATE_MODEL
     ds.meta["vlm_model"] = settings.VLM_MODEL
 
@@ -201,7 +214,7 @@ def main(argv: list[str] | None = None) -> Dataset:
             b.sort(key=lambda d: d.confidence, reverse=True)
             cands.extend(b[:max_per_tile])
 
-        vlm_s = 0.0
+        vlm_s = jev_s = 0.0
         rows: list[Candidate] = []
         if cands:
             for d in cands:
@@ -230,6 +243,15 @@ def main(argv: list[str] | None = None) -> Dataset:
                     teacher_reason="" if reason == _UNVISITED else reason,
                     teacher_valid=valid,
                 ))
+            if jev is not None:
+                crops = [make_crop(img[r.tile_y:r.tile_y + r.tile_h, r.tile_x:r.tile_x + r.tile_w],
+                                   r.bbox, args.jev_crop) for r in rows]
+                t0 = time.perf_counter()
+                jout = jev.run(crops, rows, ds.queries)
+                jev_s = time.perf_counter() - t0
+                for r, pj in zip(rows, jout.scores["noul"]):
+                    r.jev_p = None if pj != pj else float(pj)       # NaN → None
+                timing["jev_s"] += jev_s; timing["jev_frames"] += 1
             ds.append(rows)
 
         timing["frames"] += 1; timing["tiles"] += len(tiles)
@@ -239,14 +261,17 @@ def main(argv: list[str] | None = None) -> Dataset:
         n_yes = sum(r.teacher for r in rows); n_bad = sum(not r.teacher_valid for r in rows)
         print(f"  [{n}/{len(todo)}] {fpath.name}: {len(tiles)} tiles, {len(raw)} raw → {len(rows)} "
               f"candidates, {n_yes} confirmed" + (f", {n_bad} VLM failures" if n_bad else "")
-              + f" | detector {det_s:.1f}s, VLM {vlm_s:.1f}s")
+              + f" | detector {det_s:.1f}s, VLM {vlm_s:.1f}s"
+              + (f", Jev {jev_s:.1f}s" if jev is not None and cands else ""))
 
     valid = [c for c in ds.candidates if c.teacher_valid]
     print(f"\ndataset {out}: {len(ds.candidates)} candidates, {len(valid)} with a valid verdict, "
           f"{sum(c.teacher for c in valid)} confirmed")
     if timing["frames"]:
         print(f"remote stages, mean per frame: detector {timing['detector_s'] / timing['frames']:.1f}s, "
-              f"VLM {timing['vlm_s'] / timing['frames']:.1f}s")
+              f"VLM {timing['vlm_s'] / timing['frames']:.1f}s"
+              + (f", Jev {timing['jev_s'] / timing['jev_frames']:.1f}s "
+                 f"(over {timing['jev_frames']} frames with candidates)" if timing.get("jev_frames") else ""))
     return ds
 
 

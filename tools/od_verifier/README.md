@@ -35,6 +35,10 @@ python tools/od_verifier/record.py --frames path/to/video_or_frames --query "fin
 - Re-running with the same `--out` resumes. Run again with another `--query`
   to add a second query to the same dataset.
 - Prints and stores the measured wall time of the two remote stages per frame.
+- `--jev` additionally scores every candidate with Jev right after Qwen and
+  times it per frame, so the Qwen-vs-Jev latency comparison is measured on the
+  same frames. The verdicts are stored in the dataset and show up in
+  `evaluate.py` as a baseline row without further calls.
 - Aim for a few hundred candidates per query, from more than one flight, with
   at least 30 confirmed and 30 rejected. Fewer than that and the numbers are noise.
 
@@ -52,6 +56,8 @@ Backends:
 | `openclip:ViT-B-16-SigLIP:webli` | SigLIP base. `ViT-B-16-SigLIP2:webli` also works with a recent open_clip. |
 | `openclip:<arch>:<path.pt>` | Any open_clip-compatible checkpoint, e.g. a remote-sensing CLIP. |
 | `hfvlm:HuggingFaceTB/SmolVLM-256M-Instruct` | Small generative VLM read as first-token Yes/No logits. |
+| `vega`, `vega:4b` | **Local.** vegaml decision model (frozen Qwen3.5 0.8B / 4B + small head) on CPU; score = P(true), plus a variant that neutralises abstained answers. `pip install 'vegaml[vision]'`. |
+| `jev`, `jev:jev-1.14.0` | **Remote.** TypeSafe Jev typed decision (`noul`), one HTTP call per crop, needs `TYPESAFE_API_KEY`. Not a local option: a cheaper, typed alternative to Qwen. |
 | `mock` | Colour heuristic, for the tests. |
 
 `--engine openvino` converts the image tower to OpenVINO (`pip install openvino`);
@@ -76,6 +82,18 @@ python tools/od_verifier/review.py --data tools/od_verifier/data/city --apply pa
 Opens the strongest disagreements between a local verifier and the remote VLM
 first. Until some labels are reviewed, "quality" means agreement with Qwen,
 not correctness.
+
+## Three-way comparison (Qwen / Jev / Vega)
+
+```
+python tools/od_verifier/record.py --frames VIDEO --query "find all cars" --out DATA --jev
+python tools/od_verifier/evaluate.py --data DATA --backends vega openclip:ViT-B-16-SigLIP:webli --crops tight20 ctx2
+```
+
+Qwen is the reference column; the `jev/... (recorded)` row and the `vega/...`
+rows are measured against it in the same table as the contrastive models.
+Where the three disagree, `review.py --scores` shows the crops so a person can
+decide who was right.
 
 ## Reading the report
 
@@ -110,4 +128,8 @@ Not run, so treat as unverified until you run it:
 - Any pretrained weights, hence any real quality number.
 - `record.py` against the live Replicate and OpenRouter APIs.
 - The `hfvlm` backend (written against the transformers API, never executed).
+- The `jev` and `vega` backends against the real service / package. Both are
+  tested only against stubs that follow the documented request and response
+  shapes (Jev: `POST /v1/systemone`, `noul`; vegaml 0.8.0: `decide_image`,
+  `answers[..]["boolean"]`).
 - `--ov-device GPU`.
